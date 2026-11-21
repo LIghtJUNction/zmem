@@ -1,0 +1,173 @@
+name: Release zmem
+
+on:
+  push:
+    tags: ["v[0-9]*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Bump: patch, minor, major, or an explicit X.Y.Z (ignored when tag is set)"
+        type: string
+        default: patch
+        required: false
+      tag:
+        description: "Rebuild an existing tag, for example v0.1.0; leave empty to bump"
+        type: string
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zmem-release
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && 'main' || github.ref }}
+          fetch-depth: 0
+      - name: Install Rust
+        run: rustup toolchain install 1.100.0 --profile minimal
+      - name: Resolve or create the release tag
+        id: release
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REQUESTED_VERSION: ${{ inputs.version }}
+          REQUESTED_TAG: ${{ inputs.tag }}
+          PUSHED_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          rustup default 1.100.0
+          if [ "$EVENT_NAME" = workflow_dispatch ] && [ -z "$REQUESTED_TAG" ]; then
+            git config user.name github-actions[bot]
+            git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+            python3 scripts/bump.py "${REQUESTED_VERSION:-patch}" --release
+            tag="v$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')"
+          else
+            tag="${REQUESTED_TAG:-$PUSHED_TAG}"
+            [[ "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+            git checkout --detach "refs/tags/$tag"
+          fi
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
+          test "$tag" = "v$version"
+          printf 'tag=%s\n' "$tag" >> "$GITHUB_OUTPUT"
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: x86_64
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    env:
+      CARGO_TARGET_DIR: target
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          rustup toolchain install 1.100.0 --profile minimal --component rustfmt
+          rustup default 1.100.0
+      - name: Validate the release source
+        run: |
+          cargo fmt --check
+          cargo test --locked
+          cargo check --locked --lib --no-default-features
+      - name: Build native executable
+        run: cargo build --release --locked --target "${{ matrix.target }}"
+      - name: Verify and package executable
+        run: |
+          target/${{ matrix.target }}/release/zmem --version
+          target/${{ matrix.target }}/release/zmem status --json
+          target/${{ matrix.target }}/release/zmem schema
+          python3 scripts/package.py --binary target/${{ matrix.target }}/release/zmem --arch "${{ matrix.arch }}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: zmem-linux-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+  publish:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: zmem-linux-*
+          path: dist
+          merge-multiple: true
+      - name: Install Rust
+        run: |
+          rustup toolchain install 1.100.0 --profile minimal
+          rustup default 1.100.0
+      - name: Check registry version
+        id: registry
+        run: |
+          python3 - <<'PY'
+          import json, os, tomllib, urllib.error, urllib.request
+          package = tomllib.load(open("Cargo.toml", "rb"))["package"]
+          name, version = package["name"], package["version"]
+          request = urllib.request.Request(f"https://crates.io/api/v1/crates/{name}/{version}", headers={"User-Agent": "zmem-release (https://github.com/LIghtJUNction/zmem)"})
+          try:
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  data = json.load(response)
+              if data["version"]["num"] != version:
+                  raise RuntimeError("registry returned a different version")
+              exists = True
+          except urllib.error.HTTPError as error:
+              if error.code != 404:
+                  raise
+              exists = False
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"exists={str(exists).lower()}\n")
+          PY
+      - name: Publish crate
+        if: steps.registry.outputs.exists != 'true'
+        run: |
+          test -n "$CARGO_REGISTRY_TOKEN" || { echo 'CARGO_REGISTRY_TOKEN is required for first publication.' >&2; exit 1; }
+          cargo publish --locked
+      - name: Publish verified release assets
+        run: |
+          set -euo pipefail
+          for checksum in dist/*.sha256; do (cd dist && sha256sum --check "$(basename "$checksum")"); done
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --verify-tag --title "zmem $RELEASE_TAG" --generate-notes
+          fi
+          mkdir -p .release-existing
+          for asset in dist/*; do
+            name=$(basename "$asset")
+            if gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' | grep -Fxq "$name"; then
+              gh release download "$RELEASE_TAG" --pattern "$name" --dir .release-existing
+              cmp "$asset" ".release-existing/$name" || { echo "Published asset differs: $name" >&2; exit 1; }
+            else
+              gh release upload "$RELEASE_TAG" "$asset"
+            fi
+          done
+          printf 'Published %s\n' "$RELEASE_TAG" >> "$GITHUB_STEP_SUMMARY"
+      - name: Publish the current website
+        run: gh workflow run pages.yml --ref main

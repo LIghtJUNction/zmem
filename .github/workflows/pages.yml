@@ -1,0 +1,40 @@
+name: Publish website
+
+on:
+  push:
+    branches: [main]
+    paths: ["site/**", ".github/workflows/pages.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Check static site entry points
+        run: |
+          test -s site/index.html
+          test -s site/style.css
+          test -s site/app.js
+          test -s site/version.js
+          node --check site/app.js
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+      - name: Deploy GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5

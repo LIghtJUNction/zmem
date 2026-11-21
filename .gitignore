@@ -1,0 +1,7 @@
+/target/
+/dist/
+/.ssmcp/
+/artifacts/
+/site/.preview/
+__pycache__/
+*.pyc

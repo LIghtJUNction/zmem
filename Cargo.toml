@@ -1,0 +1,36 @@
+[package]
+name = "zmem-manager"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A lightweight, pressure-aware Linux memory and swap manager with a no_std policy core"
+license = "MIT"
+repository = "https://github.com/LIghtJUNction/zmem"
+homepage = "https://lightjunction.github.io/zmem/"
+documentation = "https://docs.rs/zmem-manager"
+readme = "README.md"
+keywords = ["memory", "swap", "linux", "zram", "no-std"]
+categories = ["command-line-utilities", "os::linux-apis", "no-std"]
+include = ["src/**", "packaging/**", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE", "tests/**"]
+
+[features]
+default = ["std"]
+std = []
+
+[lib]
+name = "zmem"
+path = "src/lib.rs"
+
+[[bin]]
+name = "zmem"
+path = "src/main.rs"
+required-features = ["std"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[dependencies]

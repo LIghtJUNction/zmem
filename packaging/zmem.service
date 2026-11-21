@@ -1,0 +1,48 @@
+[Unit]
+Description=zmem adaptive memory and swap manager
+Documentation=https://lightjunction.github.io/zmem/
+After=local-fs.target systemd-modules-load.service
+RequiresMountsFor=/var/lib/zmem /var/lib/swapspace
+Before=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/zmem daemon --config /etc/zmem/zmem.conf
+Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin
+Restart=on-failure
+RestartSec=3s
+TimeoutStartSec=30s
+TimeoutStopSec=20s
+KillMode=control-group
+User=root
+Group=root
+UMask=0077
+RuntimeDirectory=zmem
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+StateDirectory=zmem
+StateDirectoryMode=0755
+OOMScoreAdjust=-900
+MemoryLow=32M
+MemoryMax=128M
+MemorySwapMax=0
+LimitNOFILE=1024
+TasksMax=32
+ProtectHome=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/proc/sys/vm /sys/fs/cgroup /sys/block /sys/devices -/sys/class/zram-control /var/lib/zmem -/var/lib/swapspace /run/zmem
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_RESOURCE CAP_DAC_OVERRIDE CAP_SYS_MODULE
+RestrictAddressFamilies=AF_UNIX
+RestrictSUIDSGID=true
+LockPersonality=true
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelLogs=true
+StandardOutput=journal
+StandardError=journal
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=60
+
+[Install]
+WantedBy=multi-user.target
