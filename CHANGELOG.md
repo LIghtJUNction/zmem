@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.1
+
+- Normalize cgroup memory limits to the running kernel's page size so the daemon can continue adjusting its own limits.
+- Preserve real external changes and track both sides of pending control writes.
+- Recover five-column 0.1.0 control journals during upgrades without losing the old daemon's final records.
+- Add a privileged empty-cgroup regression for consecutive writes, rollback, external changes and legacy recovery.
+- Verify live 0.1.0 takeover with all 13 recorded control baselines and active swap preserved.
+
 ## 0.1.0
 
 - Introduce an allocation-free `no_std` memory policy core and a Linux control daemon with no third-party Rust dependencies.

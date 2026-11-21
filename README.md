@@ -2,7 +2,7 @@
 
 **Memory, with room to work.** A small Linux memory and Swap controller from [Project Z](https://github.com/LIghtJUNction/project-z).
 
-[Website](https://lightjunction.github.io/zmem/) · [Releases](https://github.com/LIghtJUNction/zmem/releases) · [crates.io](https://crates.io/crates/zmem-manager) · [Rust API](https://docs.rs/zmem-manager) · [Host acceptance](docs/acceptance-0.1.0.md)
+[Website](https://lightjunction.github.io/zmem/) · [Releases](https://github.com/LIghtJUNction/zmem/releases) · [crates.io](https://crates.io/crates/zmem-manager) · [Rust API](https://docs.rs/zmem-manager) · [Host acceptance](docs/acceptance-0.1.1.md)
 
 zmem observes memory pressure, preserves headroom for interactive work, and gives managed background jobs a bounded memory budget. It brings zram setup, dynamic disk swap, pressure policy and structured inspection into one tool. The Rust implementation has no third-party crate dependencies; the policy library uses `no_std` and makes no heap allocations.
 

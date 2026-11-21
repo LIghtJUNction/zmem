@@ -19,12 +19,13 @@ const RUNTIME: &str = "/run/zmem";
 const CONTROL_FILE: &str = "/run/zmem/controls.tsv";
 const CGROOT: &str = "/sys/fs/cgroup";
 static STOP: AtomicBool = AtomicBool::new(false);
-// These Unix interfaces are used only for advisory locking and signal delivery.
+// These Unix interfaces provide locking, signal delivery, and the native page size.
 // The signal handler touches one lock-free atomic and performs no allocation.
 unsafe extern "C" {
     fn flock(fd: i32, operation: i32) -> i32;
     fn signal(sig: i32, handler: extern "C" fn(i32)) -> usize;
     fn kill(pid: i32, signal: i32) -> i32;
+    fn getpagesize() -> i32;
 }
 extern "C" fn stop_signal(_: i32) {
     STOP.store(true, Ordering::Relaxed);
@@ -473,6 +474,7 @@ struct Control {
     last: String,
     dev: u64,
     ino: u64,
+    pending_previous: Option<String>,
 }
 struct Controls {
     entries: BTreeMap<PathBuf, Control>,
@@ -489,12 +491,13 @@ impl Controls {
             .values()
             .map(|e| {
                 format!(
-                    "{}\t{}\t{}\t{}\t{}\n",
+                    "{}\t{}\t{}\t{}\t{}\t{}\n",
                     e.path.display(),
                     e.original,
                     e.last,
                     e.dev,
-                    e.ino
+                    e.ino,
+                    e.pending_previous.as_deref().unwrap_or("")
                 )
             })
             .collect::<String>();
@@ -504,6 +507,8 @@ impl Controls {
         if !valid_control(path) {
             return Err("invalid control path".into());
         }
+        let page_size = control_page_size()?;
+        let value = canonical_control_value(path, value, page_size)?;
         let old = read(path)?.trim().to_string();
         let meta = fs::metadata(path)?;
         if self
@@ -520,13 +525,21 @@ impl Controls {
             return Ok(());
         }
         if let Some(entry) = self.entries.get(path) {
-            if old != entry.last {
+            if !owned_control_value(
+                path,
+                &entry.last,
+                entry.pending_previous.as_deref(),
+                &old,
+                page_size,
+            )? {
                 return Err(
                     format!("external control change preserved: {}", path.display()).into(),
                 );
             }
         }
-        self.entries
+        let previous = self.entries.get(path).cloned();
+        let entry = self
+            .entries
             .entry(path.to_path_buf())
             .or_insert_with(|| Control {
                 path: path.into(),
@@ -534,17 +547,62 @@ impl Controls {
                 last: old.clone(),
                 dev: meta.dev(),
                 ino: meta.ino(),
-            })
-            .last = value.into();
-        self.save()?;
-        let result = write_control(path, value, nonblock);
-        if result.is_err() {
-            if let Some(e) = self.entries.get_mut(path) {
-                e.last = old;
+                pending_previous: None,
+            });
+        entry.last = value.clone();
+        // Persist both sides of the pending write. If the process exits before
+        // or after the kernel write, recovery can recognize the owned value.
+        entry.pending_previous = Some(old.clone());
+        if let Err(error) = self.save() {
+            match previous {
+                Some(entry) => {
+                    self.entries.insert(path.into(), entry);
+                }
+                None => {
+                    self.entries.remove(path);
+                }
+            }
+            return Err(error);
+        }
+        let result = write_control(path, &value, nonblock);
+        let observed = read(path).map(|text| text.trim().to_owned());
+        if result.is_err()
+            && observed
+                .as_deref()
+                .is_ok_and(|current| current == old.as_str())
+        {
+            // The write did not change the control. Restore the preceding
+            // ownership record, including the absence of a first-write record.
+            match previous {
+                Some(entry) => {
+                    self.entries.insert(path.into(), entry);
+                }
+                None => {
+                    self.entries.remove(path);
+                }
             }
             self.save()?;
+            return result;
         }
-        result
+        if let Ok(current) = &observed {
+            // Never adopt an unknown read-back value: another controller may
+            // have written it. Clearing pending prevents recovery from treating
+            // a later return to the previous value as our in-flight write.
+            if let Some(entry) = self.entries.get_mut(path) {
+                entry.pending_previous = None;
+            }
+            self.save()?;
+            if current != &value {
+                return Err(format!(
+                    "control read-back differs from requested value; external change preserved: {}",
+                    path.display()
+                )
+                .into());
+            }
+        }
+        result?;
+        observed?;
+        Ok(())
     }
     fn protect(&mut self, path: &Path, bytes: u64) -> Result<()> {
         if !path.exists() {
@@ -578,7 +636,53 @@ fn valid_control(path: &Path) -> bool {
                 Some("memory.low" | "memory.high")
             ))
 }
+fn control_page_size() -> Result<u64> {
+    // libc reports the running kernel's base-page size without spawning a
+    // command or guessing 4096 on machines configured for larger pages.
+    let size = unsafe { getpagesize() };
+    if size <= 0 || !(size as u64).is_power_of_two() {
+        return Err("invalid system page size".into());
+    }
+    Ok(size as u64)
+}
+fn canonical_control_value(path: &Path, value: &str, page_size: u64) -> Result<String> {
+    let memory = path.starts_with(CGROOT)
+        && matches!(
+            path.file_name().and_then(|s| s.to_str()),
+            Some("memory.low" | "memory.high")
+        );
+    let value = value.trim();
+    if memory && value == "max" {
+        return Ok("max".into());
+    }
+    let bytes = value.parse::<u64>()?;
+    if memory {
+        if page_size == 0 || !page_size.is_power_of_two() {
+            return Err("invalid control page size".into());
+        }
+        // The memory controller stores byte limits as a whole number of pages.
+        Ok((bytes / page_size * page_size).to_string())
+    } else {
+        Ok(bytes.to_string())
+    }
+}
+fn owned_control_value(
+    path: &Path,
+    last: &str,
+    pending_previous: Option<&str>,
+    observed: &str,
+    page_size: u64,
+) -> Result<bool> {
+    if observed == canonical_control_value(path, last, page_size)? {
+        return Ok(true);
+    }
+    match pending_previous {
+        Some(previous) => Ok(observed == canonical_control_value(path, previous, page_size)?),
+        None => Ok(false),
+    }
+}
 fn write_control(path: &Path, value: &str, nonblock: bool) -> Result<()> {
+    let value = canonical_control_value(path, value, control_page_size()?)?;
     let mut o = OpenOptions::new();
     o.write(true);
     if nonblock {
@@ -593,10 +697,16 @@ pub fn restore_controls() -> Result<()> {
         Err(_) if !Path::new(CONTROL_FILE).exists() => return Ok(()),
         Err(e) => return Err(e),
     };
+    restore_control_snapshot(&text)?;
+    fs::remove_file(CONTROL_FILE)?;
+    Ok(())
+}
+pub fn restore_control_snapshot(text: &str) -> Result<()> {
+    let page_size = control_page_size()?;
     let mut errors = Vec::new();
     for line in text.lines().rev() {
         let v: Vec<_> = line.split('\t').collect();
-        if v.len() != 5 {
+        if v.len() != 5 && v.len() != 6 {
             continue;
         }
         let p = Path::new(v[0]);
@@ -607,14 +717,25 @@ pub fn restore_controls() -> Result<()> {
         if m.dev().to_string() != v[3] || m.ino().to_string() != v[4] {
             continue;
         }
-        if read(p).is_ok_and(|s| s.trim() == v[2]) {
-            if let Err(e) = write_control(p, v[1], p.ends_with("memory.high")) {
-                errors.push(e.to_string());
+        let result = (|| -> Result<()> {
+            let current = read(p)?;
+            let pending = v.get(5).copied().filter(|s| !s.is_empty());
+            if owned_control_value(p, v[2], pending, current.trim(), page_size)? {
+                let original = canonical_control_value(p, v[1], page_size)?;
+                write_control(p, &original, p.ends_with("memory.high"))?;
+                if read(p)?.trim() != original {
+                    return Err(
+                        format!("restored control read-back changed: {}", p.display()).into(),
+                    );
+                }
             }
+            Ok(())
+        })();
+        if let Err(e) = result {
+            errors.push(e.to_string());
         }
     }
     if errors.is_empty() {
-        fs::remove_file(CONTROL_FILE)?;
         Ok(())
     } else {
         Err(errors.join("; ").into())
@@ -1455,5 +1576,212 @@ mod tests {
         assert_eq!(capped_high("1234", "512").unwrap(), "512");
         assert_eq!(capped_high("max", "4096").unwrap(), "4096");
         assert!(capped_high("broken", "4096").is_err());
+    }
+    #[test]
+    fn memory_controls_use_the_kernels_page_granularity() {
+        let high = Path::new("/sys/fs/cgroup/zmem.slice/zmem-background.slice/memory.high");
+        let low = Path::new("/sys/fs/cgroup/user.slice/memory.low");
+        for (path, requested, actual) in [
+            (high, "11533690420", "11533688832"),
+            (low, "1544690688", "1544687616"),
+            (low, "514896896", "514895872"),
+            (high, "4095", "0"),
+            (high, "4096", "4096"),
+        ] {
+            assert_eq!(
+                canonical_control_value(path, requested, 4096).unwrap(),
+                actual
+            );
+        }
+        assert_eq!(
+            canonical_control_value(high, "131071", 65536).unwrap(),
+            "65536"
+        );
+        assert_eq!(
+            canonical_control_value(low, "131073", 65536).unwrap(),
+            "131072"
+        );
+        assert_eq!(canonical_control_value(high, "max", 65536).unwrap(), "max");
+        assert_eq!(
+            canonical_control_value(Path::new("/proc/sys/vm/swappiness"), "120", 65536).unwrap(),
+            "120"
+        );
+        assert!(canonical_control_value(high, "123", 0).is_err());
+    }
+    #[test]
+    fn legacy_journal_rounding_is_owned_but_external_changes_are_not() {
+        let high = Path::new("/sys/fs/cgroup/zmem.slice/zmem-background.slice/memory.high");
+        assert!(owned_control_value(high, "11533690420", None, "11533688832", 4096).unwrap());
+        assert!(!owned_control_value(high, "11533690420", None, "11533684736", 4096).unwrap());
+        assert!(!owned_control_value(high, "11533690420", None, "max", 4096).unwrap());
+        assert!(owned_control_value(high, "131071", None, "65536", 65536).unwrap());
+        assert!(!owned_control_value(high, "131071", None, "131072", 65536).unwrap());
+    }
+    #[test]
+    fn pending_write_recovery_recognizes_only_its_two_owned_states() {
+        let high = Path::new("/sys/fs/cgroup/zmem.slice/zmem-background.slice/memory.high");
+        // A crash before the write leaves the previous value; after the write
+        // it leaves the target. Both recover the same original baseline.
+        assert!(owned_control_value(high, "12288", Some("8192"), "8192", 4096).unwrap());
+        assert!(owned_control_value(high, "12288", Some("8192"), "12288", 4096).unwrap());
+        assert!(!owned_control_value(high, "12288", Some("8192"), "16384", 4096).unwrap());
+        // Once the write is confirmed, a later change back to the prior value
+        // is external and must be retained.
+        assert!(!owned_control_value(high, "12288", None, "8192", 4096).unwrap());
+    }
+    #[test]
+    #[ignore = "requires root, cgroup v2, and a stopped zmem daemon"]
+    fn kernel_cgroup_rounding_and_restore() {
+        unsafe extern "C" {
+            fn geteuid() -> u32;
+        }
+        assert_eq!(
+            unsafe { geteuid() },
+            0,
+            "run this ignored regression as root"
+        );
+        assert!(
+            !Path::new(CONTROL_FILE).exists(),
+            "stop zmem and recover its control journal before this regression"
+        );
+        let _lock = InstanceLock::acquire().expect("the real zmem daemon must be stopped");
+        assert!(
+            !Path::new(CONTROL_FILE).exists(),
+            "a control journal appeared before the regression acquired the lock"
+        );
+        let fixture = Path::new(CGROOT).join(format!("zmem-regression-{}", std::process::id()));
+        fs::create_dir(&fixture).expect("create a fresh empty regression cgroup");
+        eprintln!(
+            "zmem regression fixture: {}; on failure retain it and {} for inspection",
+            fixture.display(),
+            CONTROL_FILE
+        );
+        assert!(
+            read(fixture.join("cgroup.procs"))
+                .unwrap()
+                .trim()
+                .is_empty(),
+            "regression cgroup must contain no processes"
+        );
+        let high = fixture.join("memory.high");
+        let low = fixture.join("memory.low");
+        assert!(
+            high.exists() && low.exists(),
+            "the root cgroup must already delegate the memory controller; fixture: {}",
+            fixture.display()
+        );
+        let original_high = read(&high).unwrap().trim().to_owned();
+        let original_low = read(&low).unwrap().trim().to_owned();
+        let page = control_page_size().unwrap();
+        let verify = |controls: &Controls, path: &Path, expected: u64| {
+            let expected = expected.to_string();
+            assert_eq!(
+                read(path).unwrap().trim(),
+                expected,
+                "kernel value at {}",
+                path.display()
+            );
+            let entry = controls.entries.get(path).expect("control ownership entry");
+            assert_eq!(
+                entry.last, expected,
+                "in-memory ownership must use the actual kernel value"
+            );
+            assert!(
+                entry.pending_previous.is_none(),
+                "a verified write must be committed"
+            );
+            let journal = read(CONTROL_FILE).unwrap();
+            let row = journal
+                .lines()
+                .find(|line| line.split('\t').next() == path.to_str())
+                .expect("persisted control ownership entry");
+            let fields: Vec<_> = row.split('\t').collect();
+            assert_eq!(fields.len(), 6);
+            assert_eq!(
+                fields[2], expected,
+                "journal last must equal the actual kernel value"
+            );
+            assert!(
+                fields[5].is_empty(),
+                "the committed journal must not retain a pending value"
+            );
+        };
+        let mut controls = Controls::new();
+        controls
+            .set(&high, &(page * 3 + 17).to_string(), true)
+            .unwrap();
+        controls.set(&low, &(page + 31).to_string(), false).unwrap();
+        verify(&controls, &high, page * 3);
+        verify(&controls, &low, page);
+        controls
+            .set(&high, &(page * 7 + 123).to_string(), true)
+            .expect("second nonaligned high write must remain controllable");
+        controls
+            .set(&low, &(page * 2 + 127).to_string(), false)
+            .expect("second nonaligned low write must remain controllable");
+        verify(&controls, &high, page * 7);
+        verify(&controls, &low, page * 2);
+        assert_eq!(controls.entries.get(&high).unwrap().original, original_high);
+        assert_eq!(controls.entries.get(&low).unwrap().original, original_low);
+        restore_controls().unwrap();
+        assert_eq!(read(&high).unwrap().trim(), original_high);
+        assert_eq!(read(&low).unwrap().trim(), original_low);
+        assert!(!Path::new(CONTROL_FILE).exists());
+
+        // This direct write represents another controller changing only the
+        // empty fixture. Neither a later policy update nor rollback may undo it.
+        let mut controls = Controls::new();
+        controls
+            .set(&high, &(page * 3 + 17).to_string(), true)
+            .unwrap();
+        let external = (page * 9).to_string();
+        fs::write(&high, &external).unwrap();
+        let error = controls
+            .set(&high, &(page * 4 + 19).to_string(), true)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("external control change preserved")
+        );
+        assert_eq!(read(&high).unwrap().trim(), external);
+        restore_controls().unwrap();
+        assert_eq!(read(&high).unwrap().trim(), external);
+        assert!(!Path::new(CONTROL_FILE).exists());
+        fs::write(&high, &original_high).unwrap();
+
+        // Exercise the actual kernel rounding with the old five-column
+        // write-ahead format, then restore via the upgrade snapshot interface.
+        let mut legacy = String::new();
+        for (path, original, requested) in [
+            (&high, &original_high, page * 5 + 73),
+            (&low, &original_low, page * 3 + 41),
+        ] {
+            fs::write(path, requested.to_string()).unwrap();
+            assert_eq!(
+                read(path).unwrap().trim(),
+                (requested / page * page).to_string()
+            );
+            let metadata = fs::metadata(path).unwrap();
+            legacy.push_str(&format!(
+                "{}\t{}\t{}\t{}\t{}\n",
+                path.display(),
+                original,
+                requested,
+                metadata.dev(),
+                metadata.ino()
+            ));
+        }
+        restore_control_snapshot(&legacy).unwrap();
+        assert_eq!(read(&high).unwrap().trim(), original_high);
+        assert_eq!(read(&low).unwrap().trim(), original_low);
+        assert!(!Path::new(CONTROL_FILE).exists());
+        assert!(
+            read(fixture.join("cgroup.procs"))
+                .unwrap()
+                .trim()
+                .is_empty()
+        );
+        fs::remove_dir(&fixture).expect("remove the successful empty regression cgroup");
     }
 }

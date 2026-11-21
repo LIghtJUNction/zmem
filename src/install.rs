@@ -21,6 +21,10 @@ const SERVICE: &str = "/etc/systemd/system/zmem.service";
 const GENERATOR: &str = "/etc/systemd/system-generators/zram-generator";
 const ADOPTED: &str = "/var/lib/zmem/adopted-swaps";
 const STATUS: &str = "/run/zmem/status.json";
+const CONTROLS: &str = "/run/zmem/controls.tsv";
+const CONTROL_RECOVERY: &str = "/var/lib/zmem/upgrade-controls.tsv";
+const LEGACY_DROPIN_DIR: &str = "/run/systemd/system/zmem.service.d";
+const LEGACY_DROPIN: &[u8] = b"[Service]\nKillSignal=SIGKILL\n";
 const UNIT: &str = "zmem.service";
 // Stop the socket before the service so socket activation cannot restart oomd.
 const LEGACY: &[&str] = &[
@@ -143,10 +147,12 @@ pub fn install(source: Option<&Path>, replace: bool) -> Result<()> {
         }
         backup.ensure_mask_safe(Path::new(GENERATOR))?;
     }
+    // Include every live swap before stopping a controller or changing units.
+    let swaps_before: BTreeSet<_> = swaps()?.into_iter().map(|s| s.path).collect();
+    // This is a separate preflight boundary: a failed stop or restoration must
+    // not trigger baseline rollback and start a competing controller.
+    stop_manager(&systemctl)?;
     let migration = (|| -> Result<()> {
-        // Include every live swap in the invariant before any unit file or
-        // generator changes, including effects of the first daemon-reload.
-        let swaps_before: BTreeSet<_> = swaps()?.into_iter().map(|s| s.path).collect();
         copy_atomic(&current, Path::new(BINARY), 0o755)?;
         if let Some(text) = new_config {
             write_atomic(Path::new(CONFIG), text.as_bytes(), 0o644)?;
@@ -219,15 +225,100 @@ pub fn rollback() -> Result<()> {
     Ok(())
 }
 
-fn restore(backup: &Backup, systemctl: &Path) -> Result<()> {
-    let mut errors = Vec::new();
+fn stop_manager(systemctl: &Path) -> Result<()> {
+    let recovery = Path::new(CONTROL_RECOVERY);
+    let controls = Path::new(CONTROLS);
+    let live = if controls.exists() {
+        Some(read_limited(controls, 4 * 1024 * 1024)?)
+    } else {
+        None
+    };
+    let snapshot = if recovery.exists() {
+        Some(read_limited(recovery, 4 * 1024 * 1024)?)
+    } else {
+        live.clone()
+    };
     let state = service_state(systemctl, UNIT)?;
-    if state.loaded {
-        if let Err(error) = checked(systemctl, &["stop", UNIT]) {
-            return fail(format!(
-                "cannot stop zmem before rollback: {error}; legacy controllers were not restarted"
-            ));
+    if !state.loaded {
+        if snapshot.is_some() {
+            return fail(
+                "a zmem control journal exists without a managed service; stop or recover the standalone daemon before installing",
+            );
         }
+        return Ok(());
+    }
+    // Version 0.1.0 may delete its journal while skipping page-rounded limits.
+    // Persist the captured journal before stopping that writer. A failed
+    // recovery retains this file, so a subsequent install cannot lose it.
+    if !recovery.exists() {
+        if let Some(text) = &snapshot {
+            write_atomic(recovery, text.as_bytes(), 0o600)?;
+        }
+    }
+    // Only the live journal identifies the running writer's format. A saved
+    // five-column journal may coexist with a newer daemon on a recovery retry.
+    let legacy = live
+        .as_deref()
+        .map(legacy_control_journal)
+        .transpose()?
+        .unwrap_or(false);
+    if legacy {
+        stop_legacy_manager(systemctl)?;
+    } else {
+        stop_unit_and_confirm(systemctl)?;
+    }
+    // Read after the writer has exited. Keep the final journal until both
+    // recoveries succeed; it may contain controls added after our first copy.
+    let final_snapshot = if controls.exists() {
+        Some(read_limited(controls, 4 * 1024 * 1024)?)
+    } else {
+        None
+    };
+    if legacy && final_snapshot.is_none() {
+        return fail(format!(
+            "the legacy daemon's final control journal is missing; recovery evidence retained at {CONTROL_RECOVERY}"
+        ));
+    }
+    if let Some(text) = &final_snapshot {
+        crate::linux::restore_control_snapshot(text)?;
+    }
+    if let Some(text) = &snapshot {
+        crate::linux::restore_control_snapshot(text)?;
+    }
+    // Five-column logs do not record both sides of an in-flight write. Do not
+    // discard their only baseline when ownership cannot be confirmed: a safe
+    // skipped restore is not proof that a legacy control reached its baseline.
+    for text in final_snapshot.iter().chain(snapshot.iter()) {
+        if legacy_control_journal(text)? {
+            verify_legacy_controls_restored(text)?;
+        }
+    }
+    if final_snapshot.is_some() {
+        fs::remove_file(controls)?;
+    }
+    if snapshot.is_some() {
+        fs::remove_file(recovery)?;
+    }
+    Ok(())
+}
+
+fn legacy_control_journal(text: &str) -> Result<bool> {
+    let mut legacy = false;
+    for line in text.lines().filter(|line| !line.is_empty()) {
+        match line.split('\t').count() {
+            5 => legacy = true,
+            6 => {}
+            _ => return fail("invalid control journal column count; refusing to stop its writer"),
+        }
+    }
+    Ok(legacy)
+}
+
+fn stop_unit_and_confirm(systemctl: &Path) -> Result<()> {
+    if let Err(error) = checked(systemctl, &["stop", UNIT]) {
+        return fail(format!(
+            "cannot stop zmem: {error}; no other memory controller was started"
+        ));
     }
     let stopped = checked_output(
         systemctl,
@@ -243,13 +334,118 @@ fn restore(backup: &Backup, systemctl: &Path) -> Result<()> {
         != Some(0)
     {
         return fail(
-            "zmem has not fully stopped; rollback left the current configuration in place and did not restart legacy controllers",
+            "zmem has not fully stopped; the current configuration and other controllers were preserved",
         );
     }
+    Ok(())
+}
+
+fn legacy_dropin_path() -> PathBuf {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    Path::new(LEGACY_DROPIN_DIR).join(format!(
+        "zzzz-zmem-upgrade-{}-{stamp}.conf",
+        std::process::id()
+    ))
+}
+
+fn stop_legacy_manager(systemctl: &Path) -> Result<()> {
+    let directory = Path::new(LEGACY_DROPIN_DIR);
+    ensure_secure_dir(directory, 0o755)?;
+    let path = legacy_dropin_path();
+    // Never replace another drop-in, even if a generated name already exists.
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)?;
+    let stop = (|| -> Result<()> {
+        file.write_all(LEGACY_DROPIN)?;
+        file.sync_all()?;
+        File::open(directory)?.sync_all()?;
+        checked(systemctl, &["daemon-reload"])?;
+        let output = checked_output(
+            systemctl,
+            &["show", UNIT, "--property=KillSignal,KillMode", "--no-pager"],
+        )?;
+        let values = properties(&String::from_utf8(output.stdout)?);
+        // Lexically later user overrides can win. Verify the effective value
+        // rather than overwriting or renaming any of the user's drop-ins.
+        if values.get("KillSignal").map(String::as_str) != Some("9")
+            || values.get("KillMode").map(String::as_str) != Some("control-group")
+        {
+            return fail(
+                "legacy zmem shutdown requires effective KillSignal=9 and KillMode=control-group; the daemon was not stopped",
+            );
+        }
+        stop_unit_and_confirm(systemctl)
+    })();
+    drop(file);
+    // Always remove only this invocation's file, including failed writes,
+    // reloads, validation, stops and stop-state checks. Reload after removal
+    // even when syncing the directory fails, and report every cleanup error.
+    let mut cleanup = Vec::new();
+    collect(&mut cleanup, remove_file_if_present(&path));
+    collect(
+        &mut cleanup,
+        File::open(directory)
+            .and_then(|dir| dir.sync_all())
+            .map_err(Into::into),
+    );
+    collect(&mut cleanup, checked(systemctl, &["daemon-reload"]));
+    if !cleanup.is_empty() {
+        let original = stop
+            .err()
+            .map(|error| format!("{error}; "))
+            .unwrap_or_default();
+        return fail(format!(
+            "{original}cannot clean up legacy shutdown override {}: {}; control journals retained",
+            path.display(),
+            cleanup.join("; ")
+        ));
+    }
+    stop
+}
+
+fn verify_legacy_controls_restored(text: &str) -> Result<()> {
+    let mut unresolved = BTreeSet::new();
+    for line in text.lines().filter(|line| !line.is_empty()) {
+        let fields: Vec<_> = line.split('\t').collect();
+        if fields.len() != 5 {
+            continue;
+        }
+        let path = Path::new(fields[0]);
+        let metadata = match fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if metadata.dev().to_string() != fields[3] || metadata.ino().to_string() != fields[4] {
+            continue;
+        }
+        // The original was read from the kernel, so it is already canonical.
+        if read_limited(path, 128)?.trim() != fields[1].trim() {
+            unresolved.insert(path.display().to_string());
+        }
+    }
+    if !unresolved.is_empty() {
+        return fail(format!(
+            "legacy controls changed externally or could not be confirmed restored: {}; journals retained at {CONTROLS} and {CONTROL_RECOVERY}",
+            unresolved.into_iter().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    Ok(())
+}
+
+fn restore(backup: &Backup, systemctl: &Path) -> Result<()> {
+    let mut errors = Vec::new();
+    let state = service_state(systemctl, UNIT)?;
+    stop_manager(systemctl)?;
     if state.loaded {
         collect(&mut errors, checked(systemctl, &["disable", UNIT]));
     }
-    collect(&mut errors, crate::linux::restore_controls());
     for file in backup.files.iter().rev() {
         collect(&mut errors, file.restore());
     }
@@ -1097,6 +1293,19 @@ fn fail<T>(message: impl Into<String>) -> Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn journal_format_preserves_empty_pending_column_and_rejects_unknown_rows() {
+        let legacy = "/sys/fs/cgroup/example/memory.high\tmax\t12345\t10\t20\n";
+        let committed = "/sys/fs/cgroup/example/memory.high\tmax\t12288\t10\t20\t\n";
+        let pending = "/sys/fs/cgroup/example/memory.high\tmax\t12288\t10\t20\t8192\n";
+        assert!(legacy_control_journal(legacy).unwrap());
+        assert!(!legacy_control_journal(committed).unwrap());
+        assert!(!legacy_control_journal(pending).unwrap());
+        assert!(!legacy_control_journal("").unwrap());
+        assert!(legacy_control_journal(&format!("{committed}{legacy}")).unwrap());
+        assert!(legacy_control_journal("/sys/fs/cgroup/example/memory.high\tmax\n").is_err());
+    }
 
     #[test]
     fn paranoid_stop_detection_handles_combined_flags_and_ignores_comments() {
