@@ -524,6 +524,7 @@ impl Controls {
         if old == value {
             return Ok(());
         }
+        let mut managed_reset = false;
         if let Some(entry) = self.entries.get(path) {
             if !owned_control_value(
                 path,
@@ -532,9 +533,17 @@ impl Controls {
                 &old,
                 page_size,
             )? {
-                return Err(
-                    format!("external control change preserved: {}", path.display()).into(),
-                );
+                // systemd can reapply the default unlimited value when a new
+                // scope joins our dedicated aggregate slice. zmem owns that
+                // slice's policy limit while running. An explicit `max` there
+                // is a temporary reset; finite external limits stay protected.
+                if managed_background_high_reset(path, &entry.original, &old) {
+                    managed_reset = true;
+                } else {
+                    return Err(
+                        format!("external control change preserved: {}", path.display()).into(),
+                    );
+                }
             }
         }
         let previous = self.entries.get(path).cloned();
@@ -602,6 +611,13 @@ impl Controls {
         }
         result?;
         observed?;
+        if managed_reset {
+            println!(
+                "{{\"event\":\"managed_background_limit_reapplied\",\"path\":{},\"observed\":\"max\",\"applied\":{}}}",
+                json::quote(&path.to_string_lossy()),
+                json::quote(&value)
+            );
+        }
         Ok(())
     }
     fn protect(&mut self, path: &Path, bytes: u64) -> Result<()> {
@@ -635,6 +651,27 @@ fn valid_control(path: &Path) -> bool {
                 path.file_name().and_then(|s| s.to_str()),
                 Some("memory.low" | "memory.high")
             ))
+}
+fn managed_background_high_reset(path: &Path, original: &str, observed: &str) -> bool {
+    if original != "max" || observed != "max" {
+        return false;
+    }
+    let Some(relative) = path.strip_prefix(CGROOT).ok().and_then(|p| p.to_str()) else {
+        return false;
+    };
+    const SUFFIX: &str = "zmem.slice/zmem-background.slice/memory.high";
+    if relative == SUFFIX {
+        return true;
+    }
+    let Some(user) = relative.strip_prefix("user.slice/user-") else {
+        return false;
+    };
+    let Some((uid, tail)) = user.split_once(".slice/user@") else {
+        return false;
+    };
+    !uid.is_empty()
+        && uid.bytes().all(|c| c.is_ascii_digit())
+        && tail == format!("{uid}.service/{SUFFIX}")
 }
 fn control_page_size() -> Result<u64> {
     // libc reports the running kernel's base-page size without spawning a
@@ -1630,6 +1667,39 @@ mod tests {
         assert!(!owned_control_value(high, "12288", None, "8192", 4096).unwrap());
     }
     #[test]
+    fn only_owned_background_slices_may_reapply_an_unlimited_reset() {
+        for path in [
+            "/sys/fs/cgroup/zmem.slice/zmem-background.slice/memory.high",
+            "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/zmem.slice/zmem-background.slice/memory.high",
+        ] {
+            let path = Path::new(path);
+            assert!(managed_background_high_reset(path, "max", "max"));
+            assert!(
+                !managed_background_high_reset(path, "4096", "max"),
+                "preserve finite original limits"
+            );
+            assert!(
+                !managed_background_high_reset(path, "max", "8192"),
+                "preserve finite external limits"
+            );
+        }
+        for path in [
+            "/sys/fs/cgroup/zmem.slice/zmem-background.slice/memory.low",
+            "/sys/fs/cgroup/zmem.slice/zmem-background.slice/job.scope/memory.high",
+            "/sys/fs/cgroup/other.slice/zmem-background.slice/memory.high",
+            "/sys/fs/cgroup/zmem.slice/zmem-background-other.slice/memory.high",
+            "/sys/fs/cgroup/user.slice/user-1000.slice/user@1001.service/zmem.slice/zmem-background.slice/memory.high",
+            "/sys/fs/cgroup/user.slice/user-.slice/user@.service/zmem.slice/zmem-background.slice/memory.high",
+            "/sys/fs/cgroup/user.slice/user-name.slice/user@name.service/zmem.slice/zmem-background.slice/memory.high",
+            "/proc/sys/vm/swappiness",
+        ] {
+            assert!(
+                !managed_background_high_reset(Path::new(path), "max", "max"),
+                "{path}"
+            );
+        }
+    }
+    #[test]
     #[ignore = "requires root, cgroup v2, and a stopped zmem daemon"]
     fn kernel_cgroup_rounding_and_restore() {
         unsafe extern "C" {
@@ -1783,5 +1853,112 @@ mod tests {
                 .is_empty()
         );
         fs::remove_dir(&fixture).expect("remove the successful empty regression cgroup");
+    }
+    #[test]
+    #[ignore = "requires root, a stopped zmem daemon, and no system zmem.slice cgroup"]
+    fn kernel_managed_background_reset_and_restore() {
+        unsafe extern "C" {
+            fn geteuid() -> u32;
+        }
+        assert_eq!(
+            unsafe { geteuid() },
+            0,
+            "run this ignored regression as root"
+        );
+        let parent = Path::new(CGROOT).join("zmem.slice");
+        assert!(
+            !parent.exists(),
+            "refusing to reuse an existing system zmem.slice"
+        );
+        assert!(
+            !Path::new(CONTROL_FILE).exists(),
+            "stop zmem and recover its control journal first"
+        );
+        let _lock = InstanceLock::acquire().expect("the real zmem daemon must be stopped");
+        assert!(
+            !parent.exists(),
+            "system zmem.slice appeared before the regression acquired the lock"
+        );
+        assert!(
+            !Path::new(CONTROL_FILE).exists(),
+            "a control journal appeared before the regression acquired the lock"
+        );
+        fs::create_dir(&parent).expect("create a fresh empty system zmem.slice fixture");
+        eprintln!(
+            "zmem managed-slice regression fixture: {}; on failure retain it and {} for inspection",
+            parent.display(),
+            CONTROL_FILE
+        );
+        assert!(read(parent.join("cgroup.procs")).unwrap().trim().is_empty());
+        assert!(
+            read(parent.join("cgroup.controllers"))
+                .unwrap()
+                .split_whitespace()
+                .any(|name| name == "memory"),
+            "the root cgroup must already delegate the memory controller"
+        );
+        // Enable memory only in the fresh, empty fixture. No root controller
+        // configuration or real workload cgroup is changed by this regression.
+        fs::write(parent.join("cgroup.subtree_control"), "+memory").unwrap();
+        let child = parent.join("zmem-background.slice");
+        fs::create_dir(&child).unwrap();
+        assert!(read(child.join("cgroup.procs")).unwrap().trim().is_empty());
+        let high = child.join("memory.high");
+        assert_eq!(read(&high).unwrap().trim(), "max");
+        let page = control_page_size().unwrap();
+        let mut controls = Controls::new();
+        controls
+            .set(&high, &(page * 32 + 23).to_string(), true)
+            .unwrap();
+        assert_eq!(read(&high).unwrap().trim(), (page * 32).to_string());
+        let identity = fs::metadata(&high).unwrap();
+        fs::write(&high, "max").unwrap();
+        controls
+            .set(&high, &(page * 64 + 17).to_string(), true)
+            .expect("an unlimited reset of the owned aggregate must permit reapplying policy");
+        let after = fs::metadata(&high).unwrap();
+        assert_eq!((after.dev(), after.ino()), (identity.dev(), identity.ino()));
+        let expected = (page * 64).to_string();
+        assert_eq!(read(&high).unwrap().trim(), expected);
+        let entry = controls.entries.get(&high).unwrap();
+        assert_eq!(entry.original, "max");
+        assert_eq!(entry.last, expected);
+        assert!(entry.pending_previous.is_none());
+        let journal = read(CONTROL_FILE).unwrap();
+        let row = journal
+            .lines()
+            .find(|line| line.split('\t').next() == high.to_str())
+            .unwrap();
+        let fields: Vec<_> = row.split('\t').collect();
+        assert_eq!(fields.len(), 6);
+        assert_eq!(fields[1], "max");
+        assert_eq!(fields[2], expected);
+        assert!(fields[5].is_empty());
+        restore_controls().unwrap();
+        assert_eq!(read(&high).unwrap().trim(), "max");
+        assert!(!Path::new(CONTROL_FILE).exists());
+
+        let mut controls = Controls::new();
+        controls
+            .set(&high, &(page * 32 + 23).to_string(), true)
+            .unwrap();
+        let external = (page * 96).to_string();
+        fs::write(&high, &external).unwrap();
+        let error = controls
+            .set(&high, &(page * 64 + 17).to_string(), true)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("external control change preserved")
+        );
+        assert_eq!(read(&high).unwrap().trim(), external);
+        restore_controls().unwrap();
+        assert_eq!(read(&high).unwrap().trim(), external);
+        assert!(!Path::new(CONTROL_FILE).exists());
+        assert!(read(child.join("cgroup.procs")).unwrap().trim().is_empty());
+        assert!(read(parent.join("cgroup.procs")).unwrap().trim().is_empty());
+        fs::remove_dir(&child).expect("remove the successful empty background fixture");
+        fs::remove_dir(&parent).expect("remove the successful empty parent fixture");
     }
 }

@@ -58,7 +58,21 @@ def updated_files(version: str) -> dict[Path, str]:
     lock_text, count = re.subn(pattern, lambda m: m[1] + version + m[2], lock_content)
     if count != 1:
         raise ValueError(f"expected exactly one {package} package in Cargo.lock")
-    return {manifest: manifest_text, lock: lock_text, ROOT / "site/version.js": f'window.ZMEM_VERSION = "{version}";\n'}
+    index = ROOT / "site/index.html"
+    index_text, count = re.subn(
+        r'(?P<open><(?P<tag>[A-Za-z][A-Za-z0-9:-]*)\b[^>]*\sdata-version(?=[\s>])[^>]*>)'
+        r'[^<]*(?P<close></(?P=tag)\s*>)',
+        lambda item: item["open"] + f"v{version}" + item["close"],
+        index.read_text(),
+    )
+    if count == 0:
+        raise ValueError("site/index.html has no data-version fallback elements")
+    return {
+        manifest: manifest_text,
+        lock: lock_text,
+        ROOT / "site/version.js": f'window.ZMEM_VERSION = "{version}";\n',
+        index: index_text,
+    }
 
 
 def main() -> int:

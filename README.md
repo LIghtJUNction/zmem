@@ -93,6 +93,8 @@ The `--max-memory` value is in MiB. The disposable class is for work that can be
 
 The policy core is a deterministic state machine. It receives a snapshot and a monotonic timestamp, then produces a bounded decision. The Linux adapter checks real ownership, kernel state, disk capacity and operation results before acting.
 
+While the daemon is running, zmem owns the aggregate `memory.high` policy of its dedicated `zmem.slice/zmem-background.slice`, including the corresponding slice below a user manager. systemd can reset that slice to `max` when a new scope starts. If the original baseline was unlimited and the cgroup is still the same object, zmem reapplies its policy and records a `managed_background_limit_reapplied` event. A manual `max` write to this dedicated slice is therefore temporary. Finite external limits, finite original baselines, other cgroups and `memory.low` retain the normal external-change protection. Run jobs outside the background class when another tool should own their limits.
+
 | Default policy setting | Value |
 | --- | --- |
 | Available-memory reserve | Larger of 1 GiB or 10% of physical RAM, capped at total RAM |

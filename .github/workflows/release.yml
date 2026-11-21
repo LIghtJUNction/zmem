@@ -81,12 +81,14 @@ jobs:
           persist-credentials: false
       - name: Install Rust
         run: |
-          rustup toolchain install 1.100.0 --profile minimal --component rustfmt
+          rustup toolchain install 1.100.0 --profile minimal --component rustfmt --component clippy
           rustup default 1.100.0
       - name: Validate the release source
         run: |
           cargo fmt --check
+          python3 -m unittest discover -s scripts -p test_bump.py -v
           cargo test --locked
+          cargo clippy --locked --all-targets -- -D warnings
           cargo check --locked --lib --no-default-features
       - name: Build native executable
         run: cargo build --release --locked --target "${{ matrix.target }}"
