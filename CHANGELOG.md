@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.1 — 2026-11-22
+
+- Add a measured reclaim-latency guard to automatic swappiness selection. Sustained memory stalls together with direct scanning and anonymous refaults cap optimistic preferences at 60 while retaining lower actual values, existing hysteresis and confirmed disk-swap churn priority.
+- Skip swappiness writes when current kernel readback is unavailable; expose a null request and `readback_unavailable` instead of writing a previously cached value.
+- Prepare additive I/O delegation and accounting for user managers through a separately owned drop-in. Keep the original installation backup format readable and preserve foreign files or later external edits during upgrades and rollback.
+- Publish the drop-in with create-only semantics and a durable ownership record; recover interrupted preparation and undo only configuration created by the failed installation.
+- Add read-only user I/O-controller diagnostics to `doctor --json`. Distinguish an installed default from an existing manager that still needs a refresh, without automatically restarting user sessions or claiming that declared I/O weights are effective.
+- Record the local background-scanner investigation, effective bandwidth limits and observed memory-pressure changes separately from policy regression tests; no mouse-latency speedup is inferred.
+
 ## 0.3.0 — 2026-11-22
 
 - Schedule automatic maintenance of owned Swap files, at most one candidate per attempt and at least 60 seconds between attempts. Give growth and managed-background reclaim priority.

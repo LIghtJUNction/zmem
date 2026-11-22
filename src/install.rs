@@ -208,6 +208,7 @@ pub fn install(source: Option<&Path>, replace: bool) -> Result<()> {
     // command. An unsuccessful upgrade must restore the version just running.
     let transaction_directory = unique_path(Path::new("/var/lib/zmem"), "upgrade");
     let transaction = Backup::capture_at(services, &transaction_directory, transaction_paths())?;
+    let mut io_change = None;
     let migration = (|| -> Result<()> {
         // Keep stop inside the transaction. Recovery itself must confirm a
         // full stop before restoring files or starting any other controller.
@@ -230,6 +231,10 @@ pub fn install(source: Option<&Path>, replace: bool) -> Result<()> {
             // their zram device are never stopped or reset during takeover.
             replace_with_mask(Path::new(GENERATOR))?;
         }
+        // Keep this additive drop-in outside the immutable v1 baseline. Its
+        // own receipt protects external changes and distinguishes this
+        // transaction's new file from an earlier successful installation.
+        io_change = Some(crate::io_delegation::install()?);
         checked(&systemctl, &["daemon-reload"])?;
         if replace {
             for name in LEGACY {
@@ -248,8 +253,10 @@ pub fn install(source: Option<&Path>, replace: bool) -> Result<()> {
         Ok(())
     })();
     if let Err(error) = migration {
-        let recovery = restore(&transaction, &systemctl)
-            .and_then(|()| verify_swaps_preserved(&swaps_before, &swaps()?));
+        let recovery = restore(&transaction, &systemctl, || {
+            crate::io_delegation::undo_created(io_change.as_ref())
+        })
+        .and_then(|()| verify_swaps_preserved(&swaps_before, &swaps()?));
         return match recovery {
             Ok(()) => {
                 // Recovery succeeded. The permanent first-install baseline
@@ -278,6 +285,9 @@ pub fn install(source: Option<&Path>, replace: bool) -> Result<()> {
         );
     }
     println!("zmem is active; configuration: {CONFIG}");
+    if let Some(change) = &io_change {
+        crate::io_delegation::report_install(change);
+    }
     println!("Existing swap was retained. Restore the original setup with: sudo zmem rollback");
     Ok(())
 }
@@ -289,7 +299,7 @@ pub fn rollback() -> Result<()> {
     let _lock = InstallLock::acquire()?;
     let backup = Backup::load()?;
     let systemctl = executable("systemctl")?;
-    restore(&backup, &systemctl)?;
+    restore(&backup, &systemctl, crate::io_delegation::rollback)?;
     println!("Original memory-controller configuration restored; active swap retained.");
     Ok(())
 }
@@ -508,10 +518,23 @@ fn verify_legacy_controls_restored(text: &str) -> Result<()> {
     Ok(())
 }
 
-fn restore(backup: &Backup, systemctl: &Path) -> Result<()> {
+fn restore(
+    backup: &Backup,
+    systemctl: &Path,
+    withdraw_io: impl FnOnce() -> Result<crate::io_delegation::Withdrawal>,
+) -> Result<()> {
     let mut errors = Vec::new();
     let state = service_state(systemctl, UNIT)?;
     stop_manager(systemctl)?;
+    // An optional delegation cleanup problem must not prevent restoration of
+    // the previous working memory controller. Report it after core recovery.
+    let io_error = match withdraw_io() {
+        Ok(withdrawal) => {
+            withdrawal.report();
+            None
+        }
+        Err(error) => Some(error.to_string()),
+    };
     if state.loaded {
         collect(&mut errors, checked(systemctl, &["disable", UNIT]));
     }
@@ -575,6 +598,11 @@ fn restore(backup: &Backup, systemctl: &Path) -> Result<()> {
                 service.name, service.enabled, actual.enabled
             ));
         }
+    }
+    if let Some(error) = io_error {
+        errors.push(format!(
+            "I/O delegation withdrawal needs attention: {error}"
+        ));
     }
     if errors.is_empty() {
         Ok(())
@@ -1642,6 +1670,68 @@ mod tests {
             size_kib: 2_097_148,
             priority: -2,
         }
+    }
+
+    #[test]
+    fn io_delegation_keeps_the_original_version_one_backup_loadable() {
+        // This fixed list represents a baseline written before I/O delegation
+        // existed. Do not derive it from tracked_paths(): that would hide an
+        // incompatible extension of the immutable v1 manifest.
+        let paths = [
+            "/usr/local/bin/zmem",
+            "/etc/zmem/zmem.conf",
+            "/etc/systemd/system/zmem.service",
+            "/etc/systemd/system-generators/zram-generator",
+            "/var/lib/zmem/adopted-swaps",
+            "/etc/systemd/system/systemd-oomd.socket",
+            "/etc/systemd/system/systemd-oomd.service",
+            "/etc/systemd/system/swapspace.service",
+            "/etc/systemd/system/nohang.service",
+            "/etc/systemd/system/nohang-desktop.service",
+            "/etc/systemd/system/earlyoom.service",
+            "/etc/swapspace.conf",
+            "/etc/systemd/zram-generator.conf",
+            "/etc/nohang/nohang.conf",
+            "/etc/nohang/nohang-desktop.conf",
+            "/etc/default/earlyoom",
+            "/etc/systemd/oomd.conf",
+        ];
+        let old = Backup {
+            directory: BASELINE.into(),
+            files: paths
+                .into_iter()
+                .enumerate()
+                .map(|(index, path)| SavedFile {
+                    path: path.into(),
+                    kind: FileKind::Missing,
+                    mode: 0,
+                    uid: 0,
+                    gid: 0,
+                    index,
+                })
+                .collect(),
+            services: [
+                "systemd-oomd.socket",
+                "systemd-oomd.service",
+                "swapspace.service",
+                "nohang.service",
+                "nohang-desktop.service",
+                "earlyoom.service",
+                "zmem.service",
+            ]
+            .into_iter()
+            .map(|name| SavedService {
+                name: name.into(),
+                loaded: false,
+                active: false,
+                enabled: "disabled".into(),
+            })
+            .collect(),
+            sysctls: Vec::new(),
+        };
+        assert_eq!(Backup::decode(&old.encode()).unwrap().files.len(), 17);
+        assert_eq!(tracked_paths().len(), 17);
+        assert_eq!(transaction_paths().len(), 19);
     }
 
     #[test]

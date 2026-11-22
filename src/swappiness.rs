@@ -4,6 +4,12 @@
 //! turning noisy two-second samples into alternating global kernel settings.
 
 const MIB: u64 = 1024 * 1024;
+// Conservative starting thresholds for observed reclaim contention, not
+// kernel recommendations or a measurement of pointer/input latency.
+const RECLAIM_GUARD_FULL_BP: u16 = 100;
+const RECLAIM_GUARD_SCAN_BYTES: u64 = 64 * MIB;
+const RECLAIM_GUARD_ANON_BYTES: u64 = 4 * MIB;
+const RECLAIM_GUARD_CEILING: u16 = 60;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Input {
@@ -11,6 +17,7 @@ pub struct Input {
     pub file_refault: u64,
     pub anon_refault: u64,
     pub direct_scan: u64,
+    pub memory_full_bp: u16,
     pub swap_in: u64,
     pub disk_swap_in: Option<u64>,
     pub efficient_zram_room: bool,
@@ -24,6 +31,8 @@ pub struct Preference {
     pub value: u16,
     pub reason: &'static str,
     pub urgent: bool,
+    /// A ceiling may withdraw a promotion but must not raise a lower read-back.
+    pub ceiling_only: bool,
 }
 
 pub fn preference(i: Input) -> Preference {
@@ -35,18 +44,37 @@ pub fn preference(i: Input) -> Preference {
         && i.file_refault >= i.anon_refault.saturating_mul(2)
         && i.file_refault >= i.swap_in.saturating_mul(2);
     let disk_churn = i.disk_swap_in.is_some_and(|rate| rate >= 32 * MIB);
-    if file_dominates && !disk_churn {
-        return Preference {
-            value: if i.efficient_zram_room { 100 } else { 80 },
-            reason: "file_working_set_refaults",
-            urgent: false,
-        };
-    }
     if disk_churn {
         return Preference {
             value: i.hint.min(40),
             reason: "disk_swap_read_pressure",
             urgent: true,
+            ceiling_only: false,
+        };
+    }
+    // Global refault counts do not identify foreground working sets or the
+    // relative cost of file and anonymous paging. When direct reclaim and
+    // anonymous refaults coincide with measured stalls, withdraw automatic
+    // file/zram promotion through the ordinary governor rather than assuming
+    // that keeping more file cache will improve interactive responsiveness.
+    if i.rates_available
+        && i.direct_scan >= RECLAIM_GUARD_SCAN_BYTES
+        && i.anon_refault >= RECLAIM_GUARD_ANON_BYTES
+        && i.memory_full_bp >= RECLAIM_GUARD_FULL_BP
+    {
+        return Preference {
+            value: RECLAIM_GUARD_CEILING,
+            reason: "reclaim_latency_guard",
+            urgent: false,
+            ceiling_only: true,
+        };
+    }
+    if file_dominates {
+        return Preference {
+            value: if i.efficient_zram_room { 100 } else { 80 },
+            reason: "file_working_set_refaults",
+            urgent: false,
+            ceiling_only: false,
         };
     }
     // PSI alone cannot establish that compressed swap is expensive. In the
@@ -56,6 +84,7 @@ pub fn preference(i: Input) -> Preference {
             value: if i.interactive { 100 } else { 120 },
             reason: "efficient_zram_headroom",
             urgent: false,
+            ceiling_only: false,
         };
     }
     Preference {
@@ -74,6 +103,7 @@ pub fn preference(i: Input) -> Preference {
             "warming_sample"
         },
         urgent: false,
+        ceiling_only: false,
     }
 }
 
@@ -106,7 +136,12 @@ impl Governor {
         Self::default()
     }
 
-    pub fn observe(&mut self, desired: Preference, actual: Option<u16>, now: u64) -> Preference {
+    pub fn observe(
+        &mut self,
+        mut desired: Preference,
+        actual: Option<u16>,
+        now: u64,
+    ) -> Preference {
         let elapsed = self
             .last_observed
             .map_or(0, |previous| now.saturating_sub(previous))
@@ -129,8 +164,12 @@ impl Governor {
                 value: self.current.unwrap_or(desired.value).min(200),
                 reason: "readback_unavailable",
                 urgent: false,
+                ceiling_only: false,
             };
         };
+        if desired.ceiling_only {
+            desired.value = desired.value.min(current);
+        }
         if self.current.is_some_and(|previous| previous != current) {
             // A matching read-back confirms the preceding proposal. External
             // changes are also a new baseline and restart the normal cooldown.
@@ -198,6 +237,7 @@ impl Governor {
             value: next,
             reason: candidate.preference.reason,
             urgent: false,
+            ceiling_only: candidate.preference.ceiling_only,
         }
     }
 
@@ -247,12 +287,175 @@ fn hold(value: u16, reason: &'static str) -> Preference {
         value,
         reason,
         urgent: false,
+        ceiling_only: false,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn reclaim_contention() -> Input {
+        Input {
+            rates_available: true,
+            file_refault: 79 * MIB,
+            anon_refault: 57 * MIB / 10,
+            direct_scan: 156 * MIB,
+            memory_full_bp: 123,
+            hint: 60,
+            ..Input::default()
+        }
+    }
+
+    #[test]
+    fn observed_reclaim_combination_caps_file_and_zram_promotions() {
+        for efficient_zram_room in [false, true] {
+            for file_refault in [0, 79 * MIB] {
+                let desired = preference(Input {
+                    file_refault,
+                    efficient_zram_room,
+                    ..reclaim_contention()
+                });
+                assert_eq!(desired.value, 60);
+                assert_eq!(desired.reason, "reclaim_latency_guard");
+                assert!(desired.ceiling_only);
+                assert!(!desired.urgent);
+            }
+        }
+    }
+
+    #[test]
+    fn reclaim_guard_requires_all_three_thresholds_and_warmed_rates() {
+        let boundary = Input {
+            direct_scan: 64 * MIB,
+            anon_refault: 4 * MIB,
+            memory_full_bp: 100,
+            ..reclaim_contention()
+        };
+        assert!(preference(boundary).ceiling_only);
+        for below in [
+            Input {
+                direct_scan: 64 * MIB - 1,
+                ..boundary
+            },
+            Input {
+                anon_refault: 4 * MIB - 1,
+                ..boundary
+            },
+            Input {
+                memory_full_bp: 99,
+                ..boundary
+            },
+            Input {
+                rates_available: false,
+                ..boundary
+            },
+        ] {
+            assert!(!preference(below).ceiling_only, "{below:?}");
+        }
+    }
+
+    #[test]
+    fn sustained_reclaim_guard_withdraws_eighty_after_ordinary_support() {
+        let mut governor = Governor::new();
+        let desired = preference(reclaim_contention());
+        let mut actual = 80;
+        let mut writes = Vec::new();
+        for now in (0..=60).step_by(2) {
+            let proposal = governor.observe(desired, Some(actual), now);
+            assert!(!proposal.urgent);
+            assert!(proposal.value <= actual);
+            if proposal.value != actual {
+                writes.push((now, proposal.value));
+                actual = proposal.value;
+            }
+        }
+        assert_eq!(actual, 60);
+        assert_eq!(writes, [(10, 60)]);
+    }
+
+    #[test]
+    fn reclaim_ceiling_never_raises_a_lower_actual_or_a_failed_write_baseline() {
+        let desired = preference(reclaim_contention());
+        for actual in [0, 20, 40, 59, 60] {
+            let mut governor = Governor::new();
+            // Leave an unsupported/failed upward proposal in the old history.
+            for now in (0..=20).step_by(2) {
+                governor.observe(hold(120, "efficient_zram_headroom"), Some(actual), now);
+            }
+            for now in (22..=90).step_by(2) {
+                assert_eq!(governor.observe(desired, Some(actual), now).value, actual);
+            }
+        }
+        let mut governor = Governor::new();
+        assert_eq!(governor.observe(desired, Some(120), 0).value, 120);
+        assert_eq!(governor.observe(desired, Some(120), 10).value, 100);
+        // A failed reduction must not be mistaken for a confirmed new value.
+        assert_eq!(governor.observe(desired, Some(120), 40).value, 100);
+        let unknown = governor.observe(desired, None, 42);
+        assert_eq!(unknown.value, 120);
+        assert_eq!(unknown.reason, "readback_unavailable");
+    }
+
+    #[test]
+    fn short_or_alternating_reclaim_guard_samples_do_not_lower_the_setting() {
+        let guard = preference(reclaim_contention());
+        let normal = preference(Input {
+            memory_full_bp: 99,
+            ..reclaim_contention()
+        });
+        assert_eq!(normal.value, 80);
+        for alternating in [false, true] {
+            let mut governor = Governor::new();
+            for now in (0..=60).step_by(2) {
+                let desired = if (alternating && now % 4 == 2) || now == 2 {
+                    guard
+                } else {
+                    normal
+                };
+                assert_eq!(governor.observe(desired, Some(80), now).value, 80);
+            }
+        }
+    }
+
+    #[test]
+    fn reclaim_guard_and_later_promotion_obey_the_existing_write_interval() {
+        let mut governor = Governor::new();
+        let normal = hold(80, "file_working_set_refaults");
+        let guard = preference(reclaim_contention());
+        assert_eq!(governor.observe(normal, Some(60), 0).value, 60);
+        assert_eq!(governor.observe(normal, Some(60), 10).value, 80);
+        for now in (12..40).step_by(2) {
+            assert_eq!(governor.observe(guard, Some(80), now).value, 80);
+        }
+        assert_eq!(governor.observe(guard, Some(80), 40).value, 60);
+        for now in (42..70).step_by(2) {
+            assert_eq!(governor.observe(normal, Some(60), now).value, 60);
+        }
+        assert_eq!(governor.observe(normal, Some(60), 70).value, 80);
+    }
+
+    #[test]
+    fn confirmed_disk_churn_keeps_priority_over_the_reclaim_ceiling() {
+        let desired = preference(Input {
+            disk_swap_in: Some(32 * MIB),
+            efficient_zram_room: true,
+            hint: 20,
+            ..reclaim_contention()
+        });
+        assert!(desired.urgent);
+        assert!(!desired.ceiling_only);
+        assert_eq!(desired.reason, "disk_swap_read_pressure");
+        let mut governor = Governor::new();
+        for now in [0, 2, 4] {
+            assert_eq!(governor.observe(desired, Some(80), now).value, 80);
+        }
+        assert_eq!(governor.observe(desired, Some(80), 6).value, 20);
+        let guard = preference(reclaim_contention());
+        for now in (8..=60).step_by(2) {
+            assert_eq!(governor.observe(guard, Some(20), now).value, 20);
+        }
+    }
 
     #[test]
     fn file_working_set_can_win_even_when_disk_is_busy_and_zram_is_full() {
@@ -342,6 +545,7 @@ mod tests {
                 value: if now % 4 == 0 { 120 } else { 20 },
                 reason: "test",
                 urgent: false,
+                ceiling_only: false,
             };
             assert_eq!(g.observe(desired, Some(60), now).value, 60);
         }
@@ -354,6 +558,7 @@ mod tests {
             value: 120,
             reason: "test",
             urgent: false,
+            ceiling_only: false,
         };
         assert_eq!(g.observe(p, Some(40), 0).value, 40);
         assert_eq!(g.observe(p, Some(40), 10).value, 60);
@@ -377,6 +582,7 @@ mod tests {
             value: 120,
             reason: "test",
             urgent: false,
+            ceiling_only: false,
         };
         g.observe(p, Some(40), 100);
         assert_eq!(g.observe(p, Some(40), 50).value, 40);
@@ -540,6 +746,7 @@ mod tests {
             value: 20,
             reason: "disk_swap_read_pressure",
             urgent: true,
+            ceiling_only: false,
         };
         for now in [0, 2, 4] {
             assert_eq!(g.observe(disk, Some(80), now).value, 80);

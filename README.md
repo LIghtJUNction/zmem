@@ -2,7 +2,7 @@
 
 **Memory, with room to work.** A small Linux memory and Swap controller from [Project Z](https://github.com/LIghtJUNction/project-z).
 
-[Website](https://lightjunction.github.io/zmem/) · [Releases](https://github.com/LIghtJUNction/zmem/releases) · [crates.io](https://crates.io/crates/zmem-manager) · [Rust API](https://docs.rs/zmem-manager) · [Swap and dedup guide](docs/swap-lifecycle-and-dedup.md) · [0.3.0 acceptance](docs/acceptance-0.3.0.md) · [0.2.0 host acceptance](docs/acceptance-0.2.0.md) · [Prior pressure validation](docs/acceptance-pressure-journal.md) · [Prior scheduling validation](docs/acceptance-adaptive-scheduling.md)
+[Website](https://lightjunction.github.io/zmem/) · [Releases](https://github.com/LIghtJUNction/zmem/releases) · [crates.io](https://crates.io/crates/zmem-manager) · [Rust API](https://docs.rs/zmem-manager) · [Responsiveness guide](docs/responsiveness.md) · [0.3.1 acceptance](docs/acceptance-0.3.1.md) · [Swap and dedup guide](docs/swap-lifecycle-and-dedup.md) · [0.3.0 acceptance](docs/acceptance-0.3.0.md) · [0.2.0 host acceptance](docs/acceptance-0.2.0.md)
 
 zmem observes memory pressure, preserves headroom for interactive work, and gives managed background jobs a bounded memory budget. It brings zram setup, dynamic disk swap, automatic cleanup, opt-in memory deduplication and structured inspection into one tool. The Rust implementation has no third-party crate dependencies; the policy library uses `no_std` and makes no heap allocations.
 
@@ -16,6 +16,8 @@ zmem observes memory pressure, preserves headroom for interactive work, and give
 | Explicit memory deduplication | Registers trusted background or disposable jobs with `--dedup`; pauses owned KSM scanning under CPU, memory or IO pressure. |
 | Workload budgets | Adjusts aggregate cgroup v2 `memory.high` budgets to managed background usage and available headroom; disposable jobs retain explicit hard limits. |
 | Interactive protection | Assigns a bounded `memory.low` budget to recognized desktop, terminal and remote-access scopes through their actual cgroup hierarchy. |
+| Reclaim responsiveness | Caps optimistic swappiness adjustments when memory stalls, direct reclaim and anonymous refaults occur together; skips writes when current kernel readback is unavailable. |
+| User I/O controls | Prepares additive I/O delegation and accounting; reports whether the calling user's existing manager has the controller available. |
 | Observability | Reports daemon state, actual kernel controls, managed-workload coverage and on-demand process usage in human-readable and JSON output. |
 | Service migration | Saves prior service/configuration state, replaces existing management services, and offers rollback. |
 
@@ -39,6 +41,8 @@ sudo "$(command -v zmem)" install --replace
 ```
 
 `install --replace` is the explicit system migration operation. It preserves active swap, records the prior management configuration and installs the zmem service. Existing swap that contains data is adopted in place. Changes that require rebuilding zram take effect at a normal subsequent boot.
+
+The installer also prepares I/O delegation for user managers without replacing their other delegated controllers. An existing session may need a manager refresh before user scopes can enforce I/O controls; `zmem doctor --json` reports the observed state. See the [responsiveness guide](docs/responsiveness.md#make-user-session-io-controls-available) for refresh and kernel-readback checks. The installer does not restart user sessions automatically.
 
 Active Swap created in an older service mount namespace can retain an old alias in `/proc/swaps` until reactivation or a normal boot. Its capacity remains available. Maintenance never infers inactivity from a missing canonical pathname: cleanup leaves active files protected by the kernel, and retirement requires the full-file headroom checks described in the [lifecycle guide](docs/swap-lifecycle-and-dedup.md#automatic-swap-maintenance).
 

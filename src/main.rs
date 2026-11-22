@@ -7,6 +7,8 @@ mod dedup;
 #[cfg(target_os = "linux")]
 mod install;
 #[cfg(target_os = "linux")]
+mod io_delegation;
+#[cfg(target_os = "linux")]
 mod json;
 #[cfg(target_os = "linux")]
 mod linux;
@@ -124,6 +126,8 @@ fn execute() -> Result<()> {
                 return Err("doctor accepts --json".into());
             }
             let (result, ok) = linux::doctor_json();
+            let mut result = json::parse(&result)?;
+            result.set("user_io", io_delegation::diagnostics())?;
             println!("{result}");
             if ok {
                 Ok(())

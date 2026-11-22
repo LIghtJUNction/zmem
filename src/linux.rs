@@ -2078,6 +2078,7 @@ fn swappiness_preference(
         file_refault: t.paging.file_refault_bytes_per_sec,
         anon_refault: t.paging.anon_refault_bytes_per_sec,
         direct_scan: t.paging.direct_scan_bytes_per_sec,
+        memory_full_bp: t.sample.memory_full_bp,
         swap_in: t.sample.swap_in_bytes_per_sec,
         disk_swap_in: t
             .paging
@@ -2093,6 +2094,23 @@ fn swappiness_preference(
 fn effective_swappiness(settings: &Settings, t: &Telemetry, d: &Decision) -> u16 {
     swappiness_preference(settings, t, d).value
 }
+
+fn apply_swappiness_request(
+    actual: Option<u16>,
+    preference: swappiness::Preference,
+    applied: &mut Applied,
+    write: impl FnOnce(u16) -> Result<()>,
+) -> Result<()> {
+    applied.swappiness_reason = preference.reason;
+    // A cached governor value is useful for reporting but is not permission
+    // to overwrite a sysctl whose current value could not be observed.
+    applied.swappiness_requested = actual.map(|_| preference.value);
+    match applied.swappiness_requested {
+        Some(value) => write(value),
+        None => Ok(()),
+    }
+}
+
 fn apply_controls(
     settings: &Settings,
     t: &mut Telemetry,
@@ -2123,19 +2141,17 @@ fn apply_controls(
     t.applied.protection_errors = c.protection_errors.clone();
     t.applied.protection_sampled_at = c.protection_sampled_at;
     if settings.manage_swappiness {
-        let preference = c.swappiness_governor.observe(
-            swappiness_preference(settings, t, d),
-            observed_number("/proc/sys/vm/swappiness").and_then(|n| n.try_into().ok()),
-            now_secs,
-        );
-        let value = preference.value;
-        t.applied.swappiness_requested = Some(value);
-        t.applied.swappiness_reason = preference.reason;
-        if let Err(e) = c.set(
-            Path::new("/proc/sys/vm/swappiness"),
-            &value.to_string(),
-            false,
-        ) {
+        let actual = observed_number("/proc/sys/vm/swappiness").and_then(|n| n.try_into().ok());
+        let preference =
+            c.swappiness_governor
+                .observe(swappiness_preference(settings, t, d), actual, now_secs);
+        if let Err(e) = apply_swappiness_request(actual, preference, &mut t.applied, |value| {
+            c.set(
+                Path::new("/proc/sys/vm/swappiness"),
+                &value.to_string(),
+                false,
+            )
+        }) {
             errors.push(e.to_string());
         }
         if !t.zram.is_empty() {
@@ -4131,6 +4147,73 @@ mod tests {
         assert_eq!(effective_swappiness(&settings, &t, &d), 80);
         t.paging.rates_available = false;
         assert_eq!(effective_swappiness(&settings, &t, &d), 60);
+    }
+
+    #[test]
+    fn swappiness_reclaim_guard_uses_measured_stalls_even_when_pressure_is_healthy() {
+        let settings = Settings::default();
+        let mut t = swappiness_fixture();
+        t.sample.available_bytes = 2_950_000_000;
+        t.sample.memory_full_bp = 123;
+        t.sample.io_full_bp = 429;
+        t.paging.file_refault_bytes_per_sec = 79 * MIB;
+        t.paging.anon_refault_bytes_per_sec = 57 * MIB / 10;
+        t.paging.direct_scan_bytes_per_sec = 156 * MIB;
+        for logical_used in [5 * GIB, 10 * GIB] {
+            t.zram[0].logical_used = logical_used;
+            let d = Policy::new(settings.policy).observe(t.sample, 0);
+            assert_eq!(d.pressure, zmem::Pressure::Healthy);
+            let preference = swappiness_preference(&settings, &t, &d);
+            assert_eq!(preference.value, 60);
+            assert_eq!(preference.reason, "reclaim_latency_guard");
+            assert!(preference.ceiling_only);
+        }
+        t.sample.memory_full_bp = 99;
+        let d = Policy::new(settings.policy).observe(t.sample, 0);
+        assert_eq!(effective_swappiness(&settings, &t, &d), 80);
+    }
+
+    #[test]
+    fn swappiness_missing_readback_cannot_write_a_cached_higher_value() {
+        let desired = swappiness::preference(swappiness::Input {
+            rates_available: true,
+            direct_scan: 156 * MIB,
+            anon_refault: 57 * MIB / 10,
+            memory_full_bp: 123,
+            ..swappiness::Input::default()
+        });
+        let mut governor = SwappinessGovernor::new();
+        governor.observe(desired, Some(120), 0);
+        let unavailable = governor.observe(desired, None, 2);
+        assert_eq!(unavailable.value, 120);
+        assert_eq!(unavailable.reason, "readback_unavailable");
+        let mut kernel_value = 40;
+        let mut writes = Vec::new();
+        let mut applied = Applied {
+            swappiness_requested: Some(120),
+            ..Applied::default()
+        };
+        apply_swappiness_request(None, unavailable, &mut applied, |value| {
+            kernel_value = value;
+            writes.push(value);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(kernel_value, 40);
+        assert!(writes.is_empty());
+        assert_eq!(applied.swappiness_requested, None);
+        assert_eq!(applied.swappiness_reason, "readback_unavailable");
+
+        let observed = governor.observe(desired, Some(kernel_value), 4);
+        apply_swappiness_request(Some(kernel_value), observed, &mut applied, |value| {
+            kernel_value = value;
+            writes.push(value);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(kernel_value, 40);
+        assert_eq!(writes, [40]);
+        assert_eq!(applied.swappiness_requested, Some(40));
     }
 
     #[test]
