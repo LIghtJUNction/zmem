@@ -1,4 +1,6 @@
 #[cfg(target_os = "linux")]
+mod admission;
+#[cfg(target_os = "linux")]
 mod budget;
 #[cfg(target_os = "linux")]
 mod config;
@@ -23,7 +25,7 @@ Usage:
   zmem schema
   zmem daemon [--observe] [--config PATH]
   zmem once [--apply] [--config PATH]
-  zmem run --class background|interactive|disposable [--max-memory MiB] [--dedup] -- COMMAND...
+  zmem run --class background|interactive|disposable [--wait-timeout SECONDS] [--max-memory MiB] [--dedup] -- COMMAND...
   sudo zmem install --replace [--config PATH]
   sudo zmem rollback
 
@@ -34,6 +36,10 @@ Status uses the active daemon's report; --processes adds a fresh process list.
 do not retain the daemon's policy history, and cannot measure rates from one sample.
 The no_std library is portable. Live system management requires Linux + systemd + cgroup v2.
 Background tasks are throttled; disposable tasks explicitly opt into a hard memory limit.
+Background/disposable starts wait for real memory headroom (default 60s, timeout exit 75).
+--wait-timeout accepts 0..3600 seconds; 0 checks once. Interactive starts bypass admission.
+After observed pressure, recovery must remain stable for 3s; per-UID reservations are spaced by 3s.
+Admission covers only commands launched through run, not arbitrary terminal descendants.
 --dedup opts trusted background/disposable commands into automatic KSM scanning.
 KSM matching is global; only choose commands whose data may share this trust domain.
 ";
@@ -41,7 +47,31 @@ KSM matching is global; only choose commands whose data may share this trust dom
 #[cfg(target_os = "linux")]
 fn execute() -> Result<()> {
     use std::path::{Path, PathBuf};
-    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let raw: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    if raw.first().is_some_and(|arg| arg == "run") {
+        if raw[1..]
+            .iter()
+            .take_while(|arg| *arg != "--")
+            .any(|arg| arg == "--help" || arg == "-h")
+        {
+            print!("{HELP}");
+            return Ok(());
+        }
+        return run_cli::execute(run_cli::parse(&raw[1..])?);
+    }
+    if raw.first().is_some_and(|arg| arg == "__dedup-exec") {
+        if raw.get(1).is_none_or(|arg| arg != "--") {
+            return Err("dedup exec requires -- before the command".into());
+        }
+        return dedup::exec_registered(&raw[2..]).map_err(Into::into);
+    }
+    let mut args: Vec<String> = raw
+        .into_iter()
+        .map(|arg| {
+            arg.into_string()
+                .map_err(|_| "non-UTF-8 argument outside run COMMAND".into())
+        })
+        .collect::<Result<_>>()?;
     if args.is_empty() || args[0] == "--help" || args[0] == "-h" {
         print!("{HELP}");
         return Ok(());
@@ -51,12 +81,6 @@ fn execute() -> Result<()> {
         return Ok(());
     }
     let action = args.remove(0);
-    if action == "__dedup-exec" {
-        if args.first().map(String::as_str) != Some("--") {
-            return Err("dedup exec requires -- before the command".into());
-        }
-        return dedup::exec_registered(&args[1..]).map_err(Into::into);
-    }
     let mut configuration = PathBuf::from("/etc/zmem/zmem.conf");
     let mut custom_config = false;
     let boundary = args.iter().position(|v| v == "--").unwrap_or(args.len());
@@ -140,7 +164,7 @@ fn execute() -> Result<()> {
                 return Err("schema accepts no arguments".into());
             }
             println!(
-                "{{\"schema\":\"zmem.commands.v1\",\"version\":{},\"transport\":\"cli\",\"read_only\":[{{\"name\":\"status\",\"argv\":[\"zmem\",\"status\",\"--json\"],\"description\":\"Current memory, PSI, swap, zram and policy; counts in bytes, PSI in basis points\"}},{{\"name\":\"processes\",\"argv\":[\"zmem\",\"status\",\"--json\",\"--processes\"]}},{{\"name\":\"plan\",\"argv\":[\"zmem\",\"plan\",\"--json\"]}},{{\"name\":\"doctor\",\"argv\":[\"zmem\",\"doctor\",\"--json\"]}}],\"mutations\":[{{\"name\":\"run\",\"root\":false,\"classes\":[\"background\",\"interactive\",\"disposable\"],\"hard_limit_opt_in_class\":\"disposable\",\"dedup_opt_in_flag\":\"--dedup\",\"dedup_classes\":[\"background\",\"disposable\"],\"dedup_matching_domain\":\"system_wide\"}},{{\"name\":\"once\",\"root\":true,\"required_flag\":\"--apply\"}},{{\"name\":\"install\",\"root\":true,\"replacement_flag\":\"--replace\"}},{{\"name\":\"rollback\",\"root\":true}}],\"status_semantics\":{{\"default\":\"identity-verified daemon report when available\",\"live_flag\":\"--live\",\"live_and_plan\":\"independent preview; no daemon hysteresis history\",\"rate_unavailable\":\"null, never inferred zero\",\"controls\":\"requested and actual readback are separate\",\"coverage\":\"background pacing covers registered zmem groups only\"}},\"automatic_process_kill\":false,\"automatic_global_cache_drop\":false}}",
+                "{{\"schema\":\"zmem.commands.v1\",\"version\":{},\"transport\":\"cli\",\"read_only\":[{{\"name\":\"status\",\"argv\":[\"zmem\",\"status\",\"--json\"],\"description\":\"Current memory, PSI, swap, zram and policy; counts in bytes, PSI in basis points\"}},{{\"name\":\"processes\",\"argv\":[\"zmem\",\"status\",\"--json\",\"--processes\"]}},{{\"name\":\"plan\",\"argv\":[\"zmem\",\"plan\",\"--json\"]}},{{\"name\":\"doctor\",\"argv\":[\"zmem\",\"doctor\",\"--json\"]}}],\"mutations\":[{{\"name\":\"run\",\"root\":false,\"classes\":[\"background\",\"interactive\",\"disposable\"],\"hard_limit_opt_in_class\":\"disposable\",\"dedup_opt_in_flag\":\"--dedup\",\"dedup_classes\":[\"background\",\"disposable\"],\"dedup_matching_domain\":\"system_wide\",\"admission\":{{\"classes\":[\"background\",\"disposable\"],\"interactive_bypass\":true,\"wait_timeout_flag\":\"--wait-timeout\",\"default_wait_timeout_seconds\":60,\"max_wait_timeout_seconds\":3600,\"zero_timeout\":\"one immediate attempt\",\"timeout_exit_code\":75,\"signal_exit_codes\":[130,143],\"inherited_ignored_signals_preserved\":true,\"recovery_window_seconds\":3,\"per_uid_reservation_interval_seconds\":3,\"events\":\"stderr JSON; no command arguments\",\"coverage\":\"explicit run invocations only\"}}}},{{\"name\":\"once\",\"root\":true,\"required_flag\":\"--apply\"}},{{\"name\":\"install\",\"root\":true,\"replacement_flag\":\"--replace\"}},{{\"name\":\"rollback\",\"root\":true}}],\"status_semantics\":{{\"default\":\"identity-verified daemon report when available\",\"live_flag\":\"--live\",\"live_and_plan\":\"independent preview; no daemon hysteresis history\",\"rate_unavailable\":\"null, never inferred zero\",\"controls\":\"requested and actual readback are separate\",\"coverage\":\"background pacing covers registered zmem groups only\"}},\"automatic_process_kill\":false,\"automatic_global_cache_drop\":false}}",
                 json::quote(env!("CARGO_PKG_VERSION"))
             );
             Ok(())
@@ -156,40 +180,6 @@ fn execute() -> Result<()> {
                 return Err("once accepts --apply, --json and --config PATH".into());
             }
             linux::daemon(settings, configuration, !flag("--apply"), true)
-        }
-        "run" => {
-            let split = args
-                .iter()
-                .position(|a| a == "--")
-                .ok_or("run requires -- before the command")?;
-            let mut class = "background";
-            let mut max = None;
-            let mut dedup = false;
-            let mut i = 0;
-            while i < split {
-                match args[i].as_str() {
-                    "--dedup" => dedup = true,
-                    "--class" => {
-                        i += 1;
-                        class = args
-                            .get(i)
-                            .filter(|_| i < split)
-                            .ok_or("--class requires a value")?;
-                    }
-                    "--max-memory" => {
-                        i += 1;
-                        max = Some(
-                            args.get(i)
-                                .filter(|_| i < split)
-                                .ok_or("--max-memory requires MiB")?
-                                .parse::<u64>()?,
-                        );
-                    }
-                    other => return Err(format!("unknown run option: {other}").into()),
-                }
-                i += 1;
-            }
-            linux::run_workload(class, max, dedup, &args[split + 1..])
         }
         "__grow" => {
             if args.len() != 1 {
@@ -216,6 +206,208 @@ fn execute() -> Result<()> {
             linux::reclaim(Path::new(&args[0]), args[1].parse()?)
         }
         _ => Err(format!("unknown command: {action}; use zmem --help").into()),
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod run_cli {
+    use crate::{Result, admission, config, linux};
+    use std::{collections::BTreeSet, ffi::OsString, path::PathBuf};
+
+    #[derive(Debug)]
+    pub struct Arguments {
+        pub class: String,
+        pub max_mib: Option<u64>,
+        pub dedup: bool,
+        pub timeout_secs: u64,
+        pub configuration: Option<PathBuf>,
+        pub command: Vec<OsString>,
+    }
+    pub fn parse(args: &[OsString]) -> Result<Arguments> {
+        let split = args
+            .iter()
+            .position(|arg| arg == "--")
+            .ok_or("run requires -- before the command")?;
+        if args.get(split + 1).is_none_or(|arg| arg.is_empty()) {
+            return Err("run requires a nonempty command after --".into());
+        }
+        let mut options = Arguments {
+            class: "background".into(),
+            max_mib: None,
+            dedup: false,
+            timeout_secs: admission::DEFAULT_WAIT_TIMEOUT_SECS,
+            configuration: None,
+            command: args[split + 1..].to_vec(),
+        };
+        let mut seen = BTreeSet::new();
+        let mut index = 0;
+        while index < split {
+            let option = args[index]
+                .to_str()
+                .ok_or("run option names must be UTF-8")?;
+            if !seen.insert(option) {
+                return Err(format!("duplicate run option: {option}").into());
+            }
+            if option == "--dedup" {
+                options.dedup = true;
+                index += 1;
+                continue;
+            }
+            if !["--class", "--max-memory", "--wait-timeout", "--config"].contains(&option) {
+                return Err(format!("unknown run option: {option}").into());
+            }
+            index += 1;
+            let value = args
+                .get(index)
+                .filter(|_| index < split)
+                .ok_or_else(|| format!("{option} requires a value"))?;
+            if option == "--config" {
+                if value.is_empty() {
+                    return Err("--config requires a nonempty path".into());
+                }
+                options.configuration = Some(PathBuf::from(value));
+            } else if option == "--class" {
+                options.class = value.to_str().ok_or("class must be UTF-8")?.into();
+            } else {
+                let value = value
+                    .to_str()
+                    .ok_or("run numeric options require decimal integers")?;
+                if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return Err(format!("{option} requires a nonnegative decimal integer").into());
+                }
+                let value: u64 = value.parse()?;
+                if option == "--wait-timeout" {
+                    if value > admission::MAX_WAIT_TIMEOUT_SECS {
+                        return Err("--wait-timeout must be 0..3600 seconds".into());
+                    }
+                    options.timeout_secs = value;
+                } else {
+                    options.max_mib = Some(value);
+                }
+            }
+            index += 1;
+        }
+        if !["background", "interactive", "disposable"].contains(&options.class.as_str()) {
+            return Err("class must be background, interactive or disposable".into());
+        }
+        if options.max_mib.is_some() && options.class != "disposable" {
+            return Err("--max-memory applies to explicit disposable workloads".into());
+        }
+        if options.max_mib.is_some_and(|value| value < 16) {
+            return Err("--max-memory must be at least 16 MiB".into());
+        }
+        if options.dedup && options.class == "interactive" {
+            return Err(
+                "--dedup is available only for trusted background/disposable workloads".into(),
+            );
+        }
+        Ok(options)
+    }
+    pub fn execute(options: Arguments) -> Result<()> {
+        let path = options
+            .configuration
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("/etc/zmem/zmem.conf"));
+        let settings = if path.exists() {
+            config::Settings::read(&path)?
+        } else if options.configuration.is_some() {
+            return Err(format!("config does not exist: {}", path.display()).into());
+        } else {
+            config::Settings::default()
+        };
+        linux::run_workload(
+            &settings,
+            &options.class,
+            options.max_mib,
+            options.dedup,
+            options.timeout_secs,
+            &options.command,
+        )
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::os::unix::ffi::OsStringExt;
+
+        fn arguments(values: &[&str]) -> Vec<OsString> {
+            values.iter().map(OsString::from).collect()
+        }
+
+        #[test]
+        fn admission_cli_defaults_and_interactive_bypass_timeout_remain_explicit() {
+            let options = parse(&arguments(&["--", "command"])).unwrap();
+            assert_eq!(options.class, "background");
+            assert_eq!(options.timeout_secs, 60);
+            let options = parse(&arguments(&[
+                "--class",
+                "interactive",
+                "--wait-timeout",
+                "0",
+                "--",
+                "command",
+            ]))
+            .unwrap();
+            assert_eq!(options.class, "interactive");
+            assert_eq!(options.timeout_secs, 0);
+        }
+
+        #[test]
+        fn admission_cli_separator_protects_raw_command_arguments_and_paths() {
+            let raw = OsString::from_vec(vec![b'x', 0xff]);
+            let args = vec![
+                "--config".into(),
+                raw.clone(),
+                "--wait-timeout".into(),
+                "300".into(),
+                "--".into(),
+                "command".into(),
+                "--class".into(),
+                "--wait-timeout".into(),
+                "--help".into(),
+                "${VALUE}".into(),
+                raw.clone(),
+            ];
+            let options = parse(&args).unwrap();
+            assert_eq!(options.configuration, Some(PathBuf::from(&raw)));
+            assert_eq!(options.timeout_secs, 300);
+            assert_eq!(options.command, args[5..]);
+            assert_eq!(options.class, "background");
+        }
+
+        #[test]
+        fn admission_cli_rejects_invalid_options_before_any_wait_or_reservation() {
+            for values in [
+                vec!["--wait-timeout", "-1", "--", "command"],
+                vec!["--wait-timeout", "3601", "--", "command"],
+                vec!["--wait-timeout", "18446744073709551616", "--", "command"],
+                vec![
+                    "--wait-timeout",
+                    "0",
+                    "--wait-timeout",
+                    "1",
+                    "--",
+                    "command",
+                ],
+                vec!["--wait-timeout", "--", "command"],
+                vec!["--class", "unrecognized", "--", "command"],
+                vec!["--class", "interactive", "--dedup", "--", "command"],
+                vec!["--max-memory", "16", "--", "command"],
+                vec![
+                    "--class",
+                    "disposable",
+                    "--max-memory",
+                    "0",
+                    "--",
+                    "command",
+                ],
+                vec!["--"],
+                vec!["--", ""],
+                vec!["command"],
+            ] {
+                assert!(parse(&arguments(&values)).is_err(), "{values:?}");
+            }
+        }
     }
 }
 
@@ -1109,7 +1301,21 @@ mod status {
 fn main() {
     #[cfg(target_os = "linux")]
     if let Err(error) = execute() {
-        eprintln!("zmem: {error}");
+        if let Some(admission) = error.downcast_ref::<admission::Failure>() {
+            admission::diagnostic(&admission.json());
+            std::process::exit(admission.code);
+        }
+        if std::env::args_os()
+            .nth(1)
+            .is_some_and(|arg| arg == "run" || arg == "__dedup-exec")
+        {
+            admission::diagnostic(&format!(
+                "{{\"event\":\"run_error\",\"message\":{}}}",
+                json::quote(&error.to_string())
+            ));
+        } else {
+            eprintln!("zmem: {error}");
+        }
         std::process::exit(1);
     }
     #[cfg(not(target_os = "linux"))]

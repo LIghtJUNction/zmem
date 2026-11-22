@@ -36,6 +36,14 @@ The resulting preference is a ceiling of 60. If the actual kernel value is alrea
 
 If current swappiness cannot be read, zmem skips the write and reports `readback_unavailable` with a null request. A previously cached value cannot substitute for current readback. The implementation is in [swappiness.rs](../src/swappiness.rs); the [kernel's swappiness documentation](https://docs.kernel.org/admin-guide/sysctl/vm.html#swappiness) describes the underlying cost preference.
 
+## Wait before adding another working set
+
+A new compiler or model loader can worsen paging even while disk Swap still has space. Starting with 0.4, `zmem run --class background` and `--class disposable` check available RAM and memory PSI before executing the target. The default wait is bounded at 60 seconds, with exit code 75 if conditions do not recover. Interactive commands bypass admission.
+
+Use `--wait-timeout 300` for a longer batch window or `--wait-timeout 0` for a single immediate attempt. The launcher emits JSON events on stderr while waiting, rechecks conditions before admission, and spaces same-user starts. The [admission guide](background-admission.md) explains the thresholds and recovery rule. This gate controls new explicitly submitted work; running-task budgets remain the daemon's responsibility.
+
+Keep a persistent Cargo target directory for repeated checks. A fresh temporary target directory discards that directory's compiled-artifact reuse, while excessive concurrent compiler working sets can turn CPU work into paging stalls. Admission and cache reuse address these separate costs. Neither requires a permanent one-core limit on ordinary builds.
+
 ## Make user-session I/O controls available
 
 `zmem run --class background -- COMMAND` requests a lower CPU and I/O weight. For a user scope, its I/O controller must be available through the user manager and its ancestors. A requested `IOWeight` value alone does not prove that a kernel control exists or that the storage scheduler uses weights.

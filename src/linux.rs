@@ -37,7 +37,7 @@ static STOP: AtomicBool = AtomicBool::new(false);
 unsafe extern "C" {
     fn flock(fd: i32, operation: i32) -> i32;
     fn fcntl(fd: i32, command: i32, ...) -> i32;
-    fn signal(sig: i32, handler: extern "C" fn(i32)) -> usize;
+    fn signal(sig: i32, handler: usize) -> usize;
     fn kill(pid: i32, signal: i32) -> i32;
     fn getpagesize() -> i32;
     fn swapon(path: *const std::ffi::c_char, flags: i32) -> i32;
@@ -2924,8 +2924,8 @@ pub fn daemon(settings: Settings, config: PathBuf, observe: bool, once: bool) ->
     // POSIX calls only register a signal-safe handler. No process-wide mutable
     // state is accessed by the handler except the atomic STOP flag.
     unsafe {
-        signal(15, stop_signal);
-        signal(2, stop_signal);
+        signal(15, stop_signal as *const () as usize);
+        signal(2, stop_signal as *const () as usize);
     }
     let start = Instant::now();
     let mut sampler = Sampler::new();
@@ -3189,21 +3189,35 @@ pub fn doctor_json() -> (String, bool) {
     )
 }
 
-pub fn run_workload(class: &str, max_mib: Option<u64>, dedup: bool, args: &[String]) -> Result<()> {
-    if args.is_empty() {
-        return Err("run requires a command after --".into());
+fn systemd_run_version(text: &str) -> Result<u32> {
+    if text.len() > 16 * 1024 {
+        return Err("systemd-run version response is too large".into());
     }
-    if !["background", "interactive", "disposable"].contains(&class) {
-        return Err("class must be background, interactive or disposable".into());
+    let mut words = text.lines().next().unwrap_or_default().split_whitespace();
+    if words.next() != Some("systemd") {
+        return Err("cannot identify systemd-run version".into());
     }
-    if max_mib.is_some() && class != "disposable" {
-        return Err("--max-memory applies to explicit disposable workloads".into());
+    let version = words.next().ok_or("missing systemd-run version")?;
+    if version
+        .split('.')
+        .any(|part| part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return Err("invalid systemd-run version".into());
     }
-    if dedup && class == "interactive" {
-        return Err("--dedup is available only for trusted background/disposable workloads".into());
-    }
-    let t = Sampler::new().sample()?;
-    let total = t.sample.total_bytes;
+    let major = version
+        .split('.')
+        .next()
+        .ok_or("invalid systemd-run version")?;
+    Ok(major.parse()?)
+}
+
+fn workload_command(
+    class: &str,
+    maximum_mib: Option<u64>,
+    dedup: bool,
+    args: &[std::ffi::OsString],
+    version: u32,
+) -> Result<Command> {
     let marker = if dedup { "-dedup" } else { "" };
     let id = format!("zmem-{}{}-{}", class, marker, std::process::id());
     let mut cmd = Command::new("/usr/bin/systemd-run");
@@ -3211,6 +3225,12 @@ pub fn run_workload(class: &str, max_mib: Option<u64>, dedup: bool, args: &[Stri
         cmd.arg("--user");
     }
     cmd.args(["--scope", "--quiet", "--collect", "--unit", &id]);
+    // The option was introduced in 254; newer versions may expand by default.
+    // Earlier versions preserve scope arguments and do not accept this flag.
+    if version >= 254 {
+        cmd.arg("--expand-environment=no");
+    }
+    cmd.arg(format!("--description=zmem {class} workload"));
     match class {
         "interactive" => {
             cmd.arg("--slice=app.slice")
@@ -3223,24 +3243,98 @@ pub fn run_workload(class: &str, max_mib: Option<u64>, dedup: bool, args: &[Stri
                 .arg("--property=IOWeight=50");
         }
         _ => {
-            let max = max_mib.unwrap_or((total / 4 / MIB).max(128));
-            if max < 16 || max > total / MIB {
-                return Err("disposable --max-memory must be 16 MiB..physical RAM".into());
-            }
+            let max = maximum_mib.ok_or("disposable memory limit was not validated")?;
             cmd.arg("--slice=zmem-background.slice")
                 .arg(format!("--property=MemoryMax={}M", max))
-                .arg(format!("--property=MemoryHigh={}M", max * 3 / 4))
+                .arg(format!(
+                    "--property=MemoryHigh={}M",
+                    max.saturating_mul(3) / 4
+                ))
                 .arg(format!("--property=MemorySwapMax={}M", max))
                 .arg("--property=OOMPolicy=kill");
         }
     }
-    use std::os::unix::process::CommandExt;
     cmd.arg("--");
     if dedup {
         cmd.arg(std::env::current_exe()?)
             .args(["__dedup-exec", "--"]);
     }
-    Err(cmd.args(args).exec().into())
+    cmd.args(args);
+    Ok(cmd)
+}
+
+fn with_background_admission<T>(
+    class: &str,
+    acquire: impl FnOnce() -> Result<T>,
+) -> Result<Option<T>> {
+    if class == "interactive" {
+        Ok(None)
+    } else {
+        acquire().map(Some)
+    }
+}
+
+pub fn run_workload(
+    settings: &Settings,
+    class: &str,
+    max_mib: Option<u64>,
+    dedup: bool,
+    timeout_secs: u64,
+    args: &[std::ffi::OsString],
+) -> Result<()> {
+    if args.is_empty() {
+        return Err("run requires a command after --".into());
+    }
+    if !["background", "interactive", "disposable"].contains(&class) {
+        return Err("class must be background, interactive or disposable".into());
+    }
+    if max_mib.is_some() && class != "disposable" {
+        return Err("--max-memory applies to explicit disposable workloads".into());
+    }
+    if dedup && class == "interactive" {
+        return Err("--dedup is available only for trusted background/disposable workloads".into());
+    }
+    if timeout_secs > crate::admission::MAX_WAIT_TIMEOUT_SECS {
+        return Err("--wait-timeout must be 0..3600 seconds".into());
+    }
+    if max_mib.is_some_and(|max| max < 16) {
+        return Err("disposable --max-memory must be at least 16 MiB".into());
+    }
+    // Probe only the system launcher, never COMMAND. No memory or runtime
+    // coordination files are inspected on the interactive bypass.
+    let version = command("/usr/bin/systemd-run", &["--version"], 2)
+        .and_then(|output| systemd_run_version(&output))
+        .map_err(|error| {
+            crate::admission::Failure::state(format!("cannot prepare scope launcher: {error}"))
+        })?;
+    let mut permit = with_background_admission(class, || {
+        crate::admission::acquire(settings.policy, timeout_secs, |sample| {
+            if class == "disposable" {
+                let maximum = max_mib.unwrap_or((sample.total_bytes / 4 / MIB).max(128));
+                if maximum < 16 || maximum > sample.total_bytes / MIB {
+                    return Err("disposable --max-memory must be 16 MiB..physical RAM".into());
+                }
+            }
+            Ok(())
+        })
+        .map_err(Into::into)
+    })?;
+    let maximum = if class == "disposable" {
+        let total = permit
+            .as_ref()
+            .ok_or("missing disposable admission")?
+            .sample
+            .total_bytes;
+        Some(max_mib.unwrap_or((total / 4 / MIB).max(128)))
+    } else {
+        None
+    };
+    let mut cmd = workload_command(class, maximum, dedup, args, version)?;
+    if let Some(permit) = &mut permit {
+        permit.before_exec()?;
+    }
+    use std::os::unix::process::CommandExt;
+    Err(cmd.exec().into())
 }
 
 #[cfg(test)]
@@ -3357,6 +3451,93 @@ mod reclaim_integration_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn admission_interactive_bypass_does_not_touch_sampling_or_runtime_state() {
+        let called = std::cell::Cell::new(false);
+        let result: Result<Option<()>> = with_background_admission("interactive", || {
+            called.set(true);
+            Err("missing kernel/runtime data".into())
+        });
+        assert!(result.unwrap().is_none());
+        assert!(!called.get());
+        let result: Result<Option<()>> = with_background_admission("background", || {
+            called.set(true);
+            Err("missing kernel/runtime data".into())
+        });
+        assert!(result.is_err());
+        assert!(called.get());
+    }
+
+    #[test]
+    fn admission_systemd_version_capability_does_not_drop_older_scope_support() {
+        assert_eq!(
+            systemd_run_version("systemd 252 (252.26-1~deb12u2)\n+PAM").unwrap(),
+            252
+        );
+        assert_eq!(
+            systemd_run_version("systemd 255 (255.4-1ubuntu8)\n").unwrap(),
+            255
+        );
+        assert_eq!(systemd_run_version("systemd 254.2\n").unwrap(), 254);
+        for invalid in [
+            "",
+            "unknown 255",
+            "systemd next",
+            "systemd 254garbage",
+            "systemd 99999999999999999999999999",
+        ] {
+            assert!(systemd_run_version(invalid).is_err());
+        }
+        for version in [252, 253, 254, 255] {
+            let command =
+                workload_command("background", None, false, &["program".into()], version).unwrap();
+            assert_eq!(
+                command
+                    .get_args()
+                    .any(|arg| arg == "--expand-environment=no"),
+                version >= 254
+            );
+        }
+    }
+
+    #[test]
+    fn admission_scope_preserves_literal_argument_bytes_and_dedup_chain_without_hard_background_limits()
+     {
+        use std::os::unix::ffi::OsStringExt;
+        let args: Vec<std::ffi::OsString> = vec![
+            "program".into(),
+            "${SECRET}".into(),
+            "--config".into(),
+            "--wait-timeout".into(),
+            std::ffi::OsString::from_vec(vec![0xff, b'$', b' ']),
+        ];
+        for dedup in [false, true] {
+            let command = workload_command("background", None, dedup, &args, 255).unwrap();
+            let arguments: Vec<_> = command.get_args().collect();
+            assert_eq!(
+                &arguments[arguments.len() - args.len()..],
+                args.iter().map(|arg| arg.as_os_str()).collect::<Vec<_>>()
+            );
+            assert_eq!(command.get_program(), "/usr/bin/systemd-run");
+            assert_eq!(command.get_envs().count(), 0, "inherit caller environment");
+            assert!(command.get_current_dir().is_none(), "inherit caller cwd");
+            assert!(!arguments.iter().any(|arg| {
+                let arg = arg.to_string_lossy();
+                arg.contains("MemoryHigh=")
+                    || arg.contains("MemoryMax=")
+                    || arg.contains("CPUQuota=")
+                    || arg.contains("BandwidthMax=")
+            }));
+            assert_eq!(arguments.iter().any(|arg| *arg == "__dedup-exec"), dedup);
+            assert!(
+                arguments
+                    .iter()
+                    .any(|arg| *arg == "--description=zmem background workload")
+            );
+        }
+    }
+
     #[test]
     fn process_exit_races_are_distinct_from_incomplete_access() {
         assert!(process_disappeared(&std::io::Error::from_raw_os_error(2)));

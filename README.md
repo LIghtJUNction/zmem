@@ -2,9 +2,9 @@
 
 **Memory, with room to work.** A small Linux memory and Swap controller from [Project Z](https://github.com/LIghtJUNction/project-z).
 
-[Website](https://lightjunction.github.io/zmem/) · [Releases](https://github.com/LIghtJUNction/zmem/releases) · [crates.io](https://crates.io/crates/zmem-manager) · [Rust API](https://docs.rs/zmem-manager) · [Responsiveness guide](docs/responsiveness.md) · [0.3.1 acceptance](docs/acceptance-0.3.1.md) · [Swap and dedup guide](docs/swap-lifecycle-and-dedup.md) · [0.3.0 acceptance](docs/acceptance-0.3.0.md) · [0.2.0 host acceptance](docs/acceptance-0.2.0.md)
+[Website](https://lightjunction.github.io/zmem/) · [Releases](https://github.com/LIghtJUNction/zmem/releases) · [crates.io](https://crates.io/crates/zmem-manager) · [Rust API](https://docs.rs/zmem-manager) · [Background admission](docs/background-admission.md) · [0.4.0 acceptance](docs/acceptance-0.4.0.md) · [Responsiveness guide](docs/responsiveness.md) · [0.3.1 acceptance](docs/acceptance-0.3.1.md) · [Swap and dedup guide](docs/swap-lifecycle-and-dedup.md) · [0.3.0 acceptance](docs/acceptance-0.3.0.md) · [0.2.0 host acceptance](docs/acceptance-0.2.0.md)
 
-zmem observes memory pressure, preserves headroom for interactive work, and gives managed background jobs a bounded memory budget. It brings zram setup, dynamic disk swap, automatic cleanup, opt-in memory deduplication and structured inspection into one tool. The Rust implementation has no third-party crate dependencies; the policy library uses `no_std` and makes no heap allocations.
+zmem observes memory pressure, waits before starting new managed background work under pressure, and gives running background jobs a bounded memory budget. It brings zram setup, dynamic disk swap, automatic cleanup, opt-in memory deduplication and structured inspection into one tool. The Rust implementation has no third-party crate dependencies; the policy library uses `no_std` and makes no heap allocations.
 
 ## What it does
 
@@ -15,6 +15,7 @@ zmem observes memory pressure, preserves headroom for interactive work, and give
 | zram lifecycle | Keeps the current active device during migration and prepares zram on subsequent boots. |
 | Explicit memory deduplication | Registers trusted background or disposable jobs with `--dedup`; pauses owned KSM scanning under CPU, memory or IO pressure. |
 | Workload budgets | Adjusts aggregate cgroup v2 `memory.high` budgets to managed background usage and available headroom; disposable jobs retain explicit hard limits. |
+| Background admission | Checks available RAM and memory PSI before a background or disposable command starts; waits for stable recovery and spaces starts by the same user. |
 | Interactive protection | Assigns a bounded `memory.low` budget to recognized desktop, terminal and remote-access scopes through their actual cgroup hierarchy. |
 | Reclaim responsiveness | Caps optimistic swappiness adjustments when memory stalls, direct reclaim and anonymous refaults occur together; skips writes when current kernel readback is unavailable. |
 | User I/O controls | Prepares additive I/O delegation and accounting; reports whether the calling user's existing manager has the controller available. |
@@ -115,6 +116,7 @@ Start background work with its classification from the beginning:
 
 ```sh
 zmem run --class background -- cargo build --release
+zmem run --class background --wait-timeout 300 -- YOUR_BATCH_COMMAND
 zmem run --class interactive -- YOUR_COMMAND
 zmem run --class disposable --max-memory 2048 -- YOUR_BATCH_COMMAND
 # Explicitly register trusted, repeat-heavy memory workloads for KSM:
@@ -123,6 +125,10 @@ zmem run --class disposable --max-memory 2048 --dedup -- YOUR_TRUSTED_BATCH_COMM
 ```
 
 The `--max-memory` value is in MiB. The disposable class is for work that can be restarted if it exceeds its explicit budget. Starting a job inside a cgroup gives the kernel a consistent accounting boundary for the job's allocations.
+
+Starting with 0.4, background and disposable commands wait for memory admission before executing. The default wait is 60 seconds; `--wait-timeout 0` makes one immediate attempt, and values up to 3600 allow a longer recovery window. A timeout returns exit code 75 without starting the target. A healthy first observation can pass immediately; after pressure, recovery must remain stable for three seconds. Launch reservations by the same user are spaced at least three seconds apart. Interactive commands bypass this gate. See the [admission guide](docs/background-admission.md) for thresholds, cancellation and JSON events.
+
+Admission progress goes to stderr, leaving stdout for the target. The launcher preserves literal argument bytes and the caller's environment, working directory and standard input. It does not freeze an existing application or impose a permanent single-core or storage-bandwidth limit. Admission covers commands submitted through `zmem run`; it does not automatically intercept every terminal build or model loader.
 
 `--dedup` enables process-level KSM registration before executing the selected command and verifies that registration. It is available for `background` and `disposable`, not `interactive`. A kernel that rejects or cannot verify registration produces an explicit error before the target command starts. Ordinary `run` commands and the default managed-build wrappers do not add this flag.
 
@@ -163,6 +169,8 @@ Active retirement has stronger requirements: the default policy waits for 600 se
 | Default policy setting | Value |
 | --- | --- |
 | Available-memory reserve | Larger of 1 GiB or 10% of physical RAM, capped at total RAM |
+| Automatic launch reserve | Policy reserve above, additionally capped at 25% of RAM; explicit reserves retain their meaning |
+| Background admission wait | 60 seconds; `--wait-timeout` accepts 0..3600, timeout exits 75 before launch |
 | Desired unused Swap headroom | 4 GiB when growth is needed |
 | Growth batch | 2 GiB per permitted decision, bounded by remaining capacity |
 | Disk Swap cap, including retained owned allocations | 32 GiB |

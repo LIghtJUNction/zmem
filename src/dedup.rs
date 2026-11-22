@@ -999,7 +999,7 @@ impl Governor {
 /// run paths must not call this function. No disable/unmerge syscall is used,
 /// including when exec fails. Kernel unsupported/denied errors are explicit.
 #[cfg(target_os = "linux")]
-pub fn exec_registered(args: &[String]) -> io::Result<()> {
+pub fn exec_registered(args: &[std::ffi::OsString]) -> io::Result<()> {
     use std::{
         ffi::{c_int, c_ulong},
         os::unix::process::CommandExt,

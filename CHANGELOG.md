@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.0 — 2026-11-22
+
+- Check memory headroom before starting explicitly submitted background and disposable commands. Use available RAM and memory PSI, with strict handling of missing observations and a three-second stable recovery period after pressure.
+- Add `--wait-timeout 0..3600`, defaulting to 60 seconds. A timeout returns 75 without starting the target; interactive commands bypass admission. Preserve inherited signal semantics and cancel eligible waiting invocations on SIGINT or SIGTERM.
+- Pace same-user admission reservations through a bounded, identity-checked runtime record and a short lock. Recheck conditions before granting a reservation; do not hold the lock for the running workload's lifetime. This does not promise FIFO order or predict peak job memory.
+- Preserve literal argument bytes through the normal and dedup launch paths. Detect systemd-run compatibility before disabling environment expansion on versions that support that option.
+- Emit machine-readable admission reasons on stderr while keeping stdout for the target. Expose wait, timeout and coverage semantics through `zmem schema` and the background-admission guide.
+- Retain existing running-task budgets, Swap state and process-preserving policy. Admission adds no permanent CPU quota, global bandwidth cap, application interception or automatic process termination.
+
 ## 0.3.1 — 2026-11-22
 
 - Add a measured reclaim-latency guard to automatic swappiness selection. Sustained memory stalls together with direct scanning and anonymous refaults cap optimistic preferences at 60 while retaining lower actual values, existing hysteresis and confirmed disk-swap churn priority.

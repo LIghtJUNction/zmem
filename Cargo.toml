@@ -1,6 +1,6 @@
 [package]
 name = "zmem-manager"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.85"
 description = "A lightweight, pressure-aware Linux memory and swap manager with a no_std policy core"
