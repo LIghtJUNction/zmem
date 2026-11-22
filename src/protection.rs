@@ -26,7 +26,7 @@ impl Role {
     const fn cap_bytes(self) -> u64 {
         match self {
             Self::Session => 3 * GIB / 2,
-            Self::Input => 64 * MIB,
+            Self::Input => 256 * MIB,
             Self::Terminal | Self::Remote => 128 * MIB,
             Self::Interactive => 512 * MIB,
         }
@@ -39,6 +39,9 @@ pub struct Scope {
     pub path: PathBuf,
     pub role: Role,
     pub current_bytes: u64,
+    /// Swapped bytes help retain input-method demand after its pages are evicted.
+    /// Other roles use only their resident usage when requesting protection.
+    pub swap_bytes: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -88,13 +91,15 @@ struct Candidate {
 
 /// Build one complete plan, or reject the input without producing a partial one.
 ///
-/// Duplicate paths use the largest bounded request, not the sum of roles. When
-/// both an ancestor and a descendant were selected, only the deepest selected
+/// Duplicate paths retain the input role when present; otherwise they use the
+/// largest bounded request, not the sum of roles. When both an ancestor and a
+/// descendant were selected, only the deepest selected
 /// scopes receive leaf budgets; their ancestors carry those budgets once.
 /// System scopes share at most B/8. The remaining user ceiling is divided
 /// equally between users that have nonzero requests; each user's session/app
 /// nominal shares retain the existing 3/4 and 1/4 split. A category may borrow
 /// the other category's unrequested share within the same user's ceiling.
+/// Input-method requests receive priority within each category's bounded share.
 /// Unused shares never cross users or go to unselected scopes or whole slices.
 pub fn plan_protection(
     cgroup_root: &Path,
@@ -116,7 +121,12 @@ pub fn plan_protection(
     let mut unique: BTreeMap<PathBuf, Candidate> = BTreeMap::new();
     for scope in scopes {
         let domain = classify(cgroup_root, &root_parts, scope)?;
-        let requested = scope.current_bytes.min(scope.role.cap_bytes()) / page_size * page_size;
+        let working_set = if scope.role == Role::Input {
+            scope.current_bytes.saturating_add(scope.swap_bytes)
+        } else {
+            scope.current_bytes
+        };
+        let requested = working_set.min(scope.role.cap_bytes()) / page_size * page_size;
         if requested == 0 {
             continue;
         }
@@ -222,8 +232,9 @@ pub fn plan_protection(
     })
 }
 
-fn preference(leaf: &ProtectedLeaf) -> (u64, u64, u64, Role) {
+fn preference(leaf: &ProtectedLeaf) -> (bool, u64, u64, u64, Role) {
     (
+        leaf.role == Role::Input,
         leaf.requested_bytes,
         leaf.role.cap_bytes(),
         leaf.current_bytes,
@@ -238,8 +249,9 @@ fn requested_pages(candidates: &[Candidate], indices: &[usize], page_size: u64) 
         .sum()
 }
 
-/// Allocate in pages so rounding cannot exceed either the request or the cap.
-/// Proportional rounding may leave less than one page per candidate unused.
+/// Fund input methods first, then share the remaining category budget. Allocate
+/// in pages so rounding cannot exceed either the request or the cap. Unused
+/// proportional-rounding pages stay within their priority class.
 fn allocate(
     candidates: &mut [Candidate],
     indices: &[usize],
@@ -247,9 +259,20 @@ fn allocate(
     page_size: u64,
 ) -> u64 {
     let requested = requested_pages(candidates, indices, page_size);
+    let input_requested: u128 = indices
+        .iter()
+        .filter(|&&index| candidates[index].leaf.role == Role::Input)
+        .map(|&index| (candidates[index].leaf.requested_bytes / page_size) as u128)
+        .sum();
+    let input_cap = input_requested.min(cap_pages as u128) as u64;
     let mut allocated = 0;
     for &index in indices {
         let leaf = &mut candidates[index].leaf;
+        let (requested, cap_pages) = if leaf.role == Role::Input {
+            (input_requested, input_cap)
+        } else {
+            (requested - input_requested, cap_pages - input_cap)
+        };
         let pages = leaf.requested_bytes / page_size;
         let pages = if requested <= cap_pages as u128 {
             pages
@@ -368,6 +391,7 @@ mod tests {
             )),
             role,
             current_bytes: current,
+            swap_bytes: 0,
         }
     }
 
@@ -376,6 +400,7 @@ mod tests {
             path: Path::new(ROOT).join("system.slice").join(unit),
             role,
             current_bytes: current,
+            swap_bytes: 0,
         }
     }
 
@@ -442,6 +467,162 @@ mod tests {
         assert_eq!(p.leaves.len(), 1);
         assert_eq!(p.leaves[0].role, Role::Session);
         assert_eq!(p.allocated_bytes, 256 * MIB);
+    }
+
+    #[test]
+    fn protection_plan_retains_swapped_input_demand_without_inflating_resident_usage() {
+        for (current, swapped, expected) in [
+            (80 * MIB, 550 * MIB, 256 * MIB),
+            (0, 96 * MIB, 96 * MIB),
+            (PAGE, u64::MAX, 256 * MIB),
+        ] {
+            let mut input = user(1000, "app", "fcitx5.scope", Role::Input, current);
+            input.swap_bytes = swapped;
+            let p = plan(&[input]);
+            assert_eq!(p.leaves[0].current_bytes, current);
+            assert_eq!(p.leaves[0].requested_bytes, expected);
+            assert_eq!(p.leaves[0].limit_bytes, expected);
+        }
+        for role in [
+            Role::Session,
+            Role::Terminal,
+            Role::Remote,
+            Role::Interactive,
+        ] {
+            let mut ordinary = user(1000, "app", "app.scope", role, 16 * MIB);
+            ordinary.swap_bytes = GIB;
+            let p = plan(&[ordinary]);
+            assert_eq!(p.leaves[0].requested_bytes, 16 * MIB);
+            assert_eq!(p.leaves[0].limit_bytes, 16 * MIB);
+        }
+    }
+
+    #[test]
+    fn protection_plan_duplicate_input_role_keeps_priority_and_its_cap() {
+        let mut input = user(1000, "app", "terminal.scope", Role::Input, 80 * MIB);
+        input.swap_bytes = 550 * MIB;
+        let mut interactive = input.clone();
+        interactive.role = Role::Interactive;
+        interactive.current_bytes = 2 * GIB;
+        let p = plan(&[interactive.clone(), input.clone(), interactive.clone()]);
+        assert_eq!(p, plan(&[input, interactive]));
+        assert_eq!(p.leaves.len(), 1);
+        assert_eq!(p.leaves[0].role, Role::Input);
+        assert_eq!(p.leaves[0].current_bytes, 80 * MIB);
+        assert_eq!(p.leaves[0].requested_bytes, 256 * MIB);
+        assert_eq!(p.leaves[0].limit_bytes, 256 * MIB);
+    }
+
+    #[test]
+    fn protection_plan_funds_input_before_oversubscribed_apps() {
+        let input = user(1000, "app", "fcitx5.scope", Role::Input, 256 * MIB);
+        let mut scopes = vec![
+            input.clone(),
+            user(1000, "session", "wm.scope", Role::Session, 2 * GIB),
+        ];
+        for index in 0..8 {
+            scopes.push(user(
+                1000,
+                "app",
+                &format!("app-{index}.scope"),
+                Role::Interactive,
+                GIB,
+            ));
+        }
+        let p = plan(&scopes);
+        assert_eq!(low(&p, &input.path), 256 * MIB);
+        assert_eq!(low(&p, input.path.parent().unwrap()), 512 * MIB);
+        for leaf in p
+            .leaves
+            .iter()
+            .filter(|leaf| leaf.role == Role::Interactive)
+        {
+            assert_eq!(leaf.limit_bytes, 32 * MIB);
+        }
+        assert_eq!(p.allocated_bytes, 2 * GIB);
+    }
+
+    #[test]
+    fn protection_plan_prioritizes_input_within_session_and_system_caps() {
+        let input = user(1000, "session", "fcitx5.scope", Role::Input, GIB);
+        let p = plan(&[
+            input.clone(),
+            user(1000, "session", "wm-a.scope", Role::Session, 2 * GIB),
+            user(1000, "session", "wm-b.scope", Role::Session, 2 * GIB),
+            user(1000, "app", "app.scope", Role::Interactive, GIB),
+        ]);
+        assert_eq!(low(&p, &input.path), 256 * MIB);
+        assert_eq!(low(&p, input.path.parent().unwrap()), 3 * GIB / 2);
+        assert_eq!(p.allocated_bytes, 2 * GIB);
+
+        let input = system("ssh.service", Role::Input, GIB);
+        let p = plan(&[
+            input.clone(),
+            system("systemd-logind.service", Role::Session, 2 * GIB),
+        ]);
+        assert_eq!(low(&p, &input.path), 256 * MIB);
+        assert_eq!(p.system_budget_bytes, 256 * MIB);
+        assert_eq!(p.allocated_bytes, p.system_budget_bytes);
+        assert_eq!(
+            p.leaves
+                .iter()
+                .find(|leaf| leaf.role == Role::Session)
+                .unwrap()
+                .limit_bytes,
+            0
+        );
+    }
+
+    #[test]
+    fn protection_plan_input_priority_preserves_system_user_and_category_boundaries() {
+        let mut scopes = vec![system("sshd.service", Role::Input, GIB)];
+        for uid in [1000, 1001] {
+            scopes.extend([
+                user(uid, "session", "wm.scope", Role::Session, 2 * GIB),
+                user(uid, "app", "input.scope", Role::Input, GIB),
+                user(uid, "app", "app.scope", Role::Interactive, GIB),
+            ]);
+        }
+        let p = plan(&scopes);
+        assert_eq!(p.system_budget_bytes, 256 * MIB);
+        assert_eq!(p.user_budget_bytes, 1792 * MIB);
+        assert_eq!(p.allocated_bytes, p.budget_bytes);
+        for uid in [1000, 1001] {
+            let manager =
+                Path::new(ROOT).join(format!("user.slice/user-{uid}.slice/user@{uid}.service"));
+            assert_eq!(low(&p, &manager), 896 * MIB);
+            assert_eq!(low(&p, &manager.join("session.slice")), 672 * MIB);
+            assert_eq!(low(&p, &manager.join("app.slice/input.scope")), 224 * MIB);
+            assert!(
+                !p.limits
+                    .contains_key(&manager.join("app.slice/app.scope/memory.low"))
+            );
+        }
+    }
+
+    #[test]
+    fn protection_plan_tiny_input_budgets_do_not_leak_rounding_pages_to_apps() {
+        for page in [4096, 65536] {
+            let input = user(1000, "app", "input-a.scope", Role::Input, 2 * page);
+            let ordinary = user(1000, "app", "app.scope", Role::Interactive, 4 * page);
+            let p = plan_protection(
+                Path::new(ROOT),
+                8 * page,
+                page,
+                &[input.clone(), ordinary.clone()],
+            )
+            .unwrap();
+            assert_eq!(low(&p, &input.path), page);
+            assert_eq!(p.allocated_bytes, page);
+
+            let second = user(1000, "app", "input-b.scope", Role::Input, 2 * page);
+            let p = plan_protection(Path::new(ROOT), 8 * page, page, &[input, second, ordinary])
+                .unwrap();
+            assert_eq!(p.budget_bytes, page);
+            assert_eq!(p.allocated_bytes, 0);
+            assert!(p.limits.is_empty());
+            assert!(p.leaves.iter().all(|leaf| leaf.limit_bytes == 0));
+        }
     }
 
     #[test]
@@ -674,6 +855,7 @@ mod tests {
             path: Path::new(ROOT).join("app.slice/zmem-interactive-123.scope"),
             role: Role::Interactive,
             current_bytes: GIB,
+            swap_bytes: 0,
         };
         let ssh = system("sshd.service", Role::Remote, GIB);
         let p = plan(&[root_app.clone(), ssh]);
@@ -715,6 +897,7 @@ mod tests {
             path: Path::new(ROOT).join("user.slice/user-1000.slice/session-4.scope"),
             role: Role::Remote,
             current_bytes: 48 * MIB,
+            swap_bytes: 0,
         };
         assert_eq!(plan(std::slice::from_ref(&scope)).allocated_bytes, 48 * MIB);
         scope.path = Path::new(ROOT).join("user.slice/user-1000.slice/session-c1.scope");
@@ -748,6 +931,7 @@ mod tests {
                     path: path.into(),
                     role: Role::Terminal,
                     current_bytes: MIB,
+                    swap_bytes: 0,
                 },
             ];
             assert!(
@@ -806,6 +990,7 @@ mod tests {
             path: root.join("user.slice/user-1000.slice/user@1000.service/app.slice/term.scope"),
             role: Role::Terminal,
             current_bytes: 16 * MIB,
+            swap_bytes: 0,
         };
         let p = plan_protection(root, 16 * GIB, PAGE, &[scope]).unwrap();
         assert!(p.limits.keys().all(|path| path.starts_with(root)));

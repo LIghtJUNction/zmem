@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.3 — 2026-11-23
+
+- Give recognized input methods priority within their existing protection category. Bound each request at 256 MiB and retain the global, per-user and ancestor budgets.
+- Include an input scope's observed swapped memory in its bounded request so eviction does not reduce its protection demand. Keep resident usage separate and retain input priority when a scope contains several recognized roles.
+- Add `--input-probe` to the responsiveness observer. Query an existing Fcitx daemon without activating it or entering text, and report state-query latency, unavailable results and timeouts separately from keyboard latency.
+
 ## 0.4.2 — 2026-11-22
 
 - Protect recognized desktop applications in independent application units and explicitly marked interactive scopes through their real ancestor chain. Retain smaller budgets for terminal/remote scopes that also contain browser descendants; avoid broad interpreter-name classification.

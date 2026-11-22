@@ -2040,6 +2040,7 @@ fn discover_protection_scopes(
             path: path.clone(),
             role,
             current_bytes: page_size,
+            swap_bytes: 0,
         };
         // Validate the complete lexical path before reading anything under it.
         // Unsupported units are outside automatic protection, not scan errors.
@@ -2079,11 +2080,28 @@ fn discover_protection_scopes(
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error.into()),
         };
+        // A swapped-out input method still needs room for its working set to
+        // return as the user types. Resident usage alone shrinks its request
+        // after eviction. Kernels without swap accounting retain RSS coverage.
+        let swap = if roles.contains(&protection::Role::Input) {
+            match protection_read(&path.join("memory.swap.current"), 64) {
+                Ok(text) => text.trim().parse::<u64>()?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+                Err(error) => return Err(error.into()),
+            }
+        } else {
+            0
+        };
         for role in roles {
             scopes.push(protection::Scope {
                 path: path.clone(),
                 role,
                 current_bytes: current,
+                swap_bytes: if role == protection::Role::Input {
+                    swap
+                } else {
+                    0
+                },
             });
         }
     }
@@ -4255,6 +4273,72 @@ mod tests {
         assert!(p.limits.contains_key(&cgroup_root.join(
             "user.slice/user-1000.slice/user@1000.service/app.slice/app-graphical.slice/memory.low"
         )));
+    }
+
+    #[test]
+    fn protection_discovery_retains_swapped_input_demand_without_promoting_other_jobs() {
+        let fixture = JournalFixture::new("protection-input-swap");
+        let proc_root = fixture.0.join("proc");
+        let cgroup_root = fixture.0.join("cgroup");
+        fs::create_dir_all(&proc_root).unwrap();
+        let input = "user.slice/user-1000.slice/user@1000.service/app.slice/app-fcitx5.scope";
+        let terminal = "user.slice/user-1000.slice/user@1000.service/app.slice/app-kitty.scope";
+        for (pid, comm, path) in [(1, "fcitx5", input), (2, "kitty", terminal)] {
+            let process = proc_root.join(pid.to_string());
+            fs::create_dir(&process).unwrap();
+            fs::write(process.join("comm"), comm).unwrap();
+            fs::write(process.join("cgroup"), format!("0::/{path}\n")).unwrap();
+            let group = cgroup_root.join(path);
+            fs::create_dir_all(&group).unwrap();
+            fs::write(group.join("memory.current"), (16 * MIB).to_string()).unwrap();
+        }
+        let swap = cgroup_root.join(input).join("memory.swap.current");
+        fs::write(&swap, (600 * MIB).to_string()).unwrap();
+        // Non-input swap usage must not be queried or inflate protection.
+        fs::write(
+            cgroup_root.join(terminal).join("memory.swap.current"),
+            "invalid",
+        )
+        .unwrap();
+        let discover = || {
+            discover_protection_scopes(
+                &proc_root,
+                &cgroup_root,
+                16 * GIB,
+                4096,
+                64,
+                Duration::from_secs(5),
+            )
+        };
+        let scopes = discover().unwrap();
+        let input_scope = scopes
+            .iter()
+            .find(|scope| scope.role == protection::Role::Input)
+            .unwrap();
+        assert_eq!(input_scope.current_bytes, 16 * MIB);
+        assert_eq!(input_scope.swap_bytes, 600 * MIB);
+        let p = protection::plan_protection(&cgroup_root, 16 * GIB, 4096, &scopes).unwrap();
+        assert_eq!(
+            p.limits[&cgroup_root.join(input).join("memory.low")],
+            256 * MIB
+        );
+        assert_eq!(
+            p.limits[&cgroup_root.join(terminal).join("memory.low")],
+            16 * MIB
+        );
+
+        fs::remove_file(&swap).unwrap();
+        assert!(
+            discover()
+                .unwrap()
+                .iter()
+                .all(|scope| scope.swap_bytes == 0)
+        );
+        fs::write(&swap, "invalid").unwrap();
+        assert!(
+            discover().is_err(),
+            "invalid input accounting retains the preceding complete plan"
+        );
     }
 
     #[test]

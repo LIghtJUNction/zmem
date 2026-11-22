@@ -1,0 +1,103 @@
+{
+  "schema": "zmem.input-observation.v1",
+  "date": "2026-11-23",
+  "timezone": "Asia/Taipei",
+  "comparison": "Two natural-workload windows; background work and cache state were not held constant. Query measurements include process startup and IPC, not physical keystroke-to-screen latency.",
+  "initial_diagnosis": {
+    "physical_memory_bytes": 16476700672,
+    "input_resident_bytes": 75796480,
+    "input_swap_bytes": 576348160,
+    "input_scope_memory_low_bytes": 34058240,
+    "input_state": "disk_sleep",
+    "desktop_compositor_state": "disk_sleep"
+  },
+  "verified_controls": {
+    "daemon_version": "0.4.3",
+    "input_scope_memory_low_bytes": 268435456,
+    "total_protection_budget_bytes": 2059587584,
+    "all_ancestors_cover_input_limit": true,
+    "protection_complete": true,
+    "protection_errors": [],
+    "installed_binary_sha256": "62b2c9d4562d50cda2da9a36ea74a86f8df9910595388267b481d77ef55f6114"
+  },
+  "before": {
+    "version": "0.4.2",
+    "duration_seconds": 30.897743965,
+    "samples": 16,
+    "input_query": {
+      "count": 3,
+      "is_keystroke_latency": false,
+      "max": 71.123391,
+      "min": 1.96275,
+      "p50": 2.274109,
+      "p95": 64.2384628,
+      "p99": 69.74640536,
+      "states": {
+        "inactive": 3
+      },
+      "statuses": {
+        "available": 3,
+        "unavailable": 13
+      },
+      "timeouts": 13
+    },
+    "compositor_query": {
+      "count": 14,
+      "is_frame_latency": false,
+      "max": 634.455262,
+      "min": 9.771627,
+      "p50": 20.786608,
+      "p95": 426.44058044999986,
+      "p99": 592.8523256899997,
+      "statuses": {
+        "available": 14,
+        "unavailable": 2
+      },
+      "timeouts": 2
+    },
+    "mean_memory_full_percent": 7.604472679047477,
+    "mean_io_full_percent": 45.40111358941047,
+    "mean_swap_in_bytes_per_second": 8265394.914934968,
+    "mean_swap_out_bytes_per_second": 11307299.456196964,
+    "median_available_bytes": 2488604672
+  },
+  "after": {
+    "version": "0.4.3",
+    "duration_seconds": 30.025319141,
+    "samples": 16,
+    "input_query": {
+      "count": 16,
+      "is_keystroke_latency": false,
+      "max": 6.997322,
+      "min": 2.045092,
+      "p50": 2.9127650000000003,
+      "p95": 4.8824974999999995,
+      "p99": 6.5743570999999985,
+      "states": {
+        "inactive": 16
+      },
+      "statuses": {
+        "available": 16
+      },
+      "timeouts": 0
+    },
+    "compositor_query": {
+      "count": 16,
+      "is_frame_latency": false,
+      "max": 48.248034,
+      "min": 17.275574,
+      "p50": 22.257338500000003,
+      "p95": 42.52205925,
+      "p99": 47.10283904999999,
+      "statuses": {
+        "available": 16
+      },
+      "timeouts": 0
+    },
+    "mean_memory_full_percent": 5.849059490982775,
+    "mean_io_full_percent": 77.23612976709055,
+    "mean_swap_in_bytes_per_second": 13448571.357375367,
+    "mean_swap_out_bytes_per_second": 7217885.141161661,
+    "median_available_bytes": 2270816256
+  }
+}

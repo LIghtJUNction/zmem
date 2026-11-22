@@ -3,13 +3,13 @@
 
 Examples:
   python3 scripts/measure_responsiveness.py --duration 30
-  python3 scripts/measure_responsiveness.py --duration 60 --desktop-probe \
+  python3 scripts/measure_responsiveness.py --duration 60 --desktop-probe --input-probe \
       --output artifacts/responsiveness-baseline
   python3 scripts/measure_responsiveness.py --self-test
 
 --output is a directory. Existing measurement files are never overwritten.
 Only this script's output files are written; all procfs/sysfs/cgroup reads and
-the zmem/Hyprland requests are observational. No process arguments, environment
+the zmem/Hyprland/Fcitx requests are observational. No process arguments, environment
 contents, window titles, monitor descriptions or raw command stderr are saved.
 """
 from __future__ import annotations
@@ -343,6 +343,23 @@ def desktop_probe(program, enabled):
     return probe
 
 
+def input_probe(program, enabled):
+    if not enabled:
+        return {"status": "not_requested", "round_trip_ms": None,
+                "state_code": None, "state": None}
+    # --check resolves an existing owner, avoiding D-Bus activation of a
+    # stopped daemon. With no action flag the command only queries its state.
+    probe, state = command_json(program, ["--check"])
+    states = {0: "closed", 1: "inactive", 2: "active"}
+    if probe["status"] == "available":
+        # bool is an int subclass and must not be accepted as a state code.
+        if type(state) is not int or state not in states:
+            probe.update(status="unavailable", reason="unexpected_state")
+        else:
+            return {**probe, "state_code": state, "state": states[state]}
+    return {**probe, "state_code": None, "state": None}
+
+
 def same_devices(before, after):
     if before is None or after is None or set(before) != set(after):
         return False
@@ -524,6 +541,8 @@ def summarize(samples, wakeups, requested, elapsed, interrupted, resources):
             "unit": windows[0]["metrics"][name]["unit"]}
     invalid = collections.Counter(reason for window in windows for reason in window["invalid"].values())
     probes = [sample["desktop_probe"] for sample in samples]
+    inputs = [sample.get("input_probe", {"status": "not_requested", "round_trip_ms": None})
+              for sample in samples]
     reports = [sample["zmem"].get("report") for sample in samples]
     sizes = [sample["kernel"][key] for sample in samples
              for key in ("page_size_before_bytes", "page_size_after_bytes")]
@@ -538,6 +557,12 @@ def summarize(samples, wakeups, requested, elapsed, interrupted, resources):
             "statuses": dict(collections.Counter(probe["status"] for probe in probes)),
             "timeouts": sum(probe.get("reason") == "timeout" for probe in probes),
             "is_frame_latency": False},
+        "fcitx5_process_and_ipc_round_trip_ms": {
+            **distribution(probe["round_trip_ms"] for probe in inputs if probe["status"] == "available"),
+            "statuses": dict(collections.Counter(probe["status"] for probe in inputs)),
+            "states": dict(collections.Counter(probe["state"] for probe in inputs if probe["status"] == "available")),
+            "timeouts": sum(probe.get("reason") == "timeout" for probe in inputs),
+            "is_keystroke_latency": False},
         "mem_available_bytes": distribution(sample["kernel"]["meminfo_bytes"]["MemAvailable"] for sample in samples),
         "window_metrics": metrics, "invalid_counter_reasons": dict(invalid),
         "kernel_read_span_ms": distribution(sample["kernel"]["read_span_ns"] / 1_000_000 for sample in samples),
@@ -558,7 +583,7 @@ def summarize(samples, wakeups, requested, elapsed, interrupted, resources):
 
 def measure(args):
     output = Outputs(args.output)
-    programs = {name: shutil.which(name) for name in ("zmem", "hyprctl")}
+    programs = {name: shutil.which(name) for name in ("zmem", "hyprctl", "fcitx5-remote")}
     start = time.monotonic_ns()
     end = start + args.duration * 1_000_000_000
     self_start, children_start = resource.getrusage(resource.RUSAGE_SELF), resource.getrusage(resource.RUSAGE_CHILDREN)
@@ -568,6 +593,7 @@ def measure(args):
         "requested_duration_s": args.duration, "interval_ns": INTERVAL_NS,
         "scheduler_interval_ns": WAKE_INTERVAL_NS, "command_timeout_s": COMMAND_TIMEOUT_S,
         "desktop_probe_requested": args.desktop_probe, "programs_found": {name: path is not None for name, path in programs.items()},
+        "input_probe_requested": args.input_probe,
         "page_size_bytes": page_size(), "kernel_release": platform.release(), "machine": platform.machine(),
         "python_version": platform.python_version(), "script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "units": {"psi_total": "microseconds", "vmstat": "base pages", "block_sectors": "512 bytes"},
@@ -575,10 +601,14 @@ def measure(args):
         "window_clock": "monotonic midpoint of each sequential kernel snapshot; read span records non-atomic source skew",
         "scheduler_metric": "Python thread timed-wait lateness; includes scheduler, timer and interpreter effects, not input/frame latency",
         "desktop_metric": "hyprctl -j monitors process spawn + IPC + response time; monitor payload is discarded; not frame latency",
+        "input_metric": "fcitx5-remote --check process spawn + IPC + state-query response time; no daemon activation or text input; not end-to-end keystroke latency",
+        "input_states": {"0": "closed", "1": "inactive", "2": "active"},
         "cpu_full": "System-level CPU full PSI is undefined; raw counter retained, derived percentage is null",
         "privacy": "No process command lines, environment contents, window titles or raw command stderr are collected",
         "references": ["https://docs.kernel.org/accounting/psi.html", "https://docs.kernel.org/block/stat.html",
-                       "https://docs.kernel.org/admin-guide/blockdev/zram.html"],
+                       "https://docs.kernel.org/admin-guide/blockdev/zram.html",
+                       "https://fcitx-im.org/wiki/DBus_Interface",
+                       "https://github.com/fcitx/fcitx5/blob/master/src/tools/remote.cpp"],
     }
     output.write("metadata.json", metadata)
     samples, previous, interrupted = [], None, False
@@ -593,7 +623,8 @@ def measure(args):
                 "scheduled_elapsed_ns": deadline - start, "schedule_lateness_ns": max(0, began - deadline),
                 "kernel": kernel, "window": window_between(previous, kernel) if previous is not None else None,
                 "zmem": zmem_probe(programs["zmem"]),
-                "desktop_probe": desktop_probe(programs["hyprctl"], args.desktop_probe)}
+                "desktop_probe": desktop_probe(programs["hyprctl"], args.desktop_probe),
+                "input_probe": input_probe(programs["fcitx5-remote"], args.input_probe)}
             sample["collection_duration_ns"] = time.monotonic_ns() - began
             output.write("samples.jsonl", sample)
             samples.append(sample)
@@ -626,6 +657,8 @@ def measure(args):
 
 
 def self_test():
+    from unittest.mock import Mock, patch
+
     assert parse_psi("some avg10=1 total=100\nfull total=25\n") == {"some": 100, "full": 25}
     assert parse_psi("some total=-1\n")["some"] is None
     assert counter_delta(20, 19) == (None, "counter_reset")
@@ -661,7 +694,52 @@ def self_test():
     assert window["metrics"]["psi.cpu.full"]["value"] is None
     later["page_size_after_bytes"] = 65536
     assert window_between(kernel, later)["metrics"]["paging.swap_in"]["value"] is None
-    print('{"self_test":"passed","groups":7}')
+    # Fixture outputs exercise the Fcitx contract without requiring a desktop.
+    for code, state in ((0, "closed"), (1, "inactive"), (2, "active")):
+        query = Mock(return_value=({"status": "available", "reason": None, "round_trip_ms": 1.25}, code))
+        with patch.dict(globals(), command_json=query):
+            result = input_probe("fcitx5-remote", True)
+        query.assert_called_once_with("fcitx5-remote", ["--check"])
+        assert result["status"] == "available" and result["round_trip_ms"] == 1.25
+        assert result["state_code"] == code and result["state"] == state
+    for value in (True, False, "2", 2.0, -1, 3, None, [], {}):
+        query = Mock(return_value=({"status": "available", "reason": None, "round_trip_ms": 1.25}, value))
+        with patch.dict(globals(), command_json=query):
+            result = input_probe("fcitx5-remote", True)
+        assert result["status"] == "unavailable" and result["reason"] == "unexpected_state"
+        assert result["state"] is None and result["state_code"] is None
+    query = Mock(side_effect=AssertionError("disabled input probe must not run a command"))
+    with patch.dict(globals(), command_json=query):
+        assert input_probe("fcitx5-remote", False)["status"] == "not_requested"
+    query.assert_not_called()
+    assert input_probe(None, True)["reason"] == "program_not_found"
+    for reason in ("command_failed", "timeout"):
+        query = Mock(return_value=({"status": "unavailable", "reason": reason, "round_trip_ms": None}, None))
+        with patch.dict(globals(), command_json=query):
+            result = input_probe("fcitx5-remote", True)
+        assert result["status"] == "unavailable" and result["reason"] == reason
+        assert result["state"] is None and result["state_code"] is None
+    # The same bounded runner is used for all probes, including Fcitx.
+    result, value = command_json(sys.executable, ["-c", "import sys; sys.exit(3)"])
+    assert result["reason"] == "command_failed" and value is None
+    result, value = command_json(sys.executable, ["-c", "import time; time.sleep(2)"])
+    assert result["reason"] == "timeout" and result["timeout_bound_ms"] == COMMAND_TIMEOUT_S * 1000
+    assert value is None
+    inputs = [{"status": "available", "reason": None, "round_trip_ms": code + 1,
+               "state_code": code, "state": state}
+              for code, state in ((0, "closed"), (1, "inactive"), (2, "active"))]
+    inputs.append({"status": "unavailable", "reason": "timeout", "round_trip_ms": None})
+    samples = [{"window": None, "desktop_probe": {"status": "not_requested", "round_trip_ms": None},
+                "input_probe": probe, "zmem": {"status": "unavailable", "report": None},
+                "schedule_lateness_ns": 0, "kernel": {"page_size_before_bytes": 4096,
+                    "page_size_after_bytes": 4096, "meminfo_bytes": {"MemAvailable": 4096},
+                    "read_span_ns": 1, "background": {}}} for probe in inputs]
+    summary = summarize(samples, [], 2, 2, False, {})["fcitx5_process_and_ipc_round_trip_ms"]
+    assert summary["count"] == 3 and summary["p50"] == 2 and summary["timeouts"] == 1
+    assert summary["states"] == {"closed": 1, "inactive": 1, "active": 1}
+    assert summary["statuses"] == {"available": 3, "unavailable": 1}
+    assert summary["is_keystroke_latency"] is False
+    print('{"self_test":"passed","groups":8}')
     return 0
 
 
@@ -670,7 +748,8 @@ def main():
     parser.add_argument("--duration", type=int, default=30, help="requested seconds, usually 30 or 60; range 2..300")
     parser.add_argument("--output", type=Path, help="directory for private raw samples and summary; prefer ignored artifacts/")
     parser.add_argument("--desktop-probe", action="store_true", help="time a bounded hyprctl read request; not frame latency")
-    parser.add_argument("--self-test", action="store_true", help="run pure-function regression checks without probing the system")
+    parser.add_argument("--input-probe", action="store_true", help="time a bounded Fcitx state query; no text input; not keystroke latency")
+    parser.add_argument("--self-test", action="store_true", help="run parser and isolated command regression checks without querying desktop services")
     args = parser.parse_args()
     if args.self_test:
         return self_test()

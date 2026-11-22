@@ -52,6 +52,26 @@ The planner requests up to 512 MiB of observed memory for each selected interact
 
 The interactive launcher makes an initial 512 MiB `memory.low` request on its scope. Complete ancestor planning requires a running daemon with `protect_sessions=true`; normal reconciliation runs every 15 sampling cycles, about 30 seconds with the default interval. The daemon retains nonzero external settings and applies the shared ancestor ceilings. `memory.low` is a best-effort reclaim preference, not preallocated RAM, a hard reservation or a promise to prevent all swapping. Inspect the leaf and every ancestor, together with `controls.protection_complete` and `protection_errors`, when checking whether protection was applied.
 
+### Keep input-method demand visible after eviction
+
+Recognized Fcitx and IBus scopes receive priority within their existing session or application share. Each input scope requests at most 256 MiB, using `memory.current + memory.swap.current` as its bounded demand estimate. This allows pages used during typing to return under protection after eviction has reduced resident usage. Other roles continue to request protection from resident usage. The total ceiling, each user's share and the session/application split remain in force.
+
+Input methods share their category's allowance proportionally when their combined requests exceed it. Other selected scopes share the remaining allowance. A mixed scope containing an input method retains the input role and its cap; protection applies to the whole scope. This does not separate an input method from other processes launched in that same scope. Missing swap accounting falls back to resident usage; malformed or inaccessible accounting retains the preceding complete protection plan.
+
+### Measure an input-method stall
+
+Run the observer from the affected desktop session:
+
+```sh
+python3 scripts/measure_responsiveness.py \
+  --duration 30 --desktop-probe --input-probe \
+  --output artifacts/input-observation
+```
+
+The optional input probe runs `fcitx5-remote --check`. It queries an existing Fcitx daemon without activating it, switching the input method or collecting text. Its summary records successful query timings, state counts and timeouts. The 800 ms timeout is retained as a timeout count rather than inserted into the successful-latency distribution. Systems without the executable or the required option report unavailable results. The probe does not query IBus.
+
+Compare the input query with compositor queries, memory/IO PSI and paging rates. An input method waiting for swapped pages can delay both candidate selection and text delivery. The recorded time includes starting the query process and completing IPC; a keyboard-to-screen measurement requires a separate end-to-end test. See [Fcitx's state interface](https://fcitx-im.org/wiki/DBus_Interface) and the [query implementation](https://github.com/fcitx/fcitx5/blob/master/src/tools/remote.cpp).
+
 ## Make user-session I/O controls available
 
 `zmem run --class background -- COMMAND` requests a lower CPU and I/O weight. For a user scope, its I/O controller must be available through the user manager and its ancestors. A requested `IOWeight` value alone does not prove that a kernel control exists or that the storage scheduler uses weights.
