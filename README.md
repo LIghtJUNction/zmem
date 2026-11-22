@@ -2,7 +2,7 @@
 
 **Memory, with room to work.** A small Linux memory and Swap controller from [Project Z](https://github.com/LIghtJUNction/project-z).
 
-[Website](https://lightjunction.github.io/zmem/) · [Releases](https://github.com/LIghtJUNction/zmem/releases) · [crates.io](https://crates.io/crates/zmem-manager) · [Rust API](https://docs.rs/zmem-manager) · [Host acceptance](docs/acceptance-0.1.1.md)
+[Website](https://lightjunction.github.io/zmem/) · [Releases](https://github.com/LIghtJUNction/zmem/releases) · [crates.io](https://crates.io/crates/zmem-manager) · [Rust API](https://docs.rs/zmem-manager) · [Host acceptance](docs/acceptance-0.1.2.md) · [Latest patch validation](docs/acceptance-pressure-journal.md)
 
 zmem observes memory pressure, preserves headroom for interactive work, and gives managed background jobs a bounded memory budget. It brings zram setup, dynamic disk swap, pressure policy and structured inspection into one tool. The Rust implementation has no third-party crate dependencies; the policy library uses `no_std` and makes no heap allocations.
 
@@ -93,7 +93,11 @@ The `--max-memory` value is in MiB. The disposable class is for work that can be
 
 The policy core is a deterministic state machine. It receives a snapshot and a monotonic timestamp, then produces a bounded decision. The Linux adapter checks real ownership, kernel state, disk capacity and operation results before acting.
 
+Busy Swap/IO takes precedence over the preference for available zram capacity. When the policy reports `swap_or_io_pressure`, the adapter keeps its swappiness hint of 20, including when Swap-in is high but IO PSI is low. Outside that condition, the existing zram and profile preferences apply.
+
 While the daemon is running, zmem owns the aggregate `memory.high` policy of its dedicated `zmem.slice/zmem-background.slice`, including the corresponding slice below a user manager. systemd can reset that slice to `max` when a new scope starts. If the original baseline was unlimited and the cgroup is still the same object, zmem reapplies its policy and records a `managed_background_limit_reapplied` event. A manual `max` write to this dedicated slice is therefore temporary. Finite external limits, finite original baselines, other cgroups and `memory.low` retain the normal external-change protection. Run jobs outside the background class when another tool should own their limits.
+
+Recovery records for vanished or replaced cgroups are removed every 15 sampling cycles, or about 30 seconds with the default interval. Live control baselines and records with uncertain metadata errors remain intact. Reading a recovery journal larger than 1 MiB returns an error and retains the whole file for recovery.
 
 | Default policy setting | Value |
 | --- | --- |

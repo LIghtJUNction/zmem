@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Honor busy Swap/IO policy before zram and profile preferences when selecting swappiness.
+- Periodically remove recovery records for vanished or replaced cgroups while preserving live baselines and uncertain metadata errors.
+- Reject oversized reads before restoring controls, retaining the complete recovery journal on failure.
+- Add regression coverage for swappiness thresholds, profile preferences, control identity cleanup and oversized journal recovery.
+
 ## 0.1.1
 
 - Normalize cgroup memory limits to the running kernel's page size so the daemon can continue adjusting its own limits.

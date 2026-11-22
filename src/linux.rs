@@ -32,10 +32,17 @@ extern "C" fn stop_signal(_: i32) {
 }
 
 pub fn read(path: impl AsRef<Path>) -> Result<String> {
+    const LIMIT: u64 = 1024 * 1024;
+    let path = path.as_ref();
     let mut out = String::new();
-    File::open(path)?
-        .take(1024 * 1024)
-        .read_to_string(&mut out)?;
+    File::open(path)?.take(LIMIT + 1).read_to_string(&mut out)?;
+    if out.len() as u64 > LIMIT {
+        return Err(format!(
+            "file exceeds the {LIMIT}-byte read limit: {}",
+            path.display()
+        )
+        .into());
+    }
     Ok(out)
 }
 fn number(path: impl AsRef<Path>) -> u64 {
@@ -485,6 +492,12 @@ impl Controls {
             entries: BTreeMap::new(),
         }
     }
+    fn prune_stale(&mut self) -> bool {
+        let before = self.entries.len();
+        self.entries
+            .retain(|_, entry| !stale_control(entry, fs::metadata(&entry.path)));
+        self.entries.len() != before
+    }
     fn save(&self) -> Result<()> {
         let text = self
             .entries
@@ -635,6 +648,12 @@ impl Controls {
         Ok(())
     }
 }
+fn stale_control(entry: &Control, metadata: std::io::Result<fs::Metadata>) -> bool {
+    match metadata {
+        Ok(meta) => entry.dev != meta.dev() || entry.ino != meta.ino(),
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    }
+}
 fn valid_control(path: &Path) -> bool {
     let raw = path.to_string_lossy();
     if raw.contains(['\t', '\n', '\r'])
@@ -729,13 +748,21 @@ fn write_control(path: &Path, value: &str, nonblock: bool) -> Result<()> {
     Ok(())
 }
 pub fn restore_controls() -> Result<()> {
-    let text = match read(CONTROL_FILE) {
+    restore_controls_from(Path::new(CONTROL_FILE))
+}
+fn restore_controls_from(path: &Path) -> Result<()> {
+    let text = match read(path) {
         Ok(t) => t,
-        Err(_) if !Path::new(CONTROL_FILE).exists() => return Ok(()),
+        Err(e)
+            if e.downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            return Ok(());
+        }
         Err(e) => return Err(e),
     };
     restore_control_snapshot(&text)?;
-    fs::remove_file(CONTROL_FILE)?;
+    fs::remove_file(path)?;
     Ok(())
 }
 pub fn restore_control_snapshot(text: &str) -> Result<()> {
@@ -884,6 +911,26 @@ fn capped_high(original: &str, requested: &str) -> Result<String> {
     }
     Ok(original.min(requested.parse::<u64>()?).to_string())
 }
+fn effective_swappiness(settings: &Settings, t: &Telemetry, d: &Decision) -> u16 {
+    // Swap-in and bidirectional swap traffic can be busy even with low IO PSI.
+    // Keep the policy's cost hint ahead of the preference for unused zram.
+    if d.reason == zmem::Reason::SwapIoPressure {
+        return d.recommended_swappiness;
+    }
+    let zram_room = t
+        .swaps
+        .iter()
+        .any(|s| s.path.starts_with("/dev/zram") && s.size.saturating_sub(s.used) > s.size / 5);
+    if zram_room {
+        if settings.profile == "interactive" || settings.profile == "gaming" {
+            100
+        } else {
+            120
+        }
+    } else {
+        d.recommended_swappiness.min(80)
+    }
+}
 fn apply_controls(
     settings: &Settings,
     t: &Telemetry,
@@ -892,27 +939,18 @@ fn apply_controls(
     protect: bool,
     errors: &mut Vec<String>,
 ) -> Option<PathBuf> {
+    // Terminal scopes and user managers disappear during normal session churn.
+    // Keep recovery proportional to live controls rather than daemon uptime.
+    if protect && c.prune_stale() {
+        if let Err(e) = c.save() {
+            errors.push(e.to_string());
+        }
+    }
     if protect && settings.protect_sessions {
         protect_sessions(c, t.sample.total_bytes, errors);
     }
     if settings.manage_swappiness {
-        // Prefer RAM compression while it has space; avoid pushing more data
-        // into a saturated compressed device or an already-stalled disk.
-        let zram_room = t
-            .swaps
-            .iter()
-            .any(|s| s.path.starts_with("/dev/zram") && s.size.saturating_sub(s.used) > s.size / 5);
-        let value = if t.sample.io_full_bp >= 1000 {
-            40
-        } else if zram_room {
-            if settings.profile == "interactive" || settings.profile == "gaming" {
-                100
-            } else {
-                120
-            }
-        } else {
-            d.recommended_swappiness.min(80)
-        };
+        let value = effective_swappiness(settings, t, d);
         if let Err(e) = c.set(
             Path::new("/proc/sys/vm/swappiness"),
             &value.to_string(),
@@ -1566,6 +1604,187 @@ pub fn run_workload(class: &str, max_mib: Option<u64>, args: &[String]) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct JournalFixture(PathBuf);
+    impl JournalFixture {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "zmem-{name}-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+        fn control(&self, name: &str) -> Control {
+            let path = self.0.join(name);
+            fs::write(&path, "8192").unwrap();
+            let meta = fs::metadata(&path).unwrap();
+            Control {
+                path,
+                original: "4096".into(),
+                last: "8192".into(),
+                dev: meta.dev(),
+                ino: meta.ino(),
+                pending_previous: None,
+            }
+        }
+    }
+    impl Drop for JournalFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn oversized_control_recovery_retains_the_complete_journal() {
+        let fixture = JournalFixture::new("journal-limit");
+        let journal = fixture.0.join("controls.tsv");
+        let limit = 1024 * 1024;
+        let mut text = "x".repeat(limit);
+        fs::write(&journal, &text).unwrap();
+        assert_eq!(read(&journal).unwrap().len(), limit);
+        text.push('x');
+        fs::write(&journal, &text).unwrap();
+        let error = restore_controls_from(&journal).unwrap_err();
+        assert!(error.to_string().contains("read limit"));
+        assert_eq!(fs::read_to_string(&journal).unwrap(), text);
+        assert!(restore_controls_from(&fixture.0.join("absent.tsv")).is_ok());
+    }
+
+    #[test]
+    fn control_pruning_keeps_live_baselines_and_removes_dead_identities() {
+        let fixture = JournalFixture::new("journal-pruning");
+        let live = fixture.control("live");
+        let removed = fixture.control("removed");
+        let replaced = fixture.control("replaced");
+        fs::remove_file(&removed.path).unwrap();
+        // Keep the old inode alive while creating its replacement.
+        fs::rename(&replaced.path, fixture.0.join("previous-inode")).unwrap();
+        fs::write(&replaced.path, "16384").unwrap();
+        let mut controls = Controls::new();
+        for entry in [live.clone(), removed, replaced] {
+            controls.entries.insert(entry.path.clone(), entry);
+        }
+        assert!(controls.prune_stale());
+        assert_eq!(controls.entries.len(), 1);
+        let retained = controls.entries.get(&live.path).unwrap();
+        assert_eq!(retained.original, "4096");
+        assert_eq!(retained.last, "8192");
+        assert_eq!((retained.dev, retained.ino), (live.dev, live.ino));
+        assert!(
+            !controls.prune_stale(),
+            "unchanged controls need no journal rewrite"
+        );
+    }
+
+    #[test]
+    fn control_pruning_preserves_uncertain_metadata_errors() {
+        let fixture = JournalFixture::new("journal-metadata");
+        let entry = fixture.control("live");
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::Interrupted,
+            std::io::ErrorKind::Other,
+        ] {
+            assert!(!stale_control(&entry, Err(std::io::Error::from(kind))));
+        }
+        assert!(stale_control(
+            &entry,
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        ));
+    }
+
+    fn swappiness_fixture() -> Telemetry {
+        Telemetry {
+            sample: Snapshot {
+                total_bytes: 16 * GIB,
+                available_bytes: 8 * GIB,
+                swap_total_bytes: 10 * GIB,
+                swap_free_bytes: 5 * GIB,
+                ..Snapshot::default()
+            },
+            swaps: vec![Swap {
+                path: "/dev/zram0".into(),
+                kind: "partition".into(),
+                size: 10 * GIB,
+                used: 5 * GIB,
+                priority: 100,
+            }],
+            zram: Vec::new(),
+            ksm_profit: 0,
+            ksm_shared: 0,
+            sampled_at: 0,
+        }
+    }
+
+    #[test]
+    fn swappiness_honors_swap_pressure_before_zram_preferences() {
+        for profile in ["balanced", "interactive", "throughput", "ai", "gaming"] {
+            let settings = Settings {
+                profile: profile.into(),
+                ..Settings::default()
+            };
+            for (io, input, output) in [(1000, 0, 0), (0, 64 * MIB, 0), (0, 16 * MIB, 64 * MIB)] {
+                for used in [5 * GIB, 8 * GIB, 10 * GIB] {
+                    let mut t = swappiness_fixture();
+                    t.swaps[0].used = used;
+                    t.sample.swap_free_bytes = 10 * GIB - used;
+                    t.sample.io_full_bp = io;
+                    t.sample.swap_in_bytes_per_sec = input;
+                    t.sample.swap_out_bytes_per_sec = output;
+                    let d = Policy::new(settings.policy).observe(t.sample, 0);
+                    assert_eq!(d.reason, zmem::Reason::SwapIoPressure);
+                    assert_eq!(effective_swappiness(&settings, &t, &d), 20, "{profile}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn swappiness_keeps_idle_preferences_and_pressure_thresholds() {
+        for profile in ["balanced", "interactive", "throughput", "ai", "gaming"] {
+            let settings = Settings {
+                profile: profile.into(),
+                ..Settings::default()
+            };
+            let preferred = if matches!(profile, "interactive" | "gaming") {
+                100
+            } else {
+                120
+            };
+            let mut t = swappiness_fixture();
+            // Stay just below each busy boundary, including high swap-out
+            // without the swap-in rate required for bidirectional pressure.
+            for (io, input, output) in [
+                (0, 0, 0),
+                (999, 64 * MIB - 1, 0),
+                (0, 16 * MIB - 1, 64 * MIB),
+                (0, 16 * MIB, 64 * MIB - 1),
+            ] {
+                t.sample.io_full_bp = io;
+                t.sample.swap_in_bytes_per_sec = input;
+                t.sample.swap_out_bytes_per_sec = output;
+                let d = Policy::new(settings.policy).observe(t.sample, 0);
+                assert_eq!(effective_swappiness(&settings, &t, &d), preferred);
+            }
+            t = swappiness_fixture();
+            t.swaps[0].used = 8 * GIB;
+            t.sample.swap_free_bytes = 2 * GIB;
+            let d = Policy::new(settings.policy).observe(t.sample, 0);
+            assert_eq!(effective_swappiness(&settings, &t, &d), 60);
+            t.sample.available_bytes = 512 * MIB;
+            let d = Policy::new(settings.policy).observe(t.sample, 0);
+            assert_eq!(effective_swappiness(&settings, &t, &d), 80);
+            t.swaps[0].path = "/var/lib/zmem/swap/zmem-000001.swap".into();
+            t.swaps[0].used = 0;
+            assert_eq!(effective_swappiness(&settings, &t, &d), 80);
+        }
+    }
+
     #[test]
     fn proc_parsers_keep_units_and_paths() {
         let s = parse_meminfo(
