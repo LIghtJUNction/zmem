@@ -1,6 +1,9 @@
 //! Bounded, per-user admission for commands explicitly launched through run.
 //! No daemon state, process control, or IO-pressure inference is used here.
-use crate::json;
+use crate::{
+    json,
+    linux_flags::{O_DIRECTORY, O_NOFOLLOW, O_NONBLOCK},
+};
 use std::{
     fmt,
     fs::{self, File, OpenOptions},
@@ -24,9 +27,6 @@ const RECOVERY_MS: u64 = 3000;
 const START_INTERVAL_MS: u64 = 3000;
 const EVENT_INTERVAL: Duration = Duration::from_secs(5);
 const STATE_LIMIT: u64 = 512;
-const O_NOFOLLOW: i32 = 0o400000;
-const O_DIRECTORY: i32 = 0o200000;
-const O_NONBLOCK: i32 = 0o4000;
 static CANCELLED: AtomicI32 = AtomicI32::new(0);
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 

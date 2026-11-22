@@ -2,7 +2,7 @@
 
 **Memory, with room to work.** A small Linux memory and Swap controller from [Project Z](https://github.com/LIghtJUNction/project-z).
 
-[Website](https://lightjunction.github.io/zmem/) · [Releases](https://github.com/LIghtJUNction/zmem/releases) · [crates.io](https://crates.io/crates/zmem-manager) · [Rust API](https://docs.rs/zmem-manager) · [Background admission](docs/background-admission.md) · [0.4.0 acceptance](docs/acceptance-0.4.0.md) · [Responsiveness guide](docs/responsiveness.md) · [0.3.1 acceptance](docs/acceptance-0.3.1.md) · [Swap and dedup guide](docs/swap-lifecycle-and-dedup.md) · [0.3.0 acceptance](docs/acceptance-0.3.0.md) · [0.2.0 host acceptance](docs/acceptance-0.2.0.md)
+[Website](https://lightjunction.github.io/zmem/) · [Releases](https://github.com/LIghtJUNction/zmem/releases) · [crates.io](https://crates.io/crates/zmem-manager) · [Rust API](https://docs.rs/zmem-manager) · [Background admission](docs/background-admission.md) · [0.4.1 acceptance](docs/acceptance-0.4.1.md) · [Responsiveness guide](docs/responsiveness.md) · [0.3.1 acceptance](docs/acceptance-0.3.1.md) · [Swap and dedup guide](docs/swap-lifecycle-and-dedup.md) · [0.3.0 acceptance](docs/acceptance-0.3.0.md) · [0.2.0 host acceptance](docs/acceptance-0.2.0.md)
 
 zmem observes memory pressure, waits before starting new managed background work under pressure, and gives running background jobs a bounded memory budget. It brings zram setup, dynamic disk swap, automatic cleanup, opt-in memory deduplication and structured inspection into one tool. The Rust implementation has no third-party crate dependencies; the policy library uses `no_std` and makes no heap allocations.
 

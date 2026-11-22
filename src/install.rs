@@ -13,7 +13,10 @@ use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::Result;
+use crate::{
+    Result,
+    linux_flags::{O_NOFOLLOW, O_PATH},
+};
 
 const BASELINE: &str = "/var/lib/zmem/backup";
 const BINARY: &str = "/usr/local/bin/zmem";
@@ -120,7 +123,7 @@ impl InstallLock {
             .create(true)
             .truncate(false)
             .mode(0o600)
-            .custom_flags(0o400000) // O_NOFOLLOW
+            .custom_flags(O_NOFOLLOW)
             .open(path)?;
         let metadata = file.metadata()?;
         if !metadata.is_file() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
@@ -1123,7 +1126,7 @@ fn open_path(path: &Path, nofollow: bool) -> Result<File> {
     Ok(OpenOptions::new()
         .read(true)
         // O_PATH pins the inode and mount without reading swap contents.
-        .custom_flags(0o10000000 | if nofollow { 0o400000 } else { 0 })
+        .custom_flags(O_PATH | if nofollow { O_NOFOLLOW } else { 0 })
         .open(path)?)
 }
 

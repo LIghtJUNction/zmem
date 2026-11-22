@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.1 — 2026-11-22
+
+- Use architecture-correct Linux directory and no-follow open flags. AArch64 uses different values from x86_64; the 0.4.0 formal AArch64 validation exposed the mismatch before crate or release-asset publication.
+- Share the flags across admission, installation, swap helpers and I/O delegation. Preserve the existing file-identity and regular-file checks, including the distinct `O_PATH | O_NOFOLLOW` behavior for a symlink descriptor.
+- Test actual directory/file/symlink opening behavior and expected kernel errors on each release runner. The admission thresholds and process-preserving policy are unchanged.
+
 ## 0.4.0 — 2026-11-22
 
 - Check memory headroom before starting explicitly submitted background and disposable commands. Use available RAM and memory PSI, with strict handling of missing observations and a three-second stable recovery period after pressure.

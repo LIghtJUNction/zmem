@@ -4,7 +4,7 @@
 //! prepared file's identity before a create-only hard link publishes it.
 //! A rollback compares both identity and exact bytes before removing anything.
 
-use crate::{Result, json};
+use crate::{Result, json, linux_flags::O_NOFOLLOW};
 use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
@@ -179,7 +179,7 @@ impl Layout {
         self.secure_parent(&self.journal, false)?;
         let mut file = OpenOptions::new()
             .read(true)
-            .custom_flags(0o400000)
+            .custom_flags(O_NOFOLLOW)
             .open(&self.journal)?;
         let meta = file.metadata()?;
         if !meta.is_file()
@@ -216,7 +216,7 @@ impl Layout {
         }
         let mut file = OpenOptions::new()
             .read(true)
-            .custom_flags(0o400000)
+            .custom_flags(O_NOFOLLOW)
             .open(path)?;
         let opened = file.metadata()?;
         if (opened.dev(), opened.ino()) != (receipt.dev, receipt.ino) {

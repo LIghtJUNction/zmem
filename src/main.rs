@@ -14,6 +14,8 @@ mod io_delegation;
 mod json;
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "linux")]
+mod linux_flags;
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 const HELP: &str = "zmem — pressure-aware memory and swap management

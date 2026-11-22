@@ -1,5 +1,7 @@
 # zmem 0.4.0 acceptance record
 
+The formal 0.4.0 release was blocked by AArch64 validation: its binary test suite reported 173 passed, seven failed and three ignored. x86_64 validation and packaging succeeded, but the dependent publish job did not run. No 0.4.0 crate or GitHub Release assets were published by that run. The local x86_64 evidence below remains specific to its tested candidate. The architecture fix is recorded in [0.4.1 acceptance](acceptance-0.4.1.md).
+
 This release adds launch admission for commands explicitly submitted as background or disposable work. The evidence below separates source tests, native command behavior and service installation. It does not establish a desktop-speed improvement percentage, a peak-memory prediction or protection for every unregistered process.
 
 ## Tested implementation

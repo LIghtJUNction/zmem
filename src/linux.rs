@@ -1,4 +1,9 @@
-use crate::{Result, config::Settings, dedup, json};
+use crate::{
+    Result,
+    config::Settings,
+    dedup, json,
+    linux_flags::{O_NOFOLLOW, O_NONBLOCK, O_PATH},
+};
 use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
@@ -139,7 +144,7 @@ impl SwapMutationLock {
             .create(true)
             .truncate(false)
             .mode(0o600)
-            .custom_flags(0o400000) // O_NOFOLLOW
+            .custom_flags(O_NOFOLLOW)
             .open(path)?;
         Self::validate(&file)?;
         Self::lock(file)
@@ -256,10 +261,10 @@ fn swap_target(path: &Path) -> Result<File> {
         return Err("swap helper requires a canonical absolute path".into());
     }
     // O_PATH pins the inode without reading swap data or opening a block device
-    // for I/O. O_NOFOLLOW rejects a replaced final symlink.
+    // for I/O. O_NOFOLLOW pins a replaced final symlink for metadata rejection.
     let file = OpenOptions::new()
         .read(true)
-        .custom_flags(0o10000000 | 0o400000)
+        .custom_flags(O_PATH | O_NOFOLLOW)
         .open(path)?;
     let meta = file.metadata()?;
     if meta.is_file() {
@@ -1575,7 +1580,7 @@ fn write_control(path: &Path, value: &str, nonblock: bool) -> Result<()> {
     let mut o = OpenOptions::new();
     o.write(true);
     if nonblock {
-        o.custom_flags(0o4000);
+        o.custom_flags(O_NONBLOCK);
     }
     o.open(path)?.write_all(value.as_bytes())?;
     Ok(())
@@ -3736,7 +3741,7 @@ mod tests {
         fs::write(&path, "original").unwrap();
         let original = OpenOptions::new()
             .read(true)
-            .custom_flags(0o10000000 | 0o400000)
+            .custom_flags(O_PATH | O_NOFOLLOW)
             .open(&path)
             .unwrap();
         let expected = SwapIdentity::of(&original.metadata().unwrap());
