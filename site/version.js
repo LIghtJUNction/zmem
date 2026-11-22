@@ -1,1 +1,1 @@
-window.ZMEM_VERSION = "0.1.2";
+window.ZMEM_VERSION = "0.2.0";

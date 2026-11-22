@@ -5,7 +5,7 @@ use std::{
     io::{Read, Write},
     os::{
         fd::AsRawFd,
-        unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+        unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     },
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -13,7 +13,15 @@ use std::{
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use zmem::{Decision, GIB, MIB, Policy, Snapshot};
+use zmem::{Decision, GIB, MIB, Policy, Snapshot, reclaim as reclaim_policy};
+
+#[path = "background.rs"]
+mod background;
+#[path = "protection.rs"]
+mod protection;
+#[path = "swappiness.rs"]
+mod swappiness;
+type SwappinessGovernor = swappiness::Governor;
 
 const RUNTIME: &str = "/run/zmem";
 const CONTROL_FILE: &str = "/run/zmem/controls.tsv";
@@ -26,6 +34,8 @@ unsafe extern "C" {
     fn signal(sig: i32, handler: extern "C" fn(i32)) -> usize;
     fn kill(pid: i32, signal: i32) -> i32;
     fn getpagesize() -> i32;
+    fn swapon(path: *const std::ffi::c_char, flags: i32) -> i32;
+    fn swapoff(path: *const std::ffi::c_char) -> i32;
 }
 extern "C" fn stop_signal(_: i32) {
     STOP.store(true, Ordering::Relaxed);
@@ -103,6 +113,271 @@ pub fn command(program: &str, args: &[&str], seconds: u64) -> Result<String> {
             return Err(format!("{program} timed out after {seconds}s").into());
         }
         thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SwapAction {
+    Activate(i32),
+    Deactivate,
+}
+
+// Only a successfully decoded child response proves that the swap syscall
+// returned this errno. Setup, transport and timeout errors remain distinct.
+#[derive(Debug)]
+struct SwapSyscallError(i32);
+
+impl std::fmt::Display for SwapSyscallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "swap syscall failed: {}",
+            std::io::Error::from_raw_os_error(self.0)
+        )
+    }
+}
+
+impl std::error::Error for SwapSyscallError {}
+
+fn swap_syscall_errno(error: &(dyn std::error::Error + 'static)) -> Option<i32> {
+    error
+        .downcast_ref::<SwapSyscallError>()
+        .map(|error| error.0)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SwapIdentity {
+    dev: u64,
+    ino: u64,
+    rdev: u64,
+}
+
+impl SwapIdentity {
+    fn of(meta: &fs::Metadata) -> Self {
+        Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            rdev: meta.rdev(),
+        }
+    }
+}
+
+fn verify_swap_identity(file: &File, expected: SwapIdentity) -> Result<()> {
+    if SwapIdentity::of(&file.metadata()?) != expected {
+        return Err("swap file identity changed across mount namespace entry".into());
+    }
+    Ok(())
+}
+
+fn swap_flags(priority: i32) -> Result<i32> {
+    match priority {
+        -1 => Ok(0),
+        0..=32767 => Ok(0x8000 | priority),
+        _ => Err("swap priority must be -1 or between 0 and 32767".into()),
+    }
+}
+
+fn swap_target(path: &Path) -> Result<File> {
+    if !path.is_absolute() || fs::canonicalize(path)? != path {
+        return Err("swap helper requires a canonical absolute path".into());
+    }
+    // O_PATH pins the inode without reading swap data or opening a block device
+    // for I/O. O_NOFOLLOW rejects a replaced final symlink.
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(0o10000000 | 0o400000)
+        .open(path)?;
+    let meta = file.metadata()?;
+    if meta.is_file() {
+        if meta.uid() != 0 || meta.mode() & 0o077 != 0 {
+            return Err("swap helper requires a root-owned private regular file".into());
+        }
+        secure_dir(path.parent().ok_or("missing swap parent")?, false)?;
+    } else if !meta.file_type().is_block_device()
+        || path.parent() != Some(Path::new("/dev"))
+        || !path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix("zram"))
+            .is_some_and(|index| {
+                !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit())
+            })
+    {
+        return Err("swap helper only accepts private regular files or /dev/zram devices".into());
+    }
+    Ok(file)
+}
+
+fn swap_helper_args(
+    executable: &Path,
+    path: &Path,
+    action: SwapAction,
+    identity: SwapIdentity,
+) -> Result<Vec<String>> {
+    let (verb, priority) = match action {
+        SwapAction::Activate(priority) => {
+            swap_flags(priority)?;
+            ("__swap-on", priority)
+        }
+        SwapAction::Deactivate => ("__swap-off", -1),
+    };
+    Ok(vec![
+        "--target".into(),
+        "1".into(),
+        "--mount".into(),
+        "--root".into(),
+        "--wdns=/".into(),
+        "--no-fork".into(),
+        "--".into(),
+        executable
+            .to_str()
+            .ok_or("invalid helper executable")?
+            .into(),
+        verb.into(),
+        path.to_str().ok_or("invalid swap path")?.into(),
+        priority.to_string(),
+        identity.dev.to_string(),
+        identity.ino.to_string(),
+        identity.rdev.to_string(),
+    ])
+}
+
+fn swap_reply_errno(reply: &str) -> Result<i32> {
+    let code = reply
+        .strip_prefix("zmem-swap-v1\t")
+        .and_then(|value| value.strip_suffix('\n'))
+        .filter(|value| !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()))
+        .ok_or("invalid swap helper response")?
+        .parse::<i32>()?;
+    if !(0..=4095).contains(&code) {
+        return Err("invalid swap helper errno".into());
+    }
+    Ok(code)
+}
+
+fn host_swap_command(path: &Path, action: SwapAction, seconds: u64) -> Result<()> {
+    root_required()?;
+    let pinned = swap_target(path)?;
+    let identity = SwapIdentity::of(&pinned.metadata()?);
+    let args = swap_helper_args(&std::env::current_exe()?, path, action, identity)?;
+    let executable = ["/usr/bin/nsenter", "/bin/nsenter"]
+        .into_iter()
+        .map(Path::new)
+        .find(|path| path.is_file())
+        .ok_or("required host mount namespace helper is missing: nsenter")?;
+    let mut child = Command::new(executable)
+        .args(args)
+        .env_clear()
+        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+        .env("LC_ALL", "C")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let start = Instant::now();
+    loop {
+        if child.try_wait()?.is_some() {
+            let output = child.wait_with_output()?;
+            if !output.status.success() {
+                return Err(format!(
+                    "host swap helper failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )
+                .into());
+            }
+            let errno = swap_reply_errno(std::str::from_utf8(&output.stdout)?)?;
+            return if errno == 0 {
+                Ok(())
+            } else {
+                Err(SwapSyscallError(errno).into())
+            };
+        }
+        if STOP.load(Ordering::Relaxed) || start.elapsed() > Duration::from_secs(seconds) {
+            // nsenter --no-fork execs the single helper in this PID. Inherit
+            // the enclosing worker's process group so cancelling a grow/shrink
+            // worker also reaches this child. Never wait forever for a syscall
+            // that has an uninterruptible operation and pending SIGKILL.
+            let _ = child.kill();
+            let cleanup = Instant::now();
+            while child.try_wait()?.is_none() && cleanup.elapsed() < Duration::from_secs(1) {
+                thread::sleep(Duration::from_millis(20));
+            }
+            return Err(
+                "host swap helper was interrupted or exceeded its deadline; file retained".into(),
+            );
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Private child protocol: execute exactly one syscall after nsenter has
+/// selected PID 1's mount namespace, root and working directory. Numeric errno
+/// is returned separately from setup/validation failures.
+pub fn swap_helper(action: &str, args: &[String]) -> Result<()> {
+    root_required()?;
+    if !matches!(action, "__swap-on" | "__swap-off") || args.len() != 5 {
+        return Err("invalid private swap helper request".into());
+    }
+    for (current, host) in [
+        ("/proc/self/ns/mnt", "/proc/1/ns/mnt"),
+        ("/", "/proc/1/root"),
+    ] {
+        let current = fs::metadata(current)?;
+        let host = fs::metadata(host)?;
+        if (current.dev(), current.ino()) != (host.dev(), host.ino()) {
+            return Err("swap helper is outside the host mount namespace or root".into());
+        }
+    }
+    let priority = args[1].parse::<i32>()?;
+    let flags = swap_flags(priority)?;
+    if action == "__swap-off" && priority != -1 {
+        return Err("invalid deactivation priority".into());
+    }
+    let expected = SwapIdentity {
+        dev: args[2].parse()?,
+        ino: args[3].parse()?,
+        rdev: args[4].parse()?,
+    };
+    let pinned = swap_target(Path::new(&args[0]))?;
+    verify_swap_identity(&pinned, expected)?;
+    // Resolve the syscall through the pinned host file, so a concurrent rename
+    // cannot substitute another inode after the identity check.
+    let name = std::ffi::CString::new(format!("/proc/self/fd/{}", pinned.as_raw_fd()))?;
+    let result = unsafe {
+        if action == "__swap-on" {
+            swapon(name.as_ptr(), flags)
+        } else {
+            swapoff(name.as_ptr())
+        }
+    };
+    let errno = if result == 0 {
+        0
+    } else {
+        std::io::Error::last_os_error()
+            .raw_os_error()
+            .ok_or("swap syscall did not provide errno")?
+    };
+    println!("zmem-swap-v1\t{errno}");
+    Ok(())
+}
+
+fn swap_busy(error: &(dyn std::error::Error + 'static)) -> bool {
+    swap_syscall_errno(error) == Some(16)
+}
+
+fn activate_existing_swap(path: &Path, priority: i32) -> Result<()> {
+    match host_swap_command(path, SwapAction::Activate(priority), 10) {
+        Err(error) if swap_busy(error.as_ref()) => {
+            // An orphan mount can change /proc/swaps' displayed name. EBUSY
+            // preserves an existing file without claiming an alias identity:
+            // some filesystems can also report a temporarily busy activation.
+            println!(
+                "{{\"event\":\"swap_activation_busy_preserved\",\"path\":{},\"errno\":16,\"active_identity_confirmed\":false}}",
+                json::quote(&path.to_string_lossy())
+            );
+            Ok(())
+        }
+        result => result,
     }
 }
 
@@ -273,8 +548,42 @@ pub struct Zram {
     pub compressed: u64,
     pub resident: u64,
     pub same_pages: u64,
+    pub logical_size: u64,
+    pub logical_used: u64,
+    pub memory_limit: u64,
+    pub algorithm: String,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
+pub struct Paging {
+    pub rates_available: bool,
+    pub zram_rates_available: bool,
+    pub disk_swap_estimate_available: bool,
+    pub zswap_enabled: Option<bool>,
+    pub sample_interval_ms: u64,
+    pub file_refault_bytes_per_sec: u64,
+    pub anon_refault_bytes_per_sec: u64,
+    pub direct_scan_bytes_per_sec: u64,
+    pub zram_read_bytes_per_sec: u64,
+    pub estimated_disk_swap_in_bytes_per_sec: u64,
+}
+#[derive(Clone, Debug, Default)]
+pub struct Managed {
+    pub background_groups: usize,
+    pub populated_background_groups: usize,
+    pub background_tasks: usize,
+    pub background_memory_bytes: u64,
+    pub reclaim_candidates: usize,
+    pub coverage_complete: bool,
+}
+#[derive(Clone, Debug, Default)]
+pub struct Applied {
+    pub swappiness_requested: Option<u16>,
+    pub swappiness_reason: &'static str,
+    pub protection_budget_bytes: u64,
+    pub protected_critical_scopes: usize,
+    pub protection_complete: bool,
+}
+#[derive(Clone, Debug, Default)]
 pub struct Telemetry {
     pub sample: Snapshot,
     pub swaps: Vec<Swap>,
@@ -282,34 +591,102 @@ pub struct Telemetry {
     pub ksm_profit: i64,
     pub ksm_shared: u64,
     pub sampled_at: u64,
+    pub paging: Paging,
+    pub managed: Managed,
+    pub background: background::Report,
+    pub applied: Applied,
+    pub file_cache_bytes: u64,
+    pub anon_bytes: u64,
+    pub free_bytes: u64,
 }
 pub struct Sampler {
-    last: Option<(Instant, [u64; 5])>,
+    last: Option<(Instant, [u64; 9])>,
+    last_zram_key: Option<String>,
     page_size: u64,
 }
 impl Sampler {
     pub fn new() -> Self {
         Self {
             last: None,
-            page_size: command("getconf", &["PAGESIZE"], 2)
-                .ok()
-                .and_then(|s| s.trim().parse().ok())
-                .unwrap_or(4096),
+            last_zram_key: None,
+            page_size: control_page_size().unwrap_or(4096),
         }
     }
     pub fn sample(&mut self) -> Result<Telemetry> {
-        let mut sample = parse_meminfo(&read("/proc/meminfo")?)?;
+        let meminfo = read("/proc/meminfo")?;
+        let mut sample = parse_meminfo(&meminfo)?;
         let memory = read("/proc/pressure/memory")?;
         let io = read("/proc/pressure/io")?;
         let (some, ts) = psi(&memory, "some ");
         let (full, tf) = psi(&memory, "full ");
         let (ioavg, ti) = psi(&io, "full ");
-        let (pin, pout) = vmstats(&read("/proc/vmstat")?);
+        let vmtext = read("/proc/vmstat")?;
+        let (pin, pout) = vmstats(&vmtext);
+        let vm = counters(&vmtext);
+        let file_refault = vm.get("workingset_refault_file").copied().unwrap_or(0);
+        let anon_refault = vm.get("workingset_refault_anon").copied().unwrap_or(0);
+        let direct_scan = vm.get("pgscan_direct").copied().unwrap_or(0);
+        let swaps = swaps()?;
+        let mut zram_sectors = Some(0u64);
+        let mut zram_key = String::new();
+        for s in &swaps {
+            let Some(name) = s
+                .path
+                .strip_prefix("/dev/")
+                .filter(|n| n.starts_with("zram") && !n.contains('/'))
+            else {
+                continue;
+            };
+            zram_key.push_str(&format!("{name}:{};", s.size));
+            let sectors = read(format!("/sys/block/{name}/stat"))
+                .ok()
+                .and_then(|text| {
+                    text.split_whitespace()
+                        .nth(2)
+                        .and_then(|s| s.parse::<u64>().ok())
+                });
+            zram_sectors = zram_sectors
+                .zip(sectors)
+                .and_then(|(sum, n)| sum.checked_add(n));
+        }
+        let current = [
+            ts,
+            tf,
+            ti,
+            pin,
+            pout,
+            file_refault,
+            anon_refault,
+            direct_scan,
+            zram_sectors.unwrap_or(0),
+        ];
+        let zswap_enabled = match read("/sys/module/zswap/parameters/enabled") {
+            Ok(text) => match text.trim() {
+                "Y" | "y" | "1" => Some(true),
+                "N" | "n" | "0" => Some(false),
+                _ => None,
+            },
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                Some(false)
+            }
+            Err(_) => None,
+        };
+        let mut paging = Paging {
+            zswap_enabled,
+            ..Paging::default()
+        };
         let nowi = Instant::now();
         sample.memory_some_bp = some;
         sample.memory_full_bp = full;
         sample.io_full_bp = ioavg;
-        if let Some((last, counters)) = self.last {
+        if let Some((last, counters)) = self.last.filter(|(last, previous)| {
+            nowi.duration_since(*last) >= Duration::from_millis(100)
+                && current[..8].iter().zip(&previous[..8]).all(|(a, b)| a >= b)
+        }) {
             let us = nowi.duration_since(last).as_micros().max(1);
             let percent =
                 |a: u64, b: u64| ((a.saturating_sub(b) as u128 * 10000 / us).min(10000)) as u16;
@@ -322,9 +699,35 @@ impl Sampler {
             };
             sample.swap_in_bytes_per_sec = rate(pin, counters[3]);
             sample.swap_out_bytes_per_sec = rate(pout, counters[4]);
+            paging.rates_available = [
+                "workingset_refault_file",
+                "workingset_refault_anon",
+                "pgscan_direct",
+                "pswpin",
+                "pswpout",
+            ]
+            .iter()
+            .all(|key| vm.contains_key(*key));
+            paging.sample_interval_ms = (us / 1000).min(u64::MAX as u128) as u64;
+            paging.file_refault_bytes_per_sec = rate(file_refault, counters[5]);
+            paging.anon_refault_bytes_per_sec = rate(anon_refault, counters[6]);
+            paging.direct_scan_bytes_per_sec = rate(direct_scan, counters[7]);
+            paging.zram_rates_available = paging.rates_available
+                && zram_sectors.is_some_and(|n| n >= counters[8])
+                && self.last_zram_key.as_ref() == Some(&zram_key);
+            if paging.zram_rates_available {
+                paging.zram_read_bytes_per_sec =
+                    ((current[8].saturating_sub(counters[8]) as u128 * 512 * 1_000_000 / us)
+                        .min(u64::MAX as u128)) as u64;
+                paging.estimated_disk_swap_in_bytes_per_sec = sample
+                    .swap_in_bytes_per_sec
+                    .saturating_sub(paging.zram_read_bytes_per_sec);
+            }
+            paging.disk_swap_estimate_available =
+                paging.zram_rates_available && paging.zswap_enabled == Some(false);
         }
-        self.last = Some((nowi, [ts, tf, ti, pin, pout]));
-        let swaps = swaps()?;
+        self.last = Some((nowi, current));
+        self.last_zram_key = zram_sectors.map(|_| zram_key);
         let mut zram = Vec::new();
         for s in &swaps {
             if let Some(name) = s
@@ -344,10 +747,23 @@ impl Sampler {
                         compressed: v[1],
                         resident: v[2],
                         same_pages: v[5],
+                        logical_size: s.size,
+                        logical_used: s.used,
+                        memory_limit: v[3],
+                        algorithm: read(format!("/sys/block/{name}/comp_algorithm"))
+                            .ok()
+                            .and_then(|s| {
+                                s.split_once('[')
+                                    .and_then(|(_, s)| s.split_once(']'))
+                                    .map(|(name, _)| name.to_owned())
+                            })
+                            .unwrap_or_default(),
                     });
                 }
             }
         }
+        let background = background::sample();
+        let managed = managed_snapshot(&background);
         Ok(Telemetry {
             sample,
             swaps,
@@ -358,8 +774,129 @@ impl Sampler {
                 .unwrap_or(0),
             ksm_shared: number("/sys/kernel/mm/ksm/pages_sharing"),
             sampled_at: now(),
+            paging,
+            managed,
+            background,
+            file_cache_bytes: meminfo_bytes(&meminfo, "Cached"),
+            anon_bytes: meminfo_bytes(&meminfo, "AnonPages"),
+            free_bytes: meminfo_bytes(&meminfo, "MemFree"),
+            applied: Applied::default(),
         })
     }
+}
+
+fn counters(text: &str) -> BTreeMap<String, u64> {
+    text.lines()
+        .filter_map(|line| {
+            let mut values = line.split_whitespace();
+            Some((values.next()?.to_owned(), values.next()?.parse().ok()?))
+        })
+        .collect()
+}
+fn meminfo_bytes(text: &str, key: &str) -> u64 {
+    text.lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            (name == key)
+                .then(|| value.split_whitespace().next()?.parse::<u64>().ok())
+                .flatten()
+        })
+        .unwrap_or(0)
+        .saturating_mul(1024)
+}
+fn reclaim_sample(path: &Path) -> Result<reclaim_policy::Sample> {
+    let meta = fs::metadata(path)?;
+    let stats = counters(&read(path.join("memory.stat"))?);
+    let events = counters(&read(path.join("cgroup.events"))?);
+    let get = |key: &str| stats.get(key).copied().unwrap_or(0);
+    Ok(reclaim_policy::Sample {
+        dev: meta.dev(),
+        ino: meta.ino(),
+        populated: events.get("populated") == Some(&1),
+        current_bytes: read(path.join("memory.current"))?.trim().parse()?,
+        file_bytes: get("file"),
+        inactive_file_bytes: get("inactive_file"),
+        dirty_bytes: get("file_dirty"),
+        writeback_bytes: get("file_writeback"),
+        shmem_bytes: get("shmem"),
+        pgsteal_proactive: stats.get("pgsteal_proactive").copied(),
+    })
+}
+fn managed_snapshot(background: &background::Report) -> Managed {
+    let mut result = Managed {
+        background_groups: background.groups.len(),
+        coverage_complete: background.sample_complete,
+        ..Managed::default()
+    };
+    let mut pids = std::collections::BTreeSet::new();
+    for group in &background.groups {
+        result.background_memory_bytes = result
+            .background_memory_bytes
+            .saturating_add(group.current_bytes);
+        if !group.populated {
+            continue;
+        }
+        result.populated_background_groups += 1;
+        let mut pending = vec![(group.path.clone(), 0)];
+        let mut visited = 0;
+        while let Some((path, depth)) = pending.pop() {
+            visited += 1;
+            if visited > 1024 || depth > 8 {
+                result.coverage_complete = false;
+                break;
+            }
+            if let Ok(text) = read(path.join("cgroup.procs")) {
+                pids.extend(
+                    text.split_whitespace()
+                        .filter_map(|s| s.parse::<u32>().ok()),
+                );
+            } else {
+                result.coverage_complete = false;
+            }
+            match fs::read_dir(&path) {
+                Ok(entries) => {
+                    for (index, entry) in entries.take(1025).enumerate() {
+                        if index == 1024 {
+                            result.coverage_complete = false;
+                            break;
+                        }
+                        match entry {
+                            Ok(e) if e.file_type().is_ok_and(|t| t.is_dir()) => {
+                                pending.push((e.path(), depth + 1))
+                            }
+                            Err(_) => result.coverage_complete = false,
+                            _ => {}
+                        }
+                    }
+                    if pending.len() > 1024 {
+                        result.coverage_complete = false;
+                        break;
+                    }
+                }
+                Err(_) => result.coverage_complete = false,
+            }
+        }
+    }
+    result.background_tasks = pids.len();
+    result
+}
+fn optional_number(value: Option<u64>) -> String {
+    value
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "null".into())
+}
+fn observed_number(path: &str) -> Option<u64> {
+    read(path).ok()?.trim().parse().ok()
+}
+fn process_start_ticks() -> u64 {
+    read("/proc/self/stat")
+        .ok()
+        .and_then(|s| {
+            s.rsplit_once(") ")
+                .and_then(|(_, tail)| tail.split_whitespace().nth(19))
+                .and_then(|s| s.parse().ok())
+        })
+        .unwrap_or(0)
 }
 
 pub fn telemetry_json(
@@ -371,6 +908,12 @@ pub fn telemetry_json(
     processes: bool,
 ) -> String {
     let s = &t.sample;
+    let mut all_errors = errors.to_vec();
+    for error in &t.background.errors {
+        if !all_errors.contains(error) {
+            all_errors.push(error.clone());
+        }
+    }
     let swap_rows = t
         .swaps
         .iter()
@@ -387,7 +930,7 @@ pub fn telemetry_json(
         .collect::<Vec<_>>()
         .join(",");
     let zram=t.zram.iter().map(|z|format!("{{\"device\":{},\"original_bytes\":{},\"compressed_bytes\":{},\"resident_bytes\":{},\"estimated_saved_bytes\":{},\"same_pages\":{}}}",json::quote(&z.name),z.original,z.compressed,z.resident,z.original.saturating_sub(z.resident),z.same_pages)).collect::<Vec<_>>().join(",");
-    format!(
+    let mut status = format!(
         "{{\"schema\":\"zmem.status.v1\",\"version\":{},\"pid\":{},\"sampled_at_unix\":{},\"profile\":{},\"pressure\":{},\"reason\":{},\"memory\":{{\"total_bytes\":{},\"available_bytes\":{}}},\"swap\":{{\"total_bytes\":{},\"free_bytes\":{},\"in_bytes_per_sec\":{},\"out_bytes_per_sec\":{},\"devices\":[{}]}},\"psi\":{{\"memory_some_bp\":{},\"memory_full_bp\":{},\"io_full_bp\":{}}},\"zram\":[{}],\"ksm\":{{\"general_profit_bytes\":{},\"pages_sharing\":{}}},\"plan\":{{\"grow_swap_bytes\":{},\"shrink_allowed\":{},\"background_high_percent\":{},\"reclaim_request_bytes\":{},\"swappiness_hint\":{}}},\"worker\":{},\"errors\":{},\"processes\":{}}}",
         json::quote(env!("CARGO_PKG_VERSION")),
         std::process::id(),
@@ -399,8 +942,8 @@ pub fn telemetry_json(
         s.available_bytes,
         s.swap_total_bytes,
         s.swap_free_bytes,
-        s.swap_in_bytes_per_sec,
-        s.swap_out_bytes_per_sec,
+        optional_number(t.paging.rates_available.then_some(s.swap_in_bytes_per_sec)),
+        optional_number(t.paging.rates_available.then_some(s.swap_out_bytes_per_sec)),
         swap_rows,
         s.memory_some_bp,
         s.memory_full_bp,
@@ -414,13 +957,42 @@ pub fn telemetry_json(
         d.reclaim_bytes,
         d.recommended_swappiness,
         worker.map(json::quote).unwrap_or_else(|| "null".into()),
-        json::strings(errors),
+        json::strings(&all_errors),
         if processes {
             top_processes(20)
         } else {
             "[]".into()
         }
-    )
+    );
+    status.pop();
+    let p = &t.paging;
+    let m = &t.managed;
+    let a = &t.applied;
+    let boot_id = read("/proc/sys/kernel/random/boot_id").unwrap_or_default();
+    let device_details = t.zram.iter().map(|z| format!(
+        "{{\"device\":{},\"logical_size_bytes\":{},\"logical_used_bytes\":{},\"resident_bytes\":{},\"memory_limit_bytes\":{},\"algorithm\":{},\"mode\":\"active_device_preserved\"}}",
+        json::quote(&z.name),z.logical_size,z.logical_used,z.resident,z.memory_limit,json::quote(&z.algorithm)
+    )).collect::<Vec<_>>().join(",");
+    status.push_str(&format!(
+        ",\"memory_pressure\":{},\"io_congested\":{},\"instance\":{{\"pid\":{},\"start_ticks\":{},\"boot_id\":{}}},\"paging\":{{\"rates_available\":{},\"zram_rates_available\":{},\"disk_swap_estimate_available\":{},\"zswap_enabled\":{},\"sample_interval_ms\":{},\"file_refault_bytes_per_sec\":{},\"anon_refault_bytes_per_sec\":{},\"direct_scan_bytes_per_sec\":{},\"zram_read_bytes_per_sec\":{},\"estimated_disk_swap_in_bytes_per_sec\":{}}},\"memory_usage\":{{\"free_bytes\":{},\"file_cache_bytes\":{},\"anonymous_bytes\":{}}},\"controls\":{{\"swappiness_requested\":{},\"swappiness_actual\":{},\"swappiness_reason\":{},\"page_cluster_actual\":{},\"protection_budget_bytes\":{},\"protected_critical_scopes\":{},\"protection_complete\":{}}},\"managed\":{{\"background_groups\":{},\"populated_background_groups\":{},\"background_tasks\":{},\"background_memory_bytes\":{},\"reclaim_candidates\":{},\"coverage_complete\":{}}},\"zram_devices\":[{}]}}",
+        json::quote(d.pressure.as_str()),d.io_congested,std::process::id(),process_start_ticks(),json::quote(boot_id.trim()),
+        p.rates_available,p.zram_rates_available,p.disk_swap_estimate_available,
+        p.zswap_enabled.map(|b| b.to_string()).unwrap_or_else(|| "null".into()),p.sample_interval_ms,
+        optional_number(p.rates_available.then_some(p.file_refault_bytes_per_sec)),
+        optional_number(p.rates_available.then_some(p.anon_refault_bytes_per_sec)),
+        optional_number(p.rates_available.then_some(p.direct_scan_bytes_per_sec)),
+        optional_number(p.zram_rates_available.then_some(p.zram_read_bytes_per_sec)),
+        optional_number(p.disk_swap_estimate_available.then_some(p.estimated_disk_swap_in_bytes_per_sec)),
+        t.free_bytes,t.file_cache_bytes,t.anon_bytes,
+        optional_number(a.swappiness_requested.map(u64::from)),optional_number(observed_number("/proc/sys/vm/swappiness")),json::quote(a.swappiness_reason),optional_number(observed_number("/proc/sys/vm/page-cluster")),a.protection_budget_bytes,a.protected_critical_scopes,a.protection_complete,
+        m.background_groups,m.populated_background_groups,m.background_tasks,m.background_memory_bytes,m.reclaim_candidates,m.coverage_complete,device_details
+    ));
+    status.pop();
+    status.push_str(&format!(
+        ",\"background\":{}}}",
+        background::json(&t.background)
+    ));
+    status
 }
 pub fn top_processes(limit: usize) -> String {
     let mut rows = Vec::new();
@@ -465,13 +1037,32 @@ pub fn top_processes(limit: usize) -> String {
     format!(
         "[{}]",
         rows.iter()
-            .map(|(_, pid, name, rss, swap)| format!(
-                "{{\"pid\":{pid},\"name\":{},\"rss_bytes\":{rss},\"swap_bytes\":{swap}}}",
-                json::quote(name)
-            ))
+            .map(|(_, pid, name, rss, swap)| {
+                let cgroup = read(format!("/proc/{pid}/cgroup")).ok().and_then(|text| {
+                    text.lines().find_map(|line| line.strip_prefix("0::").map(str::to_owned))
+                });
+                let managed = cgroup.as_deref().map(is_managed_background_path);
+                format!(
+                    "{{\"pid\":{pid},\"name\":{},\"rss_bytes\":{rss},\"swap_bytes\":{swap},\"cgroup\":{},\"managed_background\":{}}}",
+                    json::quote(name), cgroup.as_deref().map(json::quote).unwrap_or_else(|| "null".into()),
+                    managed.map(|v| v.to_string()).unwrap_or_else(|| "null".into())
+                )
+            })
             .collect::<Vec<_>>()
             .join(",")
     )
+}
+
+fn is_managed_background_path(path: &str) -> bool {
+    const ROOT: &str = "/zmem.slice/zmem-background.slice";
+    let Some(index) = path.find(ROOT) else {
+        return false;
+    };
+    let end = index + ROOT.len();
+    if !path.starts_with('/') || (path.len() != end && path.as_bytes()[end] != b'/') {
+        return false;
+    }
+    is_managed_background_control(&Path::new(CGROOT).join(&path[1..end]).join("memory.high"))
 }
 
 #[derive(Clone)]
@@ -485,11 +1076,21 @@ struct Control {
 }
 struct Controls {
     entries: BTreeMap<PathBuf, Control>,
+    swappiness_governor: SwappinessGovernor,
+    background: background::State,
+    pub protection_budget_bytes: u64,
+    pub protected_critical_scopes: usize,
+    pub protection_complete: bool,
 }
 impl Controls {
     fn new() -> Self {
         Self {
             entries: BTreeMap::new(),
+            swappiness_governor: SwappinessGovernor::new(),
+            background: background::State::default(),
+            protection_budget_bytes: 0,
+            protected_critical_scopes: 0,
+            protection_complete: false,
         }
     }
     fn prune_stale(&mut self) -> bool {
@@ -633,20 +1234,98 @@ impl Controls {
         }
         Ok(())
     }
-    fn protect(&mut self, path: &Path, bytes: u64) -> Result<()> {
-        if !path.exists() {
-            return Ok(());
+    fn protect(&mut self, path: &Path, bytes: u64) -> Result<bool> {
+        if !valid_control(path) || path.file_name().and_then(|s| s.to_str()) != Some("memory.low") {
+            return Err("invalid protection control path".into());
         }
         let current = read(path)?;
-        if current.trim() == "max" {
-            return Ok(());
+        let current = current.trim();
+        let meta = fs::metadata(path)?;
+        let page_size = control_page_size()?;
+        let requested = canonical_control_value(path, &bytes.to_string(), page_size)?;
+        if can_manage_protection(
+            self.entries.get(path),
+            path,
+            current,
+            meta.dev(),
+            meta.ino(),
+            page_size,
+        )? {
+            // Unlike the former minimum-only helper, an owned allocation can
+            // also decrease when its scope's working set or budget changes.
+            self.set(path, &requested, false)?;
+            return Ok(true);
         }
-        let current = current.trim().parse::<u64>()?;
-        if current < bytes {
-            self.set(path, &bytes.to_string(), false)?;
+        // A pre-existing nonzero control belongs to another administrator.
+        // Preserve it even when it is smaller than our desired allocation.
+        Ok(current == "max" || current.parse::<u64>()? >= requested.parse::<u64>()?)
+    }
+
+    fn forget_protection(&mut self, path: &Path) -> Result<()> {
+        if let Some(entry) = self.entries.remove(path) {
+            if let Err(error) = self.save() {
+                self.entries.insert(path.into(), entry);
+                return Err(error);
+            }
         }
         Ok(())
     }
+
+    fn retire_protection(&mut self, path: &Path) -> Result<()> {
+        let Some(entry) = self.entries.get(path).cloned() else {
+            return Ok(());
+        };
+        if path.file_name().and_then(|s| s.to_str()) != Some("memory.low") {
+            return Err("cannot retire a non-protection control".into());
+        }
+        let meta = match fs::metadata(path) {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return self.forget_protection(path);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if entry.dev != meta.dev() || entry.ino != meta.ino() {
+            return self.forget_protection(path);
+        }
+        let current = read(path)?;
+        if owned_control_value(
+            path,
+            &entry.last,
+            entry.pending_previous.as_deref(),
+            current.trim(),
+            control_page_size()?,
+        )? {
+            // Use the existing write-ahead journal for restoration as well.
+            // A failed write/read-back leaves a recoverable ownership record.
+            self.set(path, &entry.original, false)?;
+        }
+        // An external replacement is preserved; ownership is relinquished.
+        self.forget_protection(path)
+    }
+}
+
+fn can_manage_protection(
+    entry: Option<&Control>,
+    path: &Path,
+    current: &str,
+    dev: u64,
+    ino: u64,
+    page_size: u64,
+) -> Result<bool> {
+    if let Some(entry) = entry.filter(|entry| entry.dev == dev && entry.ino == ino) {
+        if !owned_control_value(
+            path,
+            &entry.last,
+            entry.pending_previous.as_deref(),
+            current,
+            page_size,
+        )? {
+            return Err(format!("external control change preserved: {}", path.display()).into());
+        }
+        return Ok(true);
+    }
+    Ok(current == "0")
 }
 fn stale_control(entry: &Control, metadata: std::io::Result<fs::Metadata>) -> bool {
     match metadata {
@@ -675,6 +1354,9 @@ fn managed_background_high_reset(path: &Path, original: &str, observed: &str) ->
     if original != "max" || observed != "max" {
         return false;
     }
+    is_managed_background_control(path)
+}
+fn is_managed_background_control(path: &Path) -> bool {
     let Some(relative) = path.strip_prefix(CGROOT).ok().and_then(|p| p.to_str()) else {
         return false;
     };
@@ -805,101 +1487,318 @@ pub fn restore_control_snapshot(text: &str) -> Result<()> {
         Err(errors.join("; ").into())
     }
 }
-fn child_dirs(path: &Path) -> Vec<PathBuf> {
-    fs::read_dir(path)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-        .map(|e| e.path())
-        .take(256)
-        .collect()
-}
-fn user_managers() -> Vec<PathBuf> {
-    child_dirs(Path::new(CGROOT).join("user.slice").as_path())
-        .into_iter()
-        .filter_map(|p| {
-            let uid = p
-                .file_name()?
-                .to_str()?
-                .strip_prefix("user-")?
-                .strip_suffix(".slice")?;
-            if !uid.chars().all(|x| x.is_ascii_digit()) {
-                return None;
-            }
-            let manager = p.join(format!("user@{uid}.service"));
-            manager.exists().then_some(manager)
-        })
-        .collect()
-}
 fn protect_sessions(c: &mut Controls, total: u64, errors: &mut Vec<String>) {
-    let reserve = (total / 8).clamp(256 * MIB, 2 * GIB);
-    let users = user_managers();
-    let mut paths = vec![
-        (Path::new(CGROOT).join("user.slice/memory.low"), reserve),
-        (
-            Path::new(CGROOT).join("system.slice/memory.low"),
-            (256 * MIB).min(total / 32),
-        ),
-    ];
-    for manager in &users {
-        let share = reserve / users.len().max(1) as u64;
-        if let Some(parent) = manager.parent() {
-            paths.push((parent.join("memory.low"), share));
-        }
-        paths.push((manager.join("memory.low"), share));
-        paths.push((manager.join("session.slice/memory.low"), share * 3 / 4));
-        paths.push((manager.join("app.slice/memory.low"), share / 4));
-        for app in child_dirs(&manager.join("app.slice")) {
-            let name = app
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_lowercase();
-            if [
-                "ztty",
-                "kitty",
-                "foot",
-                "ssmcp",
-                "alacritty",
-                "konsole",
-                "terminal",
-            ]
-            .iter()
-            .any(|x| name.contains(x))
-            {
-                paths.push((app.join("memory.low"), (128 * MIB).min(share / 4)));
-            }
-        }
+    c.protection_complete = false;
+    let result = (|| -> Result<protection::ProtectionPlan> {
+        let page_size = control_page_size()?;
+        let scopes = discover_protection_scopes(
+            Path::new("/proc"),
+            Path::new(CGROOT),
+            total,
+            page_size,
+            8192,
+            Duration::from_millis(500),
+        )?;
+        protection::plan_protection(Path::new(CGROOT), total, page_size, &scopes)
+            .map_err(Into::into)
+    })();
+    match result {
+        Ok(plan) => apply_protection_plan(c, &plan, errors),
+        Err(error) => errors.push(format!(
+            "protection scan incomplete; previous controls retained: {error}"
+        )),
     }
-    for unit in ["sshd.service", "ssh.service", "systemd-logind.service"] {
-        paths.push((
-            Path::new(CGROOT)
-                .join("system.slice")
-                .join(unit)
-                .join("memory.low"),
-            64 * MIB,
+}
+
+fn protection_read(path: &Path, limit: u64) -> std::io::Result<String> {
+    let mut text = String::new();
+    File::open(path)?
+        .take(limit + 1)
+        .read_to_string(&mut text)?;
+    if text.len() as u64 > limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("protection input exceeds {limit} bytes: {}", path.display()),
         ));
     }
-    for (p, n) in paths {
-        if let Err(e) = c.protect(&p, n) {
-            errors.push(e.to_string());
-        }
-    }
+    Ok(text)
 }
-fn background_groups() -> Vec<PathBuf> {
-    let mut groups = Vec::new();
-    let root = Path::new(CGROOT).join("zmem.slice/zmem-background.slice");
-    if root.join("memory.current").exists() {
-        groups.push(root);
+
+fn protection_process_path(root: &Path, cgroup: &str) -> Result<Option<PathBuf>> {
+    let mut unified = cgroup.lines().filter_map(|line| line.strip_prefix("0::"));
+    let Some(path) = unified.next() else {
+        return Ok(None);
+    };
+    if unified.next().is_some() {
+        return Err("multiple unified cgroup memberships".into());
     }
-    for p in user_managers() {
-        let p = p.join("zmem.slice/zmem-background.slice");
-        if p.join("memory.current").exists() {
-            groups.push(p);
+    let relative = path
+        .strip_prefix('/')
+        .ok_or("nonabsolute unified cgroup membership")?;
+    let parts: Vec<_> = relative.split('/').collect();
+    // Login sessions are accepted only when the planner also recognizes an
+    // explicit Remote role. A shell or terminal alone cannot select the whole
+    // login session. The planner validates the UID and session ID before reads.
+    if parts.len() == 3
+        && parts[0] == "user.slice"
+        && parts[1].starts_with("user-")
+        && parts[1].ends_with(".slice")
+        && parts[2].starts_with("session-")
+        && parts[2].ends_with(".scope")
+    {
+        return Ok(Some(root.join(relative)));
+    }
+    // Other automatic discovery is restricted to application/session units
+    // owned by a user manager. System services are added explicitly below.
+    if parts.len() < 5
+        || parts[0] != "user.slice"
+        || !parts[2].starts_with("user@")
+        || !parts[2].ends_with(".service")
+        || !matches!(parts[3], "app.slice" | "session.slice")
+    {
+        return Ok(None);
+    }
+    Ok(Some(root.join(relative)))
+}
+
+fn protection_role(comm: &str, path: &Path) -> Option<protection::Role> {
+    use protection::Role;
+    let name = comm.trim().to_ascii_lowercase();
+    if matches!(
+        name.as_str(),
+        "hyprland"
+            | "kwin_wayland"
+            | "kwin_x11"
+            | "gnome-shell"
+            | "sway"
+            | "niri"
+            | "weston"
+            | "cage"
+            | "wayfire"
+            | "labwc"
+            | "mutter"
+            | "cinnamon"
+            | "plasmashell"
+            | "xfwm4"
+    ) {
+        return Some(Role::Session);
+    }
+    if matches!(
+        name.as_str(),
+        "fcitx" | "fcitx5" | "ibus-daemon" | "ibus-x11" | "ibus-extension-"
+    ) || name.starts_with("ibus-engine-")
+    {
+        return Some(Role::Input);
+    }
+    if matches!(
+        name.as_str(),
+        "ztty"
+            | "kitty"
+            | "kitty.bin"
+            | "foot"
+            | "footclient"
+            | "alacritty"
+            | "konsole"
+            | "wezterm"
+            | "wezterm-gui"
+            | "ghostty"
+            | "gnome-terminal"
+            | "gnome-terminal-"
+            | "xfce4-terminal"
+            | "lxterminal"
+            | "tilix"
+            | "xterm"
+            | "urxvt"
+            | "st"
+    ) {
+        return Some(Role::Terminal);
+    }
+    if matches!(
+        name.as_str(),
+        "ssmcp" | "ssmcp-server" | "007" | "sshd" | "sshd-session" | "sshd-auth"
+    ) {
+        return Some(Role::Remote);
+    }
+    // Interpreter names alone do not imply an interactive task. A specifically
+    // named remote-control unit can identify Python/Node-hosted remote tools.
+    let unit = path.file_name()?.to_str()?.to_ascii_lowercase();
+    let unit = unit.strip_prefix("app-").unwrap_or(&unit);
+    ["ssmcp", "007"]
+        .iter()
+        .any(|prefix| {
+            unit.strip_prefix(prefix).is_some_and(|tail| {
+                tail.starts_with('.') || tail.starts_with('-') || tail.starts_with('@')
+            })
+        })
+        .then_some(Role::Remote)
+}
+
+fn discover_protection_scopes(
+    proc_root: &Path,
+    cgroup_root: &Path,
+    total: u64,
+    page_size: u64,
+    max_processes: usize,
+    deadline: Duration,
+) -> Result<Vec<protection::Scope>> {
+    let start = Instant::now();
+    let mut visited = 0;
+    let mut selected: BTreeMap<PathBuf, Vec<protection::Role>> = BTreeMap::new();
+    for entry in fs::read_dir(proc_root)? {
+        let entry = entry?;
+        if entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+            .is_none()
+        {
+            continue;
+        }
+        visited += 1;
+        if visited > max_processes || start.elapsed() >= deadline || STOP.load(Ordering::Relaxed) {
+            return Err("process discovery exceeded its limit or was interrupted".into());
+        }
+        let comm = match protection_read(&entry.path().join("comm"), 128) {
+            Ok(text) => text,
+            Err(error) if process_disappeared(&error) => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let cgroup = match protection_read(&entry.path().join("cgroup"), 16 * 1024) {
+            Ok(text) => text,
+            Err(error) if process_disappeared(&error) => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let Some(path) = protection_process_path(cgroup_root, &cgroup)? else {
+            continue;
+        };
+        let Some(role) = protection_role(&comm, &path) else {
+            continue;
+        };
+        let candidate = protection::Scope {
+            path: path.clone(),
+            role,
+            current_bytes: page_size,
+        };
+        // Validate the complete lexical path before reading anything under it.
+        // Unsupported units are outside automatic protection, not scan errors.
+        if protection::plan_protection(cgroup_root, total, page_size, &[candidate]).is_err() {
+            continue;
+        }
+        let roles = selected.entry(path).or_default();
+        if !roles.contains(&role) {
+            roles.push(role);
+        }
+        if selected.len() > 256 {
+            return Err("too many critical scopes for one complete protection plan".into());
         }
     }
-    groups
+    for (unit, role) in [
+        ("sshd.service", protection::Role::Remote),
+        ("ssh.service", protection::Role::Remote),
+        ("systemd-logind.service", protection::Role::Session),
+    ] {
+        selected.insert(cgroup_root.join("system.slice").join(unit), vec![role]);
+    }
+    let mut scopes = Vec::new();
+    for (path, roles) in selected {
+        if start.elapsed() >= deadline || STOP.load(Ordering::Relaxed) {
+            return Err("scope discovery exceeded its limit or was interrupted".into());
+        }
+        let current = match protection_read(&path.join("memory.current"), 64) {
+            Ok(text) => text.trim().parse::<u64>()?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        for role in roles {
+            scopes.push(protection::Scope {
+                path: path.clone(),
+                role,
+                current_bytes: current,
+            });
+        }
+    }
+    Ok(scopes)
+}
+
+fn process_disappeared(error: &std::io::Error) -> bool {
+    // A task can exit after its /proc directory was enumerated or opened.
+    // procfs may report either ENOENT or ESRCH for that normal race.
+    error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(3)
+}
+
+fn expired_protection_paths(
+    entries: &BTreeMap<PathBuf, Control>,
+    desired: &BTreeMap<PathBuf, u64>,
+    complete: bool,
+) -> Vec<PathBuf> {
+    if !complete {
+        return Vec::new();
+    }
+    entries
+        .keys()
+        .filter(|path| {
+            path.file_name().and_then(|name| name.to_str()) == Some("memory.low")
+                && !desired.contains_key(*path)
+        })
+        .cloned()
+        .collect()
+}
+
+fn apply_protection_plan(
+    c: &mut Controls,
+    plan: &protection::ProtectionPlan,
+    errors: &mut Vec<String>,
+) {
+    let mut complete = true;
+    let mut satisfied = BTreeMap::new();
+    for (path, bytes) in &plan.limits {
+        let ok = match c.protect(path, *bytes) {
+            Ok(true) => true,
+            Ok(false) => {
+                errors.push(format!(
+                    "pre-existing protection preserved below requested value: {}",
+                    path.display()
+                ));
+                false
+            }
+            Err(error) => {
+                errors.push(error.to_string());
+                false
+            }
+        };
+        satisfied.insert(path.clone(), ok);
+        complete &= ok;
+    }
+    c.protection_budget_bytes = plan.budget_bytes;
+    c.protected_critical_scopes = plan
+        .leaves
+        .iter()
+        .filter(|leaf| {
+            leaf.limit_bytes > 0
+                && leaf
+                    .path
+                    .ancestors()
+                    .take_while(|path| *path != Path::new(CGROOT))
+                    .all(|path| {
+                        satisfied
+                            .get(&path.join("memory.low"))
+                            .copied()
+                            .unwrap_or(false)
+                    })
+        })
+        .count();
+    // A partial discovery never calls this function, and a partial application
+    // cannot retire previously established protection either.
+    for path in expired_protection_paths(&c.entries, &plan.limits, complete) {
+        if let Err(error) = c.retire_protection(&path) {
+            errors.push(format!("protection restore incomplete: {error}"));
+            complete = false;
+        }
+    }
+    c.protection_complete = complete;
+}
+fn background_groups() -> Result<Vec<PathBuf>> {
+    background::paths()
 }
 fn capped_high(original: &str, requested: &str) -> Result<String> {
     if original == "max" {
@@ -911,34 +1810,53 @@ fn capped_high(original: &str, requested: &str) -> Result<String> {
     }
     Ok(original.min(requested.parse::<u64>()?).to_string())
 }
-fn effective_swappiness(settings: &Settings, t: &Telemetry, d: &Decision) -> u16 {
-    // Swap-in and bidirectional swap traffic can be busy even with low IO PSI.
-    // Keep the policy's cost hint ahead of the preference for unused zram.
-    if d.reason == zmem::Reason::SwapIoPressure {
-        return d.recommended_swappiness;
-    }
-    let zram_room = t
-        .swaps
-        .iter()
-        .any(|s| s.path.starts_with("/dev/zram") && s.size.saturating_sub(s.used) > s.size / 5);
-    if zram_room {
-        if settings.profile == "interactive" || settings.profile == "gaming" {
-            100
-        } else {
-            120
-        }
-    } else {
-        d.recommended_swappiness.min(80)
-    }
-}
-fn apply_controls(
+fn swappiness_preference(
     settings: &Settings,
     t: &Telemetry,
     d: &Decision,
+) -> swappiness::Preference {
+    let resident: u64 = t
+        .zram
+        .iter()
+        .fold(0u64, |sum, z| sum.saturating_add(z.resident));
+    // Logical zram capacity is not free RAM. Require measured compression
+    // savings, bounded physical residency and usable logical headroom.
+    let zram_room = resident < t.sample.total_bytes / 2
+        && t.zram.iter().any(|z| {
+            z.logical_size > 0
+                && z.logical_size.saturating_sub(z.logical_used) > z.logical_size / 10
+                && (z.original == 0 || z.original >= z.resident.saturating_add(z.resident / 2))
+                && (z.memory_limit == 0 || z.resident < z.memory_limit.saturating_mul(9) / 10)
+        });
+    swappiness::preference(swappiness::Input {
+        rates_available: t.paging.rates_available,
+        file_refault: t.paging.file_refault_bytes_per_sec,
+        anon_refault: t.paging.anon_refault_bytes_per_sec,
+        direct_scan: t.paging.direct_scan_bytes_per_sec,
+        swap_in: t.sample.swap_in_bytes_per_sec,
+        disk_swap_in: t
+            .paging
+            .disk_swap_estimate_available
+            .then_some(t.paging.estimated_disk_swap_in_bytes_per_sec),
+        efficient_zram_room: zram_room,
+        swap_or_io_busy: d.reason == zmem::Reason::SwapIoPressure,
+        hint: d.recommended_swappiness,
+        interactive: matches!(settings.profile.as_str(), "interactive" | "gaming"),
+    })
+}
+#[cfg(test)]
+fn effective_swappiness(settings: &Settings, t: &Telemetry, d: &Decision) -> u16 {
+    swappiness_preference(settings, t, d).value
+}
+fn apply_controls(
+    settings: &Settings,
+    t: &mut Telemetry,
+    d: &Decision,
     c: &mut Controls,
     protect: bool,
+    now_secs: u64,
     errors: &mut Vec<String>,
-) -> Option<PathBuf> {
+) -> Vec<PathBuf> {
     // Terminal scopes and user managers disappear during normal session churn.
     // Keep recovery proportional to live controls rather than daemon uptime.
     if protect && c.prune_stale() {
@@ -949,8 +1867,18 @@ fn apply_controls(
     if protect && settings.protect_sessions {
         protect_sessions(c, t.sample.total_bytes, errors);
     }
+    t.applied.protection_budget_bytes = c.protection_budget_bytes;
+    t.applied.protected_critical_scopes = c.protected_critical_scopes;
+    t.applied.protection_complete = c.protection_complete;
     if settings.manage_swappiness {
-        let value = effective_swappiness(settings, t, d);
+        let preference = c.swappiness_governor.observe(
+            swappiness_preference(settings, t, d),
+            observed_number("/proc/sys/vm/swappiness").and_then(|n| n.try_into().ok()),
+            now_secs,
+        );
+        let value = preference.value;
+        t.applied.swappiness_requested = Some(value);
+        t.applied.swappiness_reason = preference.reason;
         if let Err(e) = c.set(
             Path::new("/proc/sys/vm/swappiness"),
             &value.to_string(),
@@ -964,35 +1892,7 @@ fn apply_controls(
             }
         }
     }
-    let mut groups = background_groups();
-    let count = groups.len().max(1) as u64;
-    for p in &groups {
-        let high = p.join("memory.high");
-        let value = if d.background_high_percent == 100 {
-            "max".into()
-        } else {
-            (t.sample.total_bytes / 100 * d.background_high_percent as u64 / count)
-                .max(256 * MIB)
-                .to_string()
-        };
-        let result = (|| -> Result<()> {
-            let meta = fs::metadata(&high)?;
-            let original = match c
-                .entries
-                .get(&high)
-                .filter(|entry| entry.dev == meta.dev() && entry.ino == meta.ino())
-            {
-                Some(entry) => entry.original.clone(),
-                None => read(&high)?.trim().to_owned(),
-            };
-            c.set(&high, &capped_high(&original, &value)?, true)
-        })();
-        if let Err(e) = result {
-            errors.push(e.to_string());
-        }
-    }
-    groups.sort_unstable_by_key(|p| std::cmp::Reverse(number(p.join("memory.current"))));
-    groups.into_iter().next()
+    background::apply(settings, t, d, c, errors)
 }
 
 pub fn ensure_zram(settings: &Settings, total: u64) -> Result<()> {
@@ -1014,7 +1914,7 @@ pub fn ensure_zram(settings: &Settings, total: u64) -> Result<()> {
     let size = (total / 100 * settings.zram_percent).min(32 * GIB) / 4096 * 4096;
     fs::write(base.join("disksize"), size.to_string())?;
     command("mkswap", &["/dev/zram0"], 10)?;
-    command("swapon", &["--priority", "100", "/dev/zram0"], 10)?;
+    host_swap_command(Path::new("/dev/zram0"), SwapAction::Activate(100), 10)?;
     Ok(())
 }
 fn valid_swap_file(path: &Path) -> Result<()> {
@@ -1110,8 +2010,8 @@ pub fn ensure_disk_swaps(settings: &Settings) -> Result<Vec<String>> {
             let result = (|| -> Result<()> {
                 valid_swap_file(p)?;
                 secure_dir(p.parent().unwrap(), false)?;
-                let priority = prio.parse::<i32>()?.clamp(-1, 32767).to_string();
-                command("swapon", &["--priority", &priority, path], 10)?;
+                let priority = prio.parse::<i32>()?.clamp(-1, 32767);
+                activate_existing_swap(p, priority)?;
                 Ok(())
             })();
             if let Err(e) = result {
@@ -1126,11 +2026,7 @@ pub fn ensure_disk_swaps(settings: &Settings) -> Result<Vec<String>> {
         }
         let result = (|| -> Result<()> {
             valid_swap_file(&p)?;
-            command(
-                "swapon",
-                &["--priority", "10", p.to_str().ok_or("invalid path")?],
-                10,
-            )?;
+            activate_existing_swap(&p, 10)?;
             Ok(())
         })();
         if let Err(e) = result {
@@ -1156,19 +2052,67 @@ fn disk_free(path: &Path) -> Result<u64> {
         .parse()
         .map_err(Into::into)
 }
+
+fn owned_swap_allocations(directory: &Path) -> Result<BTreeMap<PathBuf, u64>> {
+    let mut owned = BTreeMap::new();
+    for entry in fs::read_dir(directory)? {
+        let path = entry?.path();
+        if !owned_name(&path) {
+            continue;
+        }
+        valid_swap_file(&path)?;
+        let meta = fs::symlink_metadata(&path)?;
+        // Incomplete allocation and activation attempts still consume the
+        // configured budget. Count preallocated blocks as well as file length.
+        let bytes = meta.len().max(meta.blocks().saturating_mul(512));
+        owned.insert(fs::canonicalize(&path)?, bytes);
+    }
+    Ok(owned)
+}
+
+fn disk_swap_budget(owned: &BTreeMap<PathBuf, u64>, active: &[Swap]) -> u64 {
+    let allocated = owned
+        .values()
+        .fold(0u64, |sum, bytes| sum.saturating_add(*bytes));
+    active
+        .iter()
+        .filter(|swap| swap.kind == "file" || !swap.path.starts_with("/dev/zram"))
+        .fold(allocated, |sum, swap| {
+            // Only the complete canonical name is a match. Orphan mount names
+            // stay separate; a basename or size match does not prove identity.
+            let counted = owned.get(Path::new(&swap.path)).copied().unwrap_or(0);
+            sum.saturating_add(swap.size.saturating_sub(counted))
+        })
+}
+
+fn disk_swap_growth_bytes(requested: u64, chunk: u64, limit: u64, allocated: u64) -> u64 {
+    requested.min(chunk).min(limit.saturating_sub(allocated)) / 4096 * 4096
+}
+
+fn can_remove_failed_swap(
+    path: &Path,
+    expected: SwapIdentity,
+    observed: Option<SwapIdentity>,
+    errno: Option<i32>,
+    active: &[Swap],
+) -> bool {
+    errno.is_some_and(|errno| (1..=4095).contains(&errno) && errno != 16)
+        && observed == Some(expected)
+        && !active.iter().any(|swap| Path::new(&swap.path) == path)
+}
+
 pub fn grow_swap(settings: &Settings, requested: u64) -> Result<()> {
     root_required()?;
     prepare_swap_dir(settings)?;
     let active = swaps()?;
-    let disk = active
-        .iter()
-        .filter(|s| s.kind == "file" || !s.path.starts_with("/dev/zram"))
-        .fold(0u64, |n, s| n.saturating_add(s.size));
-    let size = requested
-        .min(settings.policy.chunk_bytes)
-        .min(settings.policy.max_disk_swap_bytes.saturating_sub(disk))
-        / 4096
-        * 4096;
+    let owned = owned_swap_allocations(&settings.swap_dir)?;
+    let disk = disk_swap_budget(&owned, &active);
+    let size = disk_swap_growth_bytes(
+        requested,
+        settings.policy.chunk_bytes,
+        settings.policy.max_disk_swap_bytes,
+        disk,
+    );
     if size < 64 * MIB {
         return Err("disk swap capacity limit reached".into());
     }
@@ -1192,6 +2136,7 @@ pub fn grow_swap(settings: &Settings, requested: u64) -> Result<()> {
         ],
         5,
     )?;
+    let mut activation_file = None;
     let result = (|| -> Result<()> {
         if fs_type.trim() == "btrfs" {
             command(
@@ -1210,12 +2155,29 @@ pub fn grow_swap(settings: &Settings, requested: u64) -> Result<()> {
         }
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
         valid_swap_file(&path)?;
-        command("swapon", &["--priority", "10", name], 10)?;
+        activation_file = Some(swap_target(&path)?);
+        host_swap_command(&path, SwapAction::Activate(10), 10)?;
         Ok(())
     })();
-    if result.is_err() && swaps().is_ok_and(|v| !v.iter().any(|s| s.path == name)) && path.exists()
-    {
-        let _ = fs::remove_file(&path);
+    if let (Err(error), Some(pinned)) = (&result, activation_file.as_ref()) {
+        // Keep the pinned inode alive through this check. A timeout or an
+        // unreadable inventory is not evidence that activation failed. Such
+        // files remain on disk and are charged by owned_swap_allocations.
+        if let (Ok(expected), Ok(current), Ok(active)) = (
+            pinned.metadata(),
+            swap_target(&path).and_then(|file| Ok(file.metadata()?)),
+            swaps(),
+        ) {
+            if can_remove_failed_swap(
+                &path,
+                SwapIdentity::of(&expected),
+                Some(SwapIdentity::of(&current)),
+                swap_syscall_errno(error.as_ref()),
+                &active,
+            ) {
+                let _ = fs::remove_file(&path);
+            }
+        }
     }
     result
 }
@@ -1257,7 +2219,7 @@ pub fn shrink_swap(settings: &Settings, path: &Path) -> Result<()> {
     {
         return Err("swap shrink deferred until unused with ample memory and swap".into());
     }
-    command("swapoff", &[path.to_str().ok_or("invalid swap path")?], 20)?;
+    host_swap_command(path, SwapAction::Deactivate, 20)?;
     if swaps()?.iter().any(|s| Path::new(&s.path) == path) {
         return Err("swap file remains active; preserving it".into());
     }
@@ -1266,28 +2228,144 @@ pub fn shrink_swap(settings: &Settings, path: &Path) -> Result<()> {
 }
 pub fn reclaim(path: &Path, bytes: u64) -> Result<()> {
     root_required()?;
-    if !background_groups().iter().any(|p| p == path) {
+    if !background_groups()?.iter().any(|p| p == path) {
         return Err("reclaim is limited to registered background groups".into());
     }
-    let before = number(path.join("memory.current"));
-    let amount = bytes.min(128 * MIB).min(before / 8);
-    if amount == 0 {
+    let before = reclaim_sample(path)?;
+    let expected = expected_reclaim_identity()?;
+    if expected.is_some_and(|identity| identity != (before.dev, before.ino)) {
+        println!("{{\"event\":\"reclaim_skipped\",\"reason\":\"cgroup_identity_changed\"}}");
         return Ok(());
     }
-    let result = fs::write(
-        path.join("memory.reclaim"),
-        format!("{amount} swappiness=0"),
-    );
-    if let Err(e) = result {
-        if e.raw_os_error() != Some(11) {
-            return Err(e.into());
+    // Revalidate population and the clean-file budget in the child. The
+    // controller's earlier measurement may have changed before spawn.
+    let mut validation = reclaim_policy::Tracker::new();
+    let request = match validation.plan(before, bytes, control_page_size()?, 0) {
+        Ok(request) => request,
+        Err(reason) => {
+            println!(
+                "{{\"event\":\"reclaim_skipped\",\"reason\":{}}}",
+                json::quote(reason.as_str())
+            );
+            return Ok(());
         }
+    };
+    let mut control = OpenOptions::new()
+        .write(true)
+        .open(path.join("memory.reclaim"))?;
+    let identity = fs::metadata(path)?;
+    if (identity.dev(), identity.ino()) != (request.before.dev, request.before.ino) {
+        println!("{{\"event\":\"reclaim_skipped\",\"reason\":\"cgroup_identity_changed\"}}");
+        return Ok(());
     }
-    let after = number(path.join("memory.current"));
+    // This write can perform synchronous kernel reclaim. It remains confined
+    // to this isolated, deadline-controlled worker, never the controller loop.
+    let partial = match control.write_all(format!("{} swappiness=0", request.bytes).as_bytes()) {
+        Ok(()) => false,
+        Err(error) if error.raw_os_error() == Some(11) => true,
+        Err(error) => return Err(error.into()),
+    };
     println!(
-        "{{\"event\":\"reclaim_observed\",\"requested_bytes\":{amount},\"before_bytes\":{before},\"after_bytes\":{after}}}"
+        "{{\"event\":\"reclaim_write\",\"requested_bytes\":{},\"kernel_partial\":{partial}}}",
+        request.bytes,
     );
     Ok(())
+}
+
+fn parse_reclaim_identity(dev: Option<&str>, ino: Option<&str>) -> Result<Option<(u64, u64)>> {
+    match (dev, ino) {
+        (None, None) => Ok(None),
+        (Some(dev), Some(ino)) => {
+            let identity = (dev.parse()?, ino.parse()?);
+            if identity.1 == 0 {
+                return Err("invalid expected reclaim cgroup inode".into());
+            }
+            Ok(Some(identity))
+        }
+        _ => Err("incomplete expected reclaim cgroup identity".into()),
+    }
+}
+
+fn expected_reclaim_identity() -> Result<Option<(u64, u64)>> {
+    let get = |name: &str| -> Result<Option<String>> {
+        match std::env::var(name) {
+            Ok(value) => Ok(Some(value)),
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    };
+    let dev = get("ZMEM_RECLAIM_DEV")?;
+    let ino = get("ZMEM_RECLAIM_INO")?;
+    parse_reclaim_identity(dev.as_deref(), ino.as_deref())
+}
+
+#[derive(Clone, Debug)]
+struct ReclaimTarget {
+    path: PathBuf,
+    request: reclaim_policy::Request,
+}
+
+#[derive(Default)]
+struct ReclaimSelection {
+    first: Option<ReclaimTarget>,
+    eligible: usize,
+}
+
+fn select_reclaim_candidate(
+    tracker: &mut reclaim_policy::Tracker,
+    candidates: impl IntoIterator<Item = (PathBuf, reclaim_policy::Sample)>,
+    requested_bytes: u64,
+    page_size: u64,
+    now_secs: u64,
+) -> ReclaimSelection {
+    let mut selection = ReclaimSelection::default();
+    if requested_bytes == 0 {
+        return selection;
+    }
+    for (path, sample) in candidates {
+        if let Ok(request) = tracker.plan(sample, requested_bytes, page_size, now_secs) {
+            selection.eligible += 1;
+            if selection.first.is_none() {
+                selection.first = Some(ReclaimTarget { path, request });
+            }
+        }
+    }
+    selection
+}
+
+fn finish_pending_reclaim(
+    pending: &mut Option<ReclaimTarget>,
+    tracker: &mut reclaim_policy::Tracker,
+    after: Option<reclaim_policy::Sample>,
+    now_secs: u64,
+) -> Option<(ReclaimTarget, reclaim_policy::Outcome)> {
+    let target = pending.take()?;
+    let outcome = tracker.finish(target.request, after, now_secs);
+    Some((target, outcome))
+}
+
+fn log_reclaim_feedback(
+    target: &ReclaimTarget,
+    outcome: &reclaim_policy::Outcome,
+    after: Option<reclaim_policy::Sample>,
+    phase: &str,
+    worker_pid: Option<u32>,
+) {
+    println!(
+        "{{\"event\":\"reclaim_feedback\",\"path\":{},\"phase\":{},\"worker_pid\":{},\"requested_bytes\":{},\"before_bytes\":{},\"after_bytes\":{},\"progress\":{},\"made_progress\":{},\"reclaimed_pages\":{},\"reclaimed_bytes\":{},\"net_freed_bytes\":{},\"retry_at_uptime_secs\":{}}}",
+        json::quote(&target.path.to_string_lossy()),
+        json::quote(phase),
+        optional_number(worker_pid.map(u64::from)),
+        target.request.bytes,
+        target.request.before.current_bytes,
+        optional_number(after.filter(|s| (s.dev, s.ino) == (target.request.before.dev, target.request.before.ino)).map(|s| s.current_bytes)),
+        json::quote(outcome.progress.as_str()),
+        outcome.progress.made_progress(),
+        optional_number(outcome.reclaimed_pages),
+        optional_number(outcome.reclaimed_bytes),
+        outcome.net_freed_bytes,
+        outcome.retry_after_secs,
+    );
 }
 
 struct Worker {
@@ -1295,8 +2373,25 @@ struct Worker {
     kind: String,
     start: Instant,
     termination_sent: bool,
+    reclaim: Option<ReclaimTarget>,
 }
 impl Worker {
+    fn reclaim_feedback(
+        &mut self,
+        tracker: &mut reclaim_policy::Tracker,
+        now_secs: u64,
+        phase: &str,
+    ) {
+        let after = self
+            .reclaim
+            .as_ref()
+            .and_then(|target| reclaim_sample(&target.path).ok());
+        if let Some((target, outcome)) =
+            finish_pending_reclaim(&mut self.reclaim, tracker, after, now_secs)
+        {
+            log_reclaim_feedback(&target, &outcome, after, phase, Some(self.child.id()));
+        }
+    }
     fn deadline(&self) -> Duration {
         Duration::from_secs(if self.kind == "reclaim" { 5 } else { 125 })
     }
@@ -1355,10 +2450,22 @@ impl Worker {
         }
     }
 }
-fn worker_start(kind: &str, args: &[String], config: &Path) -> Result<Worker> {
+fn worker_start(
+    kind: &str,
+    args: &[String],
+    config: &Path,
+    reclaim: Option<&ReclaimTarget>,
+) -> Result<Worker> {
+    if (kind == "reclaim") != reclaim.is_some() {
+        return Err("reclaim workers require a measured request".into());
+    }
     use std::os::unix::process::CommandExt;
     let mut cmd = Command::new(std::env::current_exe()?);
     cmd.process_group(0).arg(format!("__{kind}")).args(args);
+    if let Some(target) = reclaim {
+        cmd.env("ZMEM_RECLAIM_DEV", target.request.before.dev.to_string());
+        cmd.env("ZMEM_RECLAIM_INO", target.request.before.ino.to_string());
+    }
     if config.exists() {
         cmd.arg("--config").arg(config);
     }
@@ -1372,6 +2479,7 @@ fn worker_start(kind: &str, args: &[String], config: &Path) -> Result<Worker> {
         kind: kind.into(),
         start: Instant::now(),
         termination_sent: false,
+        reclaim: reclaim.cloned(),
     })
 }
 pub fn daemon(settings: Settings, config: PathBuf, observe: bool, once: bool) -> Result<()> {
@@ -1393,6 +2501,8 @@ pub fn daemon(settings: Settings, config: PathBuf, observe: bool, once: bool) ->
     let mut sampler = Sampler::new();
     let mut policy = Policy::new(settings.policy);
     let mut controls = Controls::new();
+    let mut reclaim_tracker = reclaim_policy::Tracker::new();
+    let reclaim_page_size = control_page_size()?;
     let mut worker: Option<Worker> = None;
     let mut loop_index = 0u64;
     let mut initial_errors = Vec::new();
@@ -1419,17 +2529,23 @@ pub fn daemon(settings: Settings, config: PathBuf, observe: bool, once: bool) ->
                         errors.push(format!("{} worker failed ({status})", w.kind));
                     }
                     println!(
-                        "{{\"event\":\"worker_finished\",\"action\":{},\"success\":{}}}",
+                        "{{\"event\":\"worker_finished\",\"action\":{},\"exit_success\":{}}}",
                         json::quote(&w.kind),
                         status.success()
+                    );
+                    w.reclaim_feedback(
+                        &mut reclaim_tracker,
+                        start.elapsed().as_secs(),
+                        if status.success() { "exited" } else { "failed" },
                     );
                     worker = None;
                 } else if !w.termination_sent && w.start.elapsed() > w.deadline() {
                     w.terminate();
+                    w.reclaim_feedback(&mut reclaim_tracker, start.elapsed().as_secs(), "deadline");
                     errors.push(format!("{} worker exceeded its deadline", w.kind));
                 }
             }
-            let t = match sampler.sample() {
+            let mut t = match sampler.sample() {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("zmem sample failed: {e}");
@@ -1440,35 +2556,78 @@ pub fn daemon(settings: Settings, config: PathBuf, observe: bool, once: bool) ->
                     continue;
                 }
             };
-            let d = policy.observe(t.sample, start.elapsed().as_secs());
-            if !observe {
-                let bg = apply_controls(
+            let elapsed = start.elapsed().as_secs();
+            errors.extend(t.background.errors.iter().cloned());
+            let d = policy.observe(t.sample, elapsed);
+            let bg = if !observe {
+                apply_controls(
                     &settings,
-                    &t,
+                    &mut t,
                     &d,
                     &mut controls,
                     loop_index % 15 == 0,
+                    elapsed,
                     &mut errors,
-                );
-                if worker.is_none() {
-                    let action = if d.grow_swap_bytes > 0 {
-                        Some(("grow", vec![d.grow_swap_bytes.to_string()]))
-                    } else if d.shrink_allowed {
-                        shrink_candidate(&settings, &t).map(|p| ("shrink", vec![p]))
-                    } else if d.reclaim_bytes > 0 {
-                        bg.map(|p| {
-                            (
-                                "reclaim",
-                                vec![p.to_string_lossy().into(), d.reclaim_bytes.to_string()],
-                            )
-                        })
-                    } else {
-                        None
-                    };
-                    if let Some((kind, args)) = action {
-                        match worker_start(kind, &args, &config) {
-                            Ok(w) => worker = Some(w),
-                            Err(e) => errors.push(e.to_string()),
+                )
+            } else {
+                background::preview(&settings, &mut t, &d, &mut controls.background)
+            };
+            let selection = select_reclaim_candidate(
+                &mut reclaim_tracker,
+                bg.into_iter()
+                    .filter_map(|path| match reclaim_sample(&path) {
+                        Ok(sample) => Some((path, sample)),
+                        Err(error) => {
+                            errors.push(format!("reclaim candidate {}: {error}", path.display()));
+                            None
+                        }
+                    }),
+                d.reclaim_bytes,
+                reclaim_page_size,
+                elapsed,
+            );
+            // Count candidates that pass this cycle's global reclaim request,
+            // eligibility filters, and feedback backoff, before worker/priority
+            // arbitration. With no global reclaim request this is zero.
+            t.managed.reclaim_candidates = selection.eligible;
+            if !observe && worker.is_none() {
+                let action = if d.grow_swap_bytes > 0 {
+                    Some(("grow", vec![d.grow_swap_bytes.to_string()], None))
+                } else if d.shrink_allowed {
+                    shrink_candidate(&settings, &t).map(|p| ("shrink", vec![p], None))
+                } else {
+                    selection.first.map(|target| {
+                        (
+                            "reclaim",
+                            vec![
+                                target.path.to_string_lossy().into(),
+                                target.request.bytes.to_string(),
+                            ],
+                            Some(target),
+                        )
+                    })
+                };
+                if let Some((kind, args, mut pending_reclaim)) = action {
+                    match worker_start(kind, &args, &config, pending_reclaim.as_ref()) {
+                        Ok(w) => worker = Some(w),
+                        Err(error) => {
+                            errors.push(error.to_string());
+                            let after =
+                                pending_reclaim.as_ref().map(|target| target.request.before);
+                            if let Some((target, outcome)) = finish_pending_reclaim(
+                                &mut pending_reclaim,
+                                &mut reclaim_tracker,
+                                after,
+                                elapsed,
+                            ) {
+                                log_reclaim_feedback(
+                                    &target,
+                                    &outcome,
+                                    after,
+                                    "spawn_failed",
+                                    None,
+                                );
+                            }
                         }
                     }
                 }
@@ -1512,6 +2671,11 @@ pub fn daemon(settings: Settings, config: PathBuf, observe: bool, once: bool) ->
     })();
     if let Some(mut w) = worker {
         let finished = w.finish(once);
+        w.reclaim_feedback(
+            &mut reclaim_tracker,
+            start.elapsed().as_secs(),
+            if once { "once_finished" } else { "shutdown" },
+        );
         if result.is_ok() {
             result = finished;
         }
@@ -1581,7 +2745,7 @@ pub fn run_workload(class: &str, max_mib: Option<u64>, args: &[String]) -> Resul
         }
         "background" => {
             cmd.arg("--slice=zmem-background.slice")
-                .arg(format!("--property=MemoryHigh={}", total / 2))
+                .arg("--property=MemoryAccounting=yes")
                 .arg("--property=CPUWeight=50")
                 .arg("--property=IOWeight=50");
         }
@@ -1602,8 +2766,129 @@ pub fn run_workload(class: &str, max_mib: Option<u64>, args: &[String]) -> Resul
 }
 
 #[cfg(test)]
+#[path = "scheduling_kernel_tests.rs"]
+mod scheduling_kernel_tests;
+
+#[cfg(test)]
+mod reclaim_integration_tests {
+    use super::*;
+
+    fn sample(ino: u64) -> reclaim_policy::Sample {
+        reclaim_policy::Sample {
+            dev: 7,
+            ino,
+            populated: true,
+            current_bytes: 512 * MIB,
+            file_bytes: 256 * MIB,
+            inactive_file_bytes: 128 * MIB,
+            pgsteal_proactive: Some(100),
+            ..reclaim_policy::Sample::default()
+        }
+    }
+
+    #[test]
+    fn selection_skips_the_largest_ineligible_group_and_counts_every_eligible_group() {
+        let mut tracker = reclaim_policy::Tracker::new();
+        let mut anonymous = sample(1);
+        anonymous.current_bytes = 4 * GIB;
+        anonymous.file_bytes = 0;
+        let selected = select_reclaim_candidate(
+            &mut tracker,
+            [
+                (PathBuf::from("/anonymous"), anonymous),
+                (PathBuf::from("/usable-first"), sample(2)),
+                (PathBuf::from("/usable-second"), sample(3)),
+            ],
+            64 * MIB,
+            4096,
+            0,
+        );
+        assert_eq!(selected.eligible, 2);
+        let first = selected.first.unwrap();
+        assert_eq!(first.path, Path::new("/usable-first"));
+        assert_eq!(first.request.bytes, 64 * MIB);
+    }
+
+    #[test]
+    fn no_global_reclaim_request_does_not_even_read_candidate_samples() {
+        let reads = std::cell::Cell::new(0);
+        let candidates = [1, 2].into_iter().map(|ino| {
+            reads.set(reads.get() + 1);
+            (PathBuf::from("/candidate"), sample(ino))
+        });
+        let selected =
+            select_reclaim_candidate(&mut reclaim_policy::Tracker::new(), candidates, 0, 4096, 0);
+        assert_eq!(reads.get(), 0);
+        assert_eq!(selected.eligible, 0);
+        assert!(selected.first.is_none());
+    }
+
+    #[test]
+    fn no_progress_feedback_routes_the_next_attempt_to_another_group() {
+        let mut tracker = reclaim_policy::Tracker::new();
+        let rows = || {
+            [
+                (PathBuf::from("/first"), sample(1)),
+                (PathBuf::from("/second"), sample(2)),
+            ]
+        };
+        let first = select_reclaim_candidate(&mut tracker, rows(), 64 * MIB, 4096, 0);
+        let mut pending = first.first;
+        let (_, outcome) =
+            finish_pending_reclaim(&mut pending, &mut tracker, Some(sample(1)), 1).unwrap();
+        assert_eq!(outcome.progress, reclaim_policy::Progress::NoProgress);
+        let next = select_reclaim_candidate(&mut tracker, rows(), 64 * MIB, 4096, 2);
+        assert_eq!(next.eligible, 1);
+        assert_eq!(next.first.unwrap().path, Path::new("/second"));
+    }
+
+    #[test]
+    fn deadline_feedback_is_not_recorded_again_when_the_worker_is_later_reaped() {
+        let mut tracker = reclaim_policy::Tracker::new();
+        let before = sample(1);
+        let request = tracker.plan(before, 64 * MIB, 4096, 0).unwrap();
+        let mut pending = Some(ReclaimTarget {
+            path: PathBuf::from("/worker"),
+            request,
+        });
+        let (_, outcome) =
+            finish_pending_reclaim(&mut pending, &mut tracker, Some(before), 5).unwrap();
+        assert_eq!(outcome.retry_after_secs, 65);
+        assert!(finish_pending_reclaim(&mut pending, &mut tracker, Some(before), 6).is_none());
+        assert_eq!(
+            tracker.plan(before, 64 * MIB, 4096, 64),
+            Err(reclaim_policy::SkipReason::NoProgressBackoff)
+        );
+        assert!(tracker.plan(before, 64 * MIB, 4096, 65).is_ok());
+    }
+
+    #[test]
+    fn worker_identity_requires_both_numeric_fields_when_present() {
+        assert_eq!(parse_reclaim_identity(None, None).unwrap(), None);
+        assert_eq!(
+            parse_reclaim_identity(Some("7"), Some("101")).unwrap(),
+            Some((7, 101))
+        );
+        assert!(parse_reclaim_identity(Some("7"), None).is_err());
+        assert!(parse_reclaim_identity(None, Some("101")).is_err());
+        assert!(parse_reclaim_identity(Some("7"), Some("0")).is_err());
+        assert!(parse_reclaim_identity(Some("7"), Some("101x")).is_err());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn process_exit_races_are_distinct_from_incomplete_access() {
+        assert!(process_disappeared(&std::io::Error::from_raw_os_error(2)));
+        assert!(process_disappeared(&std::io::Error::from_raw_os_error(3)));
+        for code in [1, 5, 13, 22] {
+            assert!(!process_disappeared(&std::io::Error::from_raw_os_error(
+                code
+            )));
+        }
+    }
 
     struct JournalFixture(PathBuf);
     impl JournalFixture {
@@ -1637,6 +2922,514 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn swap_helper_has_fixed_host_namespace_arguments_and_valid_priorities() {
+        let identity = SwapIdentity {
+            dev: 12,
+            ino: 34,
+            rdev: 0,
+        };
+        let args = swap_helper_args(
+            Path::new("/usr/local/bin/zmem"),
+            Path::new("/var/lib/zmem/swap/zmem-000001.swap"),
+            SwapAction::Activate(10),
+            identity,
+        )
+        .unwrap();
+        assert_eq!(
+            args,
+            [
+                "--target",
+                "1",
+                "--mount",
+                "--root",
+                "--wdns=/",
+                "--no-fork",
+                "--",
+                "/usr/local/bin/zmem",
+                "__swap-on",
+                "/var/lib/zmem/swap/zmem-000001.swap",
+                "10",
+                "12",
+                "34",
+                "0",
+            ]
+            .map(str::to_owned)
+        );
+        let off = swap_helper_args(
+            Path::new("/usr/local/bin/zmem"),
+            Path::new("/var/lib/zmem/swap/zmem-000001.swap"),
+            SwapAction::Deactivate,
+            identity,
+        )
+        .unwrap();
+        assert_eq!(off[8], "__swap-off");
+        assert_eq!(off[10], "-1");
+        assert_eq!(swap_flags(-1).unwrap(), 0);
+        assert_eq!(swap_flags(0).unwrap(), 0x8000);
+        assert_eq!(swap_flags(32767).unwrap(), 0xffff);
+        assert!(swap_flags(-2).is_err());
+        assert!(swap_flags(32768).is_err());
+    }
+
+    #[test]
+    fn swap_helper_errno_protocol_never_infers_busy_from_error_text() {
+        assert_eq!(swap_reply_errno("zmem-swap-v1\t0\n").unwrap(), 0);
+        assert_eq!(swap_reply_errno("zmem-swap-v1\t16\n").unwrap(), 16);
+        for invalid in [
+            "Device or resource busy",
+            "设备或资源忙",
+            "zmem-swap-v1\t-16\n",
+            "zmem-swap-v1\t4096\n",
+            "zmem-swap-v1\t16\nextra\n",
+            "zmem-swap-v1\t16\n\n",
+            "zmem-swap-v1\t\n",
+            "zmem-swap-v1\t16",
+        ] {
+            assert!(swap_reply_errno(invalid).is_err(), "{invalid:?}");
+        }
+        assert!(swap_busy(&SwapSyscallError(16)));
+        assert!(!swap_busy(&SwapSyscallError(13)));
+        assert!(!swap_busy(&std::io::Error::from_raw_os_error(16)));
+        assert_eq!(swap_syscall_errno(&SwapSyscallError(1)), Some(1));
+        assert_eq!(
+            swap_syscall_errno(&std::io::Error::from_raw_os_error(1)),
+            None
+        );
+        assert!(!swap_busy(&std::io::Error::other(
+            "Device or resource busy"
+        )));
+    }
+
+    #[test]
+    fn swap_helper_identity_stays_pinned_when_a_path_is_replaced() {
+        let fixture = JournalFixture::new("swap-pinned-identity");
+        let path = fixture.0.join("swap");
+        fs::write(&path, "original").unwrap();
+        let original = OpenOptions::new()
+            .read(true)
+            .custom_flags(0o10000000 | 0o400000)
+            .open(&path)
+            .unwrap();
+        let expected = SwapIdentity::of(&original.metadata().unwrap());
+        fs::rename(&path, fixture.0.join("previous")).unwrap();
+        fs::write(&path, "replacement").unwrap();
+        let replacement = File::open(&path).unwrap();
+        verify_swap_identity(&original, expected).unwrap();
+        assert!(verify_swap_identity(&replacement, expected).is_err());
+        let mut changed_device = expected;
+        changed_device.rdev = 1;
+        assert!(verify_swap_identity(&original, changed_device).is_err());
+    }
+
+    fn swap_row(path: &str, size: u64) -> Swap {
+        Swap {
+            path: path.into(),
+            kind: "file".into(),
+            size,
+            used: 0,
+            priority: 10,
+        }
+    }
+
+    #[test]
+    fn disk_swap_budget_counts_pending_and_foreign_without_double_counting_canonical() {
+        let first = "/var/lib/zmem/swap/zmem-000001.swap";
+        let pending = "/var/lib/zmem/swap/zmem-000002.swap";
+        let owned = BTreeMap::from([
+            (PathBuf::from(first), 2 * GIB),
+            (PathBuf::from(pending), GIB),
+        ]);
+        let mut active = vec![
+            swap_row(first, 2 * GIB - 4096),
+            swap_row("/foreign/swap", GIB),
+        ];
+        active.push(Swap {
+            kind: "partition".into(),
+            ..swap_row("/dev/zram0", 8 * GIB)
+        });
+        active.push(Swap {
+            kind: "partition".into(),
+            ..swap_row("/dev/nvme0n1p3", GIB)
+        });
+        assert_eq!(disk_swap_budget(&owned, &active), 5 * GIB);
+        // An inactive file is charged even when /proc/swaps is empty.
+        assert_eq!(disk_swap_budget(&owned, &[]), 3 * GIB);
+    }
+
+    #[test]
+    fn disk_swap_budget_does_not_claim_alias_identity_and_saturates() {
+        let path = PathBuf::from("/var/lib/zmem/swap/zmem-000001.swap");
+        let owned = BTreeMap::from([(path.clone(), GIB)]);
+        assert_eq!(
+            disk_swap_budget(&owned, &[swap_row("/swap/zmem-000001.swap", GIB)]),
+            2 * GIB
+        );
+        assert_eq!(
+            disk_swap_budget(&owned, &[swap_row(path.to_str().unwrap(), 2 * GIB)]),
+            2 * GIB
+        );
+        let oversized = BTreeMap::from([(path, u64::MAX)]);
+        assert_eq!(
+            disk_swap_budget(&oversized, &[swap_row("/foreign/swap", GIB)]),
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn disk_swap_growth_budget_handles_partial_capacity_and_saturation() {
+        assert_eq!(
+            disk_swap_growth_bytes(2 * GIB, 2 * GIB, 4 * GIB, 3 * GIB),
+            GIB
+        );
+        assert_eq!(
+            disk_swap_growth_bytes(2 * GIB, 2 * GIB, 4 * GIB, 4 * GIB),
+            0
+        );
+        assert_eq!(
+            disk_swap_growth_bytes(2 * GIB, 2 * GIB, 4 * GIB, u64::MAX),
+            0
+        );
+        assert_eq!(
+            disk_swap_growth_bytes(GIB, 2 * GIB, 4 * GIB, 4 * GIB - 4095),
+            0
+        );
+        assert_eq!(disk_swap_growth_bytes(2 * GIB, GIB, 4 * GIB, 0), GIB);
+    }
+
+    #[test]
+    fn disk_swap_cleanup_requires_confirmed_failure_unchanged_identity_and_inactive_path() {
+        let path = Path::new("/var/lib/zmem/swap/zmem-000001.swap");
+        let expected = SwapIdentity {
+            dev: 1,
+            ino: 2,
+            rdev: 0,
+        };
+        assert!(can_remove_failed_swap(
+            path,
+            expected,
+            Some(expected),
+            Some(1),
+            &[]
+        ));
+        for errno in [None, Some(0), Some(16), Some(-1), Some(4096)] {
+            assert!(!can_remove_failed_swap(
+                path,
+                expected,
+                Some(expected),
+                errno,
+                &[]
+            ));
+        }
+        let replacement = SwapIdentity { ino: 3, ..expected };
+        assert!(!can_remove_failed_swap(
+            path,
+            expected,
+            Some(replacement),
+            Some(1),
+            &[]
+        ));
+        assert!(!can_remove_failed_swap(path, expected, None, Some(1), &[]));
+        assert!(!can_remove_failed_swap(
+            path,
+            expected,
+            Some(expected),
+            Some(1),
+            &[swap_row(path.to_str().unwrap(), GIB)]
+        ));
+    }
+
+    #[test]
+    fn protection_roles_select_actual_critical_processes_and_named_remote_units() {
+        use protection::Role;
+        let app = Path::new(
+            "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-graphical.slice/app.scope",
+        );
+        for (comm, expected) in [
+            ("Hyprland\n", Some(Role::Session)),
+            ("kwin_wayland", Some(Role::Session)),
+            ("fcitx5", Some(Role::Input)),
+            ("ibus-engine-lib", Some(Role::Input)),
+            ("gnome-terminal-", Some(Role::Terminal)),
+            ("kitty", Some(Role::Terminal)),
+            ("ssmcp", Some(Role::Remote)),
+            ("python3", None),
+            ("node", None),
+            ("terminal-bench", None),
+            ("ChatGPT", None),
+        ] {
+            assert_eq!(protection_role(comm, app), expected, "{comm}");
+        }
+        let remote = app.with_file_name("app-ssmcp-worker.scope");
+        assert_eq!(protection_role("python3", &remote), Some(Role::Remote));
+        let unrelated = app.with_file_name("app-ssmcpunrelated.scope");
+        assert_eq!(protection_role("node", &unrelated), None);
+    }
+
+    #[test]
+    fn protection_ownership_preserves_external_nonzero_values_and_recreated_groups() {
+        let path = Path::new("/sys/fs/cgroup/user.slice/memory.low");
+        let mut entry = Control {
+            path: path.into(),
+            original: "0".into(),
+            last: "8193".into(),
+            dev: 10,
+            ino: 20,
+            pending_previous: None,
+        };
+        assert!(can_manage_protection(None, path, "0", 10, 20, 4096).unwrap());
+        for value in ["4096", "8192", "max"] {
+            assert!(!can_manage_protection(None, path, value, 10, 20, 4096).unwrap());
+        }
+        assert!(can_manage_protection(Some(&entry), path, "8192", 10, 20, 4096).unwrap());
+        for external in ["0", "4096", "16384", "max"] {
+            assert!(can_manage_protection(Some(&entry), path, external, 10, 20, 4096).is_err());
+        }
+        assert!(!can_manage_protection(Some(&entry), path, "8192", 10, 21, 4096).unwrap());
+        assert!(can_manage_protection(Some(&entry), path, "0", 10, 21, 4096).unwrap());
+        entry.last = "16384".into();
+        entry.pending_previous = Some("8192".into());
+        assert!(can_manage_protection(Some(&entry), path, "8192", 10, 20, 4096).unwrap());
+    }
+
+    #[test]
+    fn protection_cleanup_requires_a_complete_plan_and_only_selects_obsolete_low_controls() {
+        let mut entries = BTreeMap::new();
+        for name in [
+            "old/memory.low",
+            "retained/memory.low",
+            "background/memory.high",
+        ] {
+            let path = Path::new(CGROOT).join(name);
+            entries.insert(
+                path.clone(),
+                Control {
+                    path,
+                    original: "0".into(),
+                    last: "8192".into(),
+                    dev: 1,
+                    ino: 1,
+                    pending_previous: None,
+                },
+            );
+        }
+        let mut desired = BTreeMap::new();
+        desired.insert(Path::new(CGROOT).join("retained/memory.low"), 8192);
+        assert!(expired_protection_paths(&entries, &desired, false).is_empty());
+        assert_eq!(
+            expired_protection_paths(&entries, &desired, true),
+            vec![Path::new(CGROOT).join("old/memory.low")]
+        );
+        let controls = Controls::new();
+        assert_eq!(controls.protection_budget_bytes, 0);
+        assert_eq!(controls.protected_critical_scopes, 0);
+        assert!(!controls.protection_complete);
+    }
+
+    #[test]
+    fn protection_discovery_finds_nested_scopes_and_deduplicates_processes() {
+        let fixture = JournalFixture::new("protection-discovery");
+        let proc_root = fixture.0.join("proc");
+        let cgroup_root = fixture.0.join("cgroup");
+        fs::create_dir_all(&proc_root).unwrap();
+        let terminal = "user.slice/user-1000.slice/user@1000.service/app.slice/app-graphical.slice/terminal.scope";
+        let input = "user.slice/user-1000.slice/user@1000.service/app.slice/app-graphical.slice/input.scope";
+        let remote =
+            "user.slice/user-1000.slice/user@1000.service/app.slice/app-ssmcp-worker.scope";
+        for (pid, comm, path) in [
+            (1, "kitty", terminal),
+            (2, "kitty", terminal),
+            (3, "fcitx5", input),
+            (4, "node", remote),
+            (
+                5,
+                "node",
+                "user.slice/user-1000.slice/user@1000.service/app.slice/unrelated.scope",
+            ),
+            (
+                6,
+                "kitty",
+                "user.slice/user-1000.slice/user@1000.service/zmem.slice/background.scope",
+            ),
+            (
+                7,
+                "kitty",
+                "user.slice/user-1000.slice/user@1001.service/app.slice/mismatched.scope",
+            ),
+        ] {
+            let process = proc_root.join(pid.to_string());
+            fs::create_dir(&process).unwrap();
+            fs::write(process.join("comm"), comm).unwrap();
+            fs::write(process.join("cgroup"), format!("0::/{path}\n")).unwrap();
+        }
+        for path in [terminal, input, remote, "system.slice/sshd.service"] {
+            let group = cgroup_root.join(path);
+            fs::create_dir_all(&group).unwrap();
+            fs::write(group.join("memory.current"), (16 * MIB).to_string()).unwrap();
+        }
+        let scopes = discover_protection_scopes(
+            &proc_root,
+            &cgroup_root,
+            16 * GIB,
+            4096,
+            64,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(scopes.len(), 4);
+        assert_eq!(
+            scopes
+                .iter()
+                .filter(|scope| scope.path == cgroup_root.join(terminal))
+                .count(),
+            1
+        );
+        let p = protection::plan_protection(&cgroup_root, 16 * GIB, 4096, &scopes).unwrap();
+        assert_eq!(p.leaves.len(), 4);
+        assert!(p.limits.contains_key(&cgroup_root.join(
+            "user.slice/user-1000.slice/user@1000.service/app.slice/app-graphical.slice/memory.low"
+        )));
+    }
+
+    #[test]
+    fn protection_discovery_selects_ssh_login_sessions_without_generic_session_protection() {
+        let fixture = JournalFixture::new("protection-ssh-sessions");
+        let proc_root = fixture.0.join("proc");
+        let cgroup_root = fixture.0.join("cgroup");
+        fs::create_dir_all(&proc_root).unwrap();
+        let ssh = [
+            "user.slice/user-1000.slice/session-3.scope",
+            "user.slice/user-1000.slice/session-c1.scope",
+            "user.slice/user-1000.slice/session-4.scope",
+        ];
+        for (pid, comm, path) in [
+            (1, "sshd", ssh[0]),
+            (2, "sshd-session", ssh[1]),
+            (3, "sshd-auth", ssh[2]),
+            (4, "bash", "user.slice/user-1000.slice/session-5.scope"),
+            (5, "kitty", "user.slice/user-1000.slice/session-6.scope"),
+            (6, "python3", "user.slice/user-1000.slice/session-7.scope"),
+            (7, "sshd", "user.slice/user-01000.slice/session-8.scope"),
+            (8, "sshd", "user.slice/user-1000.slice/unrelated.scope"),
+            (9, "sshd", "user.slice/user-1000.slice/session-.scope"),
+        ] {
+            let process = proc_root.join(pid.to_string());
+            fs::create_dir(&process).unwrap();
+            fs::write(process.join("comm"), comm).unwrap();
+            fs::write(process.join("cgroup"), format!("0::/{path}\n")).unwrap();
+            let group = cgroup_root.join(path);
+            fs::create_dir_all(&group).unwrap();
+            fs::write(group.join("memory.current"), (16 * MIB).to_string()).unwrap();
+        }
+        let scopes = discover_protection_scopes(
+            &proc_root,
+            &cgroup_root,
+            16 * GIB,
+            4096,
+            64,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(scopes.len(), ssh.len());
+        for path in ssh {
+            assert!(scopes.iter().any(|scope| {
+                scope.path == cgroup_root.join(path) && scope.role == protection::Role::Remote
+            }));
+        }
+        let p = protection::plan_protection(&cgroup_root, 16 * GIB, 4096, &scopes).unwrap();
+        assert_eq!(p.allocated_bytes, 48 * MIB);
+        assert_eq!(
+            p.limits[&cgroup_root.join("user.slice/user-1000.slice/memory.low")],
+            48 * MIB
+        );
+        assert!(!p.limits.contains_key(
+            &cgroup_root.join("user.slice/user-1000.slice/user@1000.service/memory.low")
+        ));
+    }
+
+    #[test]
+    fn protection_discovery_reports_partial_limits_and_invalid_input() {
+        let fixture = JournalFixture::new("protection-incomplete");
+        let proc_root = fixture.0.join("proc");
+        let cgroup_root = fixture.0.join("cgroup");
+        let process = proc_root.join("1");
+        fs::create_dir_all(&process).unwrap();
+        fs::write(process.join("comm"), "kitty").unwrap();
+        fs::write(
+            process.join("cgroup"),
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/term.scope\n",
+        )
+        .unwrap();
+        assert!(
+            discover_protection_scopes(
+                &proc_root,
+                &cgroup_root,
+                16 * GIB,
+                4096,
+                0,
+                Duration::from_secs(5)
+            )
+            .is_err()
+        );
+        assert!(
+            discover_protection_scopes(
+                &proc_root,
+                &cgroup_root,
+                16 * GIB,
+                4096,
+                64,
+                Duration::ZERO
+            )
+            .is_err()
+        );
+        fs::write(process.join("comm"), "x".repeat(129)).unwrap();
+        assert!(
+            discover_protection_scopes(
+                &proc_root,
+                &cgroup_root,
+                16 * GIB,
+                4096,
+                64,
+                Duration::from_secs(5)
+            )
+            .is_err()
+        );
+        // A process that exited during discovery is an ordinary missing proc
+        // entry; it does not turn the remaining snapshot into a truncated scan.
+        fs::remove_file(process.join("comm")).unwrap();
+        assert!(
+            discover_protection_scopes(
+                &proc_root,
+                &cgroup_root,
+                16 * GIB,
+                4096,
+                64,
+                Duration::from_secs(5)
+            )
+            .unwrap()
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn protection_process_membership_is_unified_and_user_scoped() {
+        assert!(
+            protection_process_path(Path::new(CGROOT), "0::/system.slice/sshd.service\n")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            protection_process_path(
+                Path::new(CGROOT),
+                "0::/user.slice/user-1000.slice/session-3.scope\n"
+            )
+            .unwrap(),
+            Some(Path::new(CGROOT).join("user.slice/user-1000.slice/session-3.scope"))
+        );
+        assert!(protection_process_path(Path::new(CGROOT), "0::relative\n").is_err());
+        assert!(protection_process_path(Path::new(CGROOT), "0::/\n0::/other\n").is_err());
     }
 
     #[test]
@@ -1714,15 +3507,30 @@ mod tests {
                 used: 5 * GIB,
                 priority: 100,
             }],
-            zram: Vec::new(),
-            ksm_profit: 0,
-            ksm_shared: 0,
-            sampled_at: 0,
+            zram: vec![Zram {
+                name: "zram0".into(),
+                original: 5 * GIB,
+                compressed: 2 * GIB,
+                resident: 2 * GIB,
+                same_pages: 0,
+                logical_size: 10 * GIB,
+                logical_used: 5 * GIB,
+                memory_limit: 0,
+                algorithm: "zstd".into(),
+            }],
+            paging: Paging {
+                rates_available: true,
+                zram_rates_available: true,
+                disk_swap_estimate_available: true,
+                zswap_enabled: Some(false),
+                ..Paging::default()
+            },
+            ..Telemetry::default()
         }
     }
 
     #[test]
-    fn swappiness_honors_swap_pressure_before_zram_preferences() {
+    fn swappiness_distinguishes_confirmed_disk_reads_from_io_only_pressure() {
         for profile in ["balanced", "interactive", "throughput", "ai", "gaming"] {
             let settings = Settings {
                 profile: profile.into(),
@@ -1732,57 +3540,67 @@ mod tests {
                 for used in [5 * GIB, 8 * GIB, 10 * GIB] {
                     let mut t = swappiness_fixture();
                     t.swaps[0].used = used;
+                    t.zram[0].logical_used = used;
                     t.sample.swap_free_bytes = 10 * GIB - used;
                     t.sample.io_full_bp = io;
                     t.sample.swap_in_bytes_per_sec = input;
+                    t.paging.estimated_disk_swap_in_bytes_per_sec = input;
                     t.sample.swap_out_bytes_per_sec = output;
                     let d = Policy::new(settings.policy).observe(t.sample, 0);
                     assert_eq!(d.reason, zmem::Reason::SwapIoPressure);
-                    assert_eq!(effective_swappiness(&settings, &t, &d), 20, "{profile}");
+                    assert_eq!(
+                        effective_swappiness(&settings, &t, &d),
+                        if input >= 32 * MIB { 20 } else { 60 },
+                        "{profile}"
+                    );
                 }
             }
         }
     }
 
     #[test]
-    fn swappiness_keeps_idle_preferences_and_pressure_thresholds() {
+    fn swappiness_uses_measured_zram_efficiency_and_residency() {
         for profile in ["balanced", "interactive", "throughput", "ai", "gaming"] {
             let settings = Settings {
                 profile: profile.into(),
                 ..Settings::default()
             };
-            let preferred = if matches!(profile, "interactive" | "gaming") {
-                100
-            } else {
-                120
-            };
             let mut t = swappiness_fixture();
-            // Stay just below each busy boundary, including high swap-out
-            // without the swap-in rate required for bidirectional pressure.
-            for (io, input, output) in [
-                (0, 0, 0),
-                (999, 64 * MIB - 1, 0),
-                (0, 16 * MIB - 1, 64 * MIB),
-                (0, 16 * MIB, 64 * MIB - 1),
-            ] {
-                t.sample.io_full_bp = io;
-                t.sample.swap_in_bytes_per_sec = input;
-                t.sample.swap_out_bytes_per_sec = output;
-                let d = Policy::new(settings.policy).observe(t.sample, 0);
-                assert_eq!(effective_swappiness(&settings, &t, &d), preferred);
-            }
-            t = swappiness_fixture();
-            t.swaps[0].used = 8 * GIB;
-            t.sample.swap_free_bytes = 2 * GIB;
             let d = Policy::new(settings.policy).observe(t.sample, 0);
+            assert_eq!(
+                effective_swappiness(&settings, &t, &d),
+                if matches!(profile, "interactive" | "gaming") {
+                    100
+                } else {
+                    120
+                }
+            );
+            t.zram[0].resident = 4 * GIB; // Poor compression must not promote more swap.
             assert_eq!(effective_swappiness(&settings, &t, &d), 60);
-            t.sample.available_bytes = 512 * MIB;
-            let d = Policy::new(settings.policy).observe(t.sample, 0);
-            assert_eq!(effective_swappiness(&settings, &t, &d), 80);
-            t.swaps[0].path = "/var/lib/zmem/swap/zmem-000001.swap".into();
-            t.swaps[0].used = 0;
-            assert_eq!(effective_swappiness(&settings, &t, &d), 80);
+            t.zram[0].resident = 2 * GIB;
+            t.zram[0].logical_used = 10 * GIB; // Logical headroom is separately checked.
+            assert_eq!(effective_swappiness(&settings, &t, &d), 60);
+            t.zram.clear();
+            assert_eq!(effective_swappiness(&settings, &t, &d), 60);
         }
+    }
+
+    #[test]
+    fn file_refault_evidence_can_override_undifferentiated_io_hint() {
+        let settings = Settings::default();
+        let mut t = swappiness_fixture();
+        t.zram[0].logical_used = 10 * GIB;
+        t.sample.io_full_bp = 1000;
+        t.sample.swap_in_bytes_per_sec = 5 * MIB;
+        t.paging.file_refault_bytes_per_sec = 44 * MIB;
+        t.paging.anon_refault_bytes_per_sec = 5 * MIB;
+        t.paging.direct_scan_bytes_per_sec = 170 * MIB;
+        t.paging.estimated_disk_swap_in_bytes_per_sec = MIB;
+        let d = Policy::new(settings.policy).observe(t.sample, 0);
+        assert_eq!(d.recommended_swappiness, 20);
+        assert_eq!(effective_swappiness(&settings, &t, &d), 80);
+        t.paging.rates_available = false;
+        assert_eq!(effective_swappiness(&settings, &t, &d), 60);
     }
 
     #[test]
@@ -1885,6 +3703,27 @@ mod tests {
         // is external and must be retained.
         assert!(!owned_control_value(high, "12288", None, "8192", 4096).unwrap());
     }
+    #[test]
+    fn process_membership_recognizes_only_registered_background_roots() {
+        for path in [
+            "/zmem.slice/zmem-background.slice",
+            "/zmem.slice/zmem-background.slice/job.scope",
+            "/user.slice/user-1000.slice/user@1000.service/zmem.slice/zmem-background.slice/job.scope",
+        ] {
+            assert!(is_managed_background_path(path), "{path}");
+        }
+        for path in [
+            "/",
+            "zmem.slice/zmem-background.slice/job.scope",
+            "/other.slice/zmem.slice/zmem-background.slice/job.scope",
+            "/zmem.slice/zmem-background.slice-impostor/job.scope",
+            "/user.slice/user-1000.slice/user@1001.service/zmem.slice/zmem-background.slice/job.scope",
+            "/user.slice/user-name.slice/user@name.service/zmem.slice/zmem-background.slice/job.scope",
+        ] {
+            assert!(!is_managed_background_path(path), "{path}");
+        }
+    }
+
     #[test]
     fn only_owned_background_slices_may_reapply_an_unlimited_reset() {
         for path in [

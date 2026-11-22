@@ -7,12 +7,17 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+pub mod reclaim;
+
 /// One mebibyte, in bytes.
 pub const MIB: u64 = 1024 * 1024;
 /// One gibibyte, in bytes.
 pub const GIB: u64 = 1024 * MIB;
 
-const IO_BUSY_BP: u16 = 1000;
+const IO_BUSY_BP: u16 = 500;
+// Preserve the earlier hint contract. The lower IO observation threshold is
+// an action gate, not evidence for making swap IO look more expensive.
+const SWAPPINESS_IO_BUSY_BP: u16 = 1000;
 const SWAP_IO_BUSY_BYTES: u64 = 64 * MIB;
 const RECLAIM_COOLDOWN_SECS: u64 = 10;
 
@@ -33,6 +38,20 @@ pub struct Snapshot {
     pub swap_out_bytes_per_sec: u64,
 }
 
+/// Whether the sample shows IO congestion or substantial swap-in churn.
+///
+/// This signal is independent from memory pressure. IO congestion alone must
+/// not lower a memory high-water mark and send a healthy workload into reclaim.
+pub const fn io_congested(sample: Snapshot) -> bool {
+    sample.io_full_bp >= IO_BUSY_BP || swap_io_busy(sample)
+}
+
+const fn swap_io_busy(sample: Snapshot) -> bool {
+    sample.swap_in_bytes_per_sec >= SWAP_IO_BUSY_BYTES
+        || (sample.swap_in_bytes_per_sec >= SWAP_IO_BUSY_BYTES / 4
+            && sample.swap_out_bytes_per_sec >= SWAP_IO_BUSY_BYTES)
+}
+
 /// Controller limits. All byte counts are binary bytes, not decimal units.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Config {
@@ -40,7 +59,9 @@ pub struct Config {
     pub reserve_bytes: u64,
     /// Desired unused swap headroom when memory is becoming constrained.
     pub grow_free_bytes: u64,
-    /// Maximum bytes requested by one growth decision; zero disables growth.
+    /// Bytes requested per growth batch, bounded by the disk-swap cap.
+    /// Zero disables growth. A full batch creates spare headroom rather than
+    /// consuming another swap slot for each small reserve deficit.
     pub chunk_bytes: u64,
     /// The adapter enforces this limit across all owned disk swap.
     pub max_disk_swap_bytes: u64,
@@ -142,12 +163,15 @@ impl Reason {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Decision {
     pub pressure: Pressure,
+    /// Independent IO signal; `pressure` describes memory headroom/stalls.
+    pub io_congested: bool,
     /// A bounded growth request, after cooldown. The adapter may refuse it.
     pub grow_swap_bytes: u64,
     /// Permission to consider shrinking; never permission to drain used swap.
     pub shrink_allowed: bool,
-    /// Percentage of physical RAM for the managed background aggregate.
-    /// 100 means the adapter can remove a temporary `memory.high` restriction.
+    /// Pressure severity hint for simple percentage-based adapters. The Linux
+    /// adapter instead derives byte budgets from usage and measured headroom.
+    /// 100 permits removal of a temporary `memory.high` restriction.
     pub background_high_percent: u8,
     /// Maximum proactive reclaim request for explicitly managed background work.
     pub reclaim_bytes: u64,
@@ -204,6 +228,7 @@ impl Policy {
             self.recovery_count = 0;
         }
         self.last_observed_secs = Some(now_secs);
+        let io_busy = io_congested(sample);
 
         if sample.total_bytes == 0
             || sample.available_bytes > sample.total_bytes
@@ -213,6 +238,7 @@ impl Policy {
             self.recovery_count = 0;
             return Decision {
                 pressure: self.pressure,
+                io_congested: io_busy,
                 grow_swap_bytes: 0,
                 shrink_allowed: false,
                 background_high_percent: high_percent(self.pressure),
@@ -236,10 +262,6 @@ impl Policy {
         } else {
             Pressure::Healthy
         };
-        let io_busy = sample.io_full_bp >= IO_BUSY_BP
-            || sample.swap_in_bytes_per_sec >= SWAP_IO_BUSY_BYTES
-            || (sample.swap_in_bytes_per_sec >= SWAP_IO_BUSY_BYTES / 4
-                && sample.swap_out_bytes_per_sec >= SWAP_IO_BUSY_BYTES);
         let comfortable = sample.available_bytes
             >= reserve.saturating_add(reserve / 4).min(sample.total_bytes)
             && sample.memory_some_bp <= some_limit / 2
@@ -284,6 +306,10 @@ impl Policy {
 
         let near_reserve = sample.available_bytes < reserve.saturating_mul(2);
         let should_grow = (raw != Pressure::Healthy || near_reserve)
+            // Creating reserve capacity is optional while RAM remains above
+            // its reserve. Defer that disk work during IO congestion, but keep
+            // the shortage path available when memory is genuinely low.
+            && (!io_busy || low_available)
             && sample.swap_free_bytes < self.config.grow_free_bytes
             && self.config.chunk_bytes != 0
             && self.config.max_disk_swap_bytes != 0
@@ -293,12 +319,11 @@ impl Policy {
                 self.config.grow_cooldown_secs,
             );
         let grow_swap_bytes = if should_grow {
-            let bytes = self
-                .config
-                .grow_free_bytes
-                .saturating_sub(sample.swap_free_bytes)
-                .min(self.config.chunk_bytes)
-                .min(self.config.max_disk_swap_bytes);
+            // Every active file consumes a kernel swap slot. Allocate a full
+            // configured batch so small headroom deficits do not fragment the
+            // disk-swap budget across many tiny files. The adapter still caps
+            // this request by remaining owned capacity and usable disk space.
+            let bytes = self.config.chunk_bytes.min(self.config.max_disk_swap_bytes);
             self.last_growth_secs = Some(now_secs);
             bytes
         } else {
@@ -354,11 +379,14 @@ impl Policy {
 
         Decision {
             pressure: self.pressure,
+            io_congested: io_busy,
             grow_swap_bytes,
             shrink_allowed,
             background_high_percent: high_percent(self.pressure),
             reclaim_bytes,
-            recommended_swappiness: if io_busy {
+            recommended_swappiness: if sample.io_full_bp >= SWAPPINESS_IO_BUSY_BP
+                || swap_io_busy(sample)
+            {
                 20
             } else if matches!(self.pressure, Pressure::Elevated | Pressure::Critical) {
                 100

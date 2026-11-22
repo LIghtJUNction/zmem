@@ -87,6 +87,7 @@ jobs:
         run: |
           cargo fmt --check
           python3 -m unittest discover -s scripts -p test_bump.py -v
+          python3 scripts/measure_responsiveness.py --self-test
           cargo test --locked
           cargo clippy --locked --all-targets -- -D warnings
           cargo check --locked --lib --no-default-features

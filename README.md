@@ -2,7 +2,7 @@
 
 **Memory, with room to work.** A small Linux memory and Swap controller from [Project Z](https://github.com/LIghtJUNction/project-z).
 
-[Website](https://lightjunction.github.io/zmem/) · [Releases](https://github.com/LIghtJUNction/zmem/releases) · [crates.io](https://crates.io/crates/zmem-manager) · [Rust API](https://docs.rs/zmem-manager) · [Host acceptance](docs/acceptance-0.1.2.md) · [Latest patch validation](docs/acceptance-pressure-journal.md)
+[Website](https://lightjunction.github.io/zmem/) · [Releases](https://github.com/LIghtJUNction/zmem/releases) · [crates.io](https://crates.io/crates/zmem-manager) · [Rust API](https://docs.rs/zmem-manager) · [Host acceptance](docs/acceptance-0.2.0.md) · [Prior pressure validation](docs/acceptance-pressure-journal.md) · [Prior scheduling validation](docs/acceptance-adaptive-scheduling.md)
 
 zmem observes memory pressure, preserves headroom for interactive work, and gives managed background jobs a bounded memory budget. It brings zram setup, dynamic disk swap, pressure policy and structured inspection into one tool. The Rust implementation has no third-party crate dependencies; the policy library uses `no_std` and makes no heap allocations.
 
@@ -10,12 +10,12 @@ zmem observes memory pressure, preserves headroom for interactive work, and give
 
 | Capability | Behavior |
 | --- | --- |
-| Pressure policy | Combines available memory, memory/IO PSI and swap activity, with cooldowns and recovery hysteresis. |
+| Pressure policy | Reports memory pressure and IO congestion separately, using available memory, PSI and paging activity with cooldowns and recovery hysteresis. |
 | Swap management | Adopts active swap, grows disk swap within capacity and free-space limits, and shrinks only unused, owned files. |
 | zram lifecycle | Keeps the current active device during migration and prepares zram on subsequent boots. |
-| Workload budgets | Uses cgroup v2 `memory.high` for managed background work and explicit hard limits for disposable jobs. |
-| Interactive protection | Protects desktop sessions and SSH through the system's memory-control hierarchy. |
-| Observability | Exposes memory, swap, compression, process usage and policy reasons through human-readable and JSON commands. |
+| Workload budgets | Adjusts aggregate cgroup v2 `memory.high` budgets to managed background usage and available headroom; disposable jobs retain explicit hard limits. |
+| Interactive protection | Assigns a bounded `memory.low` budget to recognized desktop, terminal and remote-access scopes through their actual cgroup hierarchy. |
+| Observability | Reports daemon state, actual kernel controls, managed-workload coverage and on-demand process usage in human-readable and JSON output. |
 | Service migration | Saves prior service/configuration state, replaces existing management services, and offers rollback. |
 
 The Linux kernel performs actual paging, compression and final OOM handling. zmem makes earlier policy decisions using those facilities. Automatic application checkpoints, general-purpose memory deduplication and energy optimization are future work. KSM statistics describe what the kernel has already merged; they are not a claim that every application's memory can be deduplicated.
@@ -24,7 +24,9 @@ The default policy preserves processes. It does not issue global cache drops or 
 
 ## Installation
 
-Use a Linux system with systemd, PSI and cgroup v2. Swap creation uses the host's swap utilities; Btrfs hosts also need `btrfs-progs`. The daemon needs root privileges for system-wide configuration and swap management. Read-only status and policy inspection can run without root.
+Use a Linux system with systemd, PSI and cgroup v2. Swap-file preparation uses the host's swap utilities; activation and deactivation also require `nsenter` from util-linux. Btrfs hosts need `btrfs-progs`. The daemon needs root privileges for system-wide configuration and swap management. Read-only status and policy inspection can run without root.
+
+The [swap helper](src/linux.rs) enters PID 1's mount namespace and root before calling the swap syscalls. It pins and verifies the target file's identity so a changed path cannot substitute a different file. The provided [service unit](packaging/zmem.service) grants `CAP_SYS_CHROOT` and `CAP_SYS_PTRACE` for this namespace/root access while retaining its other service restrictions.
 
 ### From crates.io
 
@@ -36,6 +38,8 @@ sudo "$(command -v zmem)" install --replace
 ```
 
 `install --replace` is the explicit system migration operation. It preserves active swap, records the prior management configuration and installs the zmem service. Existing swap that contains data is adopted in place. Changes that require rebuilding zram take effect at a normal subsequent boot.
+
+Active Swap created in an older service mount namespace can retain an old alias in `/proc/swaps` until reactivation or a normal boot. Its capacity remains available; the alias alone does not make the file eligible for automatic shrinking.
 
 ### Prebuilt Linux executable
 
@@ -59,19 +63,40 @@ journalctl -u zmem.service
 sudo zmem rollback
 ```
 
-Stopping or upgrading the management daemon leaves active swap in place. Rollback restores the saved management configuration. It does not drain active swap into RAM. Keep the previous configuration record until the new setup has completed a normal boot on your machine.
+Stopping or upgrading the management daemon leaves active swap in place. Each installation captures a separate transaction snapshot; failure recovery uses it to restore the immediately previous binary, configuration and controller states. If recovery itself fails, the snapshot is retained and the error identifies its path. The explicit `rollback` command instead restores the original first-install baseline. Neither operation drains active swap into RAM. Keep the original configuration record until the new setup has completed a normal boot on your machine.
 
 ## Everyday use
 
 ```sh
 zmem status
 zmem status --json --processes
+zmem status --live --json
 zmem plan --json
 zmem doctor --json
 zmem schema
 ```
 
-`status` reports measurements. `plan` reports the policy's proposed action and its reason. `schema` describes the command contract for scripts and AI tools. Process details are collected on request rather than on every daemon tick.
+`status` reads the report of the active daemon after checking its process identity. It retains that daemon's policy history, measured paging rates, worker state and errors. `--processes` adds a current process list to the same report. The `observation` fields identify the source, sample age, stale reports and the separate process-sampling time.
+
+Each requested process row includes its current `cgroup` and whether it belongs to a registered background subtree (`managed_background`). Both fields are `null` when unified cgroup membership cannot be read. Membership describes current placement: moving an existing process does not transfer its existing memory charges, so classify jobs at launch ([kernel memory ownership](https://docs.kernel.org/admin-guide/cgroup-v2.html#memory-ownership)).
+
+`status --live` and `plan` take one independent sample and show an unapplied preview. They start with a new policy state; rates remain `null` while the sample is unprimed. If the daemon report is unavailable, ordinary `status` also returns an explicitly labelled independent snapshot with the cache error. `schema` describes this contract for scripts and AI tools.
+
+Read the controls and coverage alongside the plan:
+
+| Report field | Meaning |
+| --- | --- |
+| `memory_pressure`, `io_congested` | Separate signals for memory pressure and IO congestion. A busy storage device alone does not establish memory exhaustion. |
+| `paging` | Measured sampling interval, file/anonymous refaults, direct scans and available swap-rate estimates. Availability flags and `null` values distinguish missing observations from zero activity. |
+| `controls` | Requested and observed swappiness, its selection reason, actual page-cluster value, the protection budget and the count of successfully protected scopes. |
+| `managed` | Observed background groups, populated groups, task count, memory usage and currently eligible reclaim candidates. |
+| `background` | Requested aggregate budget, actual limits read back from populated groups, per-group limits, and sampling/application completeness. |
+| `plan.background_high_percent` | A pressure-severity hint retained in the policy contract. Read `background` for the byte budget actually requested and observed. |
+| `protection_complete`, `coverage_complete` | Completeness of the protection operation and managed-background observations, inside `controls` and `managed` respectively. |
+
+An empty background scope has no workload to throttle or reclaim. Use `zmem run --class background` to place a job under that policy; arbitrary existing applications are not automatically assigned a background budget. Protection counts cover recognized scopes, and completeness flags expose incomplete scans or control operations.
+
+`background.requested_budget_bytes` describes the proposed aggregate budget; `background.actual_budget_bytes` sums the limits read back from populated groups. Check `plan_available` and `readback_complete` before interpreting a `null`: with complete information, it means no temporary requested ceiling or an unlimited observed group, respectively; otherwise the value is unavailable. Per-group `requested_high_bytes` and `actual_high_bytes`, together with `applied_complete`, expose retained external limits and partial application.
 
 To observe policy over time before applying system changes:
 
@@ -93,18 +118,32 @@ The `--max-memory` value is in MiB. The disposable class is for work that can be
 
 The policy core is a deterministic state machine. It receives a snapshot and a monotonic timestamp, then produces a bounded decision. The Linux adapter checks real ownership, kernel state, disk capacity and operation results before acting.
 
-Busy Swap/IO takes precedence over the preference for available zram capacity. When the policy reports `swap_or_io_pressure`, the adapter keeps its swappiness hint of 20, including when Swap-in is high but IO PSI is low. Outside that condition, the existing zram and profile preferences apply.
+Swappiness expresses the kernel's relative preference for swapping anonymous memory versus reclaiming file-backed pages. zmem uses measured paging evidence to select it. Confirmed disk-swap read pressure lowers the preference; IO congestion alone does not trigger that reduction. When file-page refaults dominate alongside direct reclaim scans, and disk-swap pressure is absent, the desired value is 80, or 100 when zram has measured useful compression headroom. Refaults count pages used again after eviction; they do not directly measure storage reads. Hysteresis and bounded steps govern changes, so the requested and actual values can differ from the desired value for a sample.
+
+Interactive protection follows recognized processes into their real nested session and application scopes. A shared, bounded `memory.low` budget is allocated through the required ancestors and leaf scopes. The report records how many critical scopes received protection and whether the operation completed. Recursive protection in the kernel can also pass an ancestor's protection to a child whose local `memory.low` is zero; interpret the full hierarchy when inspecting a session.
+
+Background jobs inherit a dynamic budget from their managed aggregate. `run --class background` adds no fixed half-RAM limit to each new job. During a pressure episode, the daemon calculates a shared byte budget from current managed usage, available RAM and the configured reserve plus a safety margin. Populated groups share that budget with a bounded allowance for progress; empty groups consume no share. Healthy policy removes the temporary restriction while preserving existing external limits.
+
+Budget redistribution applies tighter limits before relaxing any group. A failed tightening blocks all relaxations in that batch; a failed relaxation stops the remaining relaxations. Incomplete sampling holds existing controls, and subsequent decisions use confirmed kernel readbacks, including partial application. When measured spare headroom is available, the budget can recover in bounded steps even while `memory.high` throttling keeps PSI elevated. This lets work regain capacity without waiting for its own throttling stalls to disappear first.
+
+Proactive reclaim is limited to populated, managed background groups with a conservative clean-file-page budget. Empty groups and groups without eligible file pages are skipped. The worker records its requested bytes separately from observed proactive-reclaim counters or net memory reduction, then backs off when progress is absent or unavailable. A successful request write by itself is not reported as memory saved.
 
 While the daemon is running, zmem owns the aggregate `memory.high` policy of its dedicated `zmem.slice/zmem-background.slice`, including the corresponding slice below a user manager. systemd can reset that slice to `max` when a new scope starts. If the original baseline was unlimited and the cgroup is still the same object, zmem reapplies its policy and records a `managed_background_limit_reapplied` event. A manual `max` write to this dedicated slice is therefore temporary. Finite external limits, finite original baselines, other cgroups and `memory.low` retain the normal external-change protection. Run jobs outside the background class when another tool should own their limits.
 
 Recovery records for vanished or replaced cgroups are removed every 15 sampling cycles, or about 30 seconds with the default interval. Live control baselines and records with uncertain metadata errors remain intact. Reading a recovery journal larger than 1 MiB returns an error and retains the whole file for recovery.
 
+When growth is needed, the policy requests a full configured chunk, 2 GiB by default, bounded by the disk-swap cap. Every active swap file consumes a kernel swap slot, so creating a new small file for each minor headroom deficit can exhaust slots while disk space remains available. Full chunks provide spare headroom and use fewer slots for a given capacity. Pressure, IO and cooldown gates still determine when growth is permitted; the Linux adapter checks remaining capacity and filesystem reserve before creating a file.
+
+The disk-swap budget includes valid owned files in the configured swap directory even when allocation or activation is incomplete. Each file is charged the larger of its logical length and allocated blocks. Other active disk Swap also counts toward the cap; zram does not. An exact canonical active path is counted once. An uncertain old alias remains a separate charge, so unproven identity can conservatively reduce the room for another allocation.
+
+After a failed new-file activation, cleanup requires a confirmed kernel syscall error other than `EBUSY`, unchanged file identity and a successful fresh Swap inventory that does not list the canonical path as active. Setup errors, timeouts, malformed helper replies, missing observations and changed identities preserve the file. Retained allocations continue consuming the disk-swap budget. Numeric syscall errors are distinguished from helper setup errors; text that merely says a file is busy does not establish its identity or authorize cleanup.
+
 | Default policy setting | Value |
 | --- | --- |
 | Available-memory reserve | Larger of 1 GiB or 10% of physical RAM, capped at total RAM |
 | Desired unused Swap headroom | 4 GiB when growth is needed |
-| Maximum growth request | 2 GiB per decision |
-| Managed disk Swap cap | 32 GiB |
+| Growth batch | 2 GiB per permitted decision, bounded by remaining capacity |
+| Disk Swap cap, including retained owned allocations | 32 GiB |
 | Filesystem free-space reserve | 8 GiB |
 | Swap growth cooldown | 30 seconds |
 | Stable healthy time before shrinking | 600 seconds |
@@ -125,7 +164,17 @@ cargo build --release --locked
 
 The public policy types can be embedded without the operating-system adapter. The `zmem` executable targets Linux; the `no_std` policy library does not depend on Linux.
 
-For meaningful host acceptance, exercise a bounded test workload in its own cgroup. Record probe latency, workload progress, PSI, swap IO and daemon RSS/CPU together. Do not infer responsiveness from a lower used-memory number alone. Exact measurements should identify the tested source, kernel, storage and workload.
+The repository includes a read-only probe for observations during ordinary work:
+
+```sh
+python3 scripts/measure_responsiveness.py --duration 60 --output artifacts/before
+# Repeat under the candidate policy for the same duration and a comparable workload.
+python3 scripts/measure_responsiveness.py --duration 60 --output artifacts/after
+```
+
+It records scheduler wakeup lateness, memory/IO/CPU PSI, paging counters, zram data, daemon status and managed-background activity. `--desktop-probe` adds a bounded Hyprland monitor-query round trip when available; this measures process startup plus IPC, not frame latency. The probe does not create a load or change kernel settings. Unknown measurements remain `null`, and counter resets are excluded from rate calculations. Output files contain reproducible samples and a summary with owner-only permissions.
+
+Natural-workload before/after observations describe the machine during those windows. Workload and cache changes remain possible causes of a difference. For a controlled comparison, identify the tested source, kernel, storage and workload, repeat comparable conditions, and assess latency together with task progress, pressure and paging activity. A lower used-memory number alone does not measure responsiveness.
 
 ## Release a version
 

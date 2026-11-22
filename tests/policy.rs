@@ -1,4 +1,4 @@
-use zmem::{Config, GIB, MIB, Policy, Pressure, Reason, Snapshot};
+use zmem::{Config, GIB, MIB, Policy, Pressure, Reason, Snapshot, io_congested};
 
 fn healthy() -> Snapshot {
     Snapshot {
@@ -37,7 +37,7 @@ fn zero_swap_grows_before_exhaustion_but_not_on_an_idle_machine() {
 }
 
 #[test]
-fn growth_failure_is_rate_limited_and_remaining_headroom_is_bounded() {
+fn growth_uses_full_batches_for_spare_headroom_and_rate_limits_failures() {
     let mut policy = Policy::new(Config::default());
     let mut sample = healthy();
     sample.available_bytes = 512 * MIB;
@@ -46,9 +46,29 @@ fn growth_failure_is_rate_limited_and_remaining_headroom_is_bounded() {
     assert_eq!(policy.observe(sample, 39).grow_swap_bytes, 0);
     assert_eq!(policy.observe(sample, 40).grow_swap_bytes, 2 * GIB);
     sample.swap_free_bytes = 3 * GIB;
-    assert_eq!(policy.observe(sample, 70).grow_swap_bytes, GIB);
+    // A 1 GiB deficit still requests the configured 2 GiB batch, leaving
+    // spare headroom instead of using a new swap slot for every small deficit.
+    assert_eq!(policy.observe(sample, 70).grow_swap_bytes, 2 * GIB);
     sample.swap_free_bytes = 4 * GIB;
     assert_eq!(policy.observe(sample, 100).grow_swap_bytes, 0);
+}
+
+#[test]
+fn tiny_swap_deficit_requests_the_configured_batch_without_repeating_the_worker() {
+    for chunk_bytes in [Config::default().chunk_bytes, 64 * MIB] {
+        let mut policy = Policy::new(Config {
+            chunk_bytes,
+            ..Config::default()
+        });
+        let mut sample = healthy();
+        sample.available_bytes = 512 * MIB;
+        sample.swap_free_bytes = 4 * GIB - 4096;
+        assert_eq!(policy.observe(sample, 10).grow_swap_bytes, chunk_bytes);
+        assert_eq!(policy.observe(sample, 39).grow_swap_bytes, 0);
+        sample.swap_total_bytes += chunk_bytes;
+        sample.swap_free_bytes += chunk_bytes;
+        assert_eq!(policy.observe(sample, 40).grow_swap_bytes, 0);
+    }
 }
 
 #[test]
@@ -227,4 +247,109 @@ fn kernel_memory_stalls_trigger_protection_even_when_memavailable_is_high() {
     assert_eq!(decision.reason, Reason::MemoryStall);
     assert_eq!(decision.grow_swap_bytes, 0);
     assert!(!decision.shrink_allowed);
+}
+
+#[test]
+fn observed_io_only_stall_is_visible_without_creating_memory_pressure() {
+    let mut policy = Policy::new(Config::default());
+    let sample = Snapshot {
+        total_bytes: 16_476_700_672,
+        available_bytes: 3_140_000_000,
+        swap_total_bytes: 32 * GIB,
+        swap_free_bytes: 8 * GIB,
+        memory_some_bp: 0,
+        memory_full_bp: 0,
+        io_full_bp: 1026,
+        swap_in_bytes_per_sec: 5_200_000,
+        swap_out_bytes_per_sec: 0,
+    };
+    for second in [0, 10, 60, 600] {
+        let decision = policy.observe(sample, second);
+        assert!(decision.io_congested);
+        assert_eq!(decision.pressure, Pressure::Healthy);
+        assert_eq!(decision.reason, Reason::SwapIoPressure);
+        assert_eq!(decision.background_high_percent, 100);
+        assert_eq!(decision.reclaim_bytes, 0);
+        assert_eq!(decision.grow_swap_bytes, 0);
+        assert!(!decision.shrink_allowed);
+    }
+}
+
+#[test]
+fn io_congestion_defers_preventive_swap_allocation_but_not_a_real_shortage() {
+    let mut policy = Policy::new(Config::default());
+    let mut sample = healthy();
+    sample.available_bytes = 2 * GIB;
+    sample.swap_free_bytes = GIB;
+    sample.io_full_bp = 1000;
+    let deferred = policy.observe(sample, 0);
+    assert_eq!(deferred.pressure, Pressure::Healthy);
+    assert!(deferred.io_congested);
+    assert_eq!(deferred.grow_swap_bytes, 0);
+
+    // A skipped preventive allocation must not consume the growth cooldown.
+    sample.available_bytes = 512 * MIB;
+    let urgent = policy.observe(sample, 1);
+    assert_eq!(urgent.pressure, Pressure::Elevated);
+    assert_eq!(urgent.grow_swap_bytes, 2 * GIB);
+    assert_eq!(urgent.reclaim_bytes, 0);
+}
+
+#[test]
+fn preventive_swap_growth_resumes_after_io_recovers() {
+    let mut policy = Policy::new(Config::default());
+    let mut sample = healthy();
+    sample.available_bytes = 2 * GIB;
+    sample.swap_free_bytes = GIB;
+    sample.io_full_bp = 1000;
+    assert_eq!(policy.observe(sample, 20).grow_swap_bytes, 0);
+    sample.io_full_bp = 499;
+    let resumed = policy.observe(sample, 21);
+    assert!(!resumed.io_congested);
+    assert_eq!(resumed.grow_swap_bytes, 2 * GIB);
+}
+
+#[test]
+fn reserve_boundary_keeps_disk_work_optional_until_memory_is_below_reserve() {
+    let config = Config::default();
+    let mut sample = healthy();
+    sample.swap_free_bytes = 0;
+    sample.io_full_bp = 1000;
+    sample.available_bytes = config.effective_reserve_bytes(sample.total_bytes);
+    let mut policy = Policy::new(config);
+    assert_eq!(policy.observe(sample, 0).grow_swap_bytes, 0);
+    sample.available_bytes -= 1;
+    assert!(policy.observe(sample, 1).grow_swap_bytes > 0);
+}
+
+#[test]
+fn io_signal_uses_a_five_percent_gate_and_preserves_swap_rate_boundaries() {
+    let mut sample = healthy();
+    sample.io_full_bp = 499;
+    assert!(!io_congested(sample));
+    sample.io_full_bp = 500;
+    assert!(io_congested(sample));
+    sample.io_full_bp = 0;
+    sample.swap_in_bytes_per_sec = 64 * MIB - 1;
+    assert!(!io_congested(sample));
+    sample.swap_in_bytes_per_sec += 1;
+    assert!(io_congested(sample));
+    sample.swap_in_bytes_per_sec = 16 * MIB;
+    sample.swap_out_bytes_per_sec = 64 * MIB;
+    assert!(io_congested(sample));
+    sample.swap_in_bytes_per_sec -= 1;
+    assert!(!io_congested(sample));
+}
+
+#[test]
+fn the_lower_io_gate_does_not_lower_the_existing_swappiness_hint() {
+    let mut policy = Policy::new(Config::default());
+    let mut sample = healthy();
+    sample.io_full_bp = 506;
+    let decision = policy.observe(sample, 0);
+    assert!(decision.io_congested);
+    assert_eq!(decision.pressure, Pressure::Healthy);
+    assert_eq!(decision.background_high_percent, 100);
+    assert_eq!(decision.recommended_swappiness, 60);
+    assert_eq!(decision.reclaim_bytes, 0);
 }

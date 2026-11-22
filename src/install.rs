@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt, symlink};
 use std::path::{Component, Path, PathBuf};
@@ -77,6 +78,7 @@ struct SavedService {
 
 #[derive(Debug)]
 struct Backup {
+    directory: PathBuf,
     files: Vec<SavedFile>,
     services: Vec<SavedService>,
     sysctls: Vec<(PathBuf, String)>,
@@ -86,13 +88,65 @@ struct Backup {
 struct Swap {
     path: PathBuf,
     is_file: bool,
+    size_kib: u64,
     priority: i32,
+}
+
+struct SwapWitness {
+    swap: Swap,
+    pinned: Option<PinnedSwap>,
+}
+
+struct PinnedSwap {
+    file: File,
+    dev: u64,
+    ino: u64,
+    uid: u32,
+}
+
+// The install lock is distinct from the daemon's lifetime lock: the existing
+// daemon must keep serving users while its replacement is prepared.
+struct InstallLock {
+    _file: File,
+}
+
+impl InstallLock {
+    fn acquire() -> Result<Self> {
+        let path = Path::new("/var/lib/zmem/install.lock");
+        reject_symlink(path)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(0o400000) // O_NOFOLLOW
+            .open(path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+            return fail("installation lock must be a root-owned regular file");
+        }
+        unsafe extern "C" {
+            fn flock(fd: i32, operation: i32) -> i32;
+        }
+        // SAFETY: file owns this descriptor for the lock's entire lifetime.
+        if unsafe { flock(file.as_raw_fd(), 2 | 4) } != 0 {
+            return fail(format!(
+                "cannot acquire the zmem installation lock (another install or rollback may be running): {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        // Closing this descriptor releases flock, including after an error.
+        Ok(Self { _file: file })
+    }
 }
 
 /// Install the running binary and service, optionally taking over legacy
 /// userspace controllers. Existing zmem configuration is preserved.
 pub fn install(source: Option<&Path>, replace: bool) -> Result<()> {
     require_root()?;
+    ensure_secure_dir(Path::new("/var/lib/zmem"), 0o755)?;
+    let _lock = InstallLock::acquire()?;
     let systemctl = executable("systemctl")?;
     reject_symlink(Path::new(BINARY))?;
     let current = std::env::current_exe()?;
@@ -139,7 +193,7 @@ pub fn install(source: Option<&Path>, replace: bool) -> Result<()> {
     let backup = if Path::new(BASELINE).exists() {
         Backup::load()?
     } else {
-        Backup::capture(services)?
+        Backup::capture(services.clone())?
     };
     if replace {
         for name in LEGACY {
@@ -147,12 +201,17 @@ pub fn install(source: Option<&Path>, replace: bool) -> Result<()> {
         }
         backup.ensure_mask_safe(Path::new(GENERATOR))?;
     }
-    // Include every live swap before stopping a controller or changing units.
-    let swaps_before: BTreeSet<_> = swaps()?.into_iter().map(|s| s.path).collect();
-    // This is a separate preflight boundary: a failed stop or restoration must
-    // not trigger baseline rollback and start a competing controller.
-    stop_manager(&systemctl)?;
+    // Retain the exact mount objects used by the outgoing daemon. A detached
+    // systemd mount can change /proc/swaps' spelling without changing a file.
+    let swaps_before = capture_swap_witnesses(&systemctl)?;
+    // The first-install baseline belongs only to the explicit rollback
+    // command. An unsuccessful upgrade must restore the version just running.
+    let transaction_directory = unique_path(Path::new("/var/lib/zmem"), "upgrade");
+    let transaction = Backup::capture_at(services, &transaction_directory, transaction_paths())?;
     let migration = (|| -> Result<()> {
+        // Keep stop inside the transaction. Recovery itself must confirm a
+        // full stop before restoring files or starting any other controller.
+        stop_manager(&systemctl)?;
         copy_atomic(&current, Path::new(BINARY), 0o755)?;
         if let Some(text) = new_config {
             write_atomic(Path::new(CONFIG), text.as_bytes(), 0o644)?;
@@ -185,30 +244,38 @@ pub fn install(source: Option<&Path>, replace: bool) -> Result<()> {
         checked(&systemctl, &["enable", UNIT])?;
         checked(&systemctl, &["restart", UNIT])?;
         wait_ready(&systemctl)?;
-        let swaps_after: BTreeSet<_> = swaps()?.into_iter().map(|s| s.path).collect();
-        let missing: Vec<_> = swaps_before.difference(&swaps_after).collect();
-        if !missing.is_empty() {
-            return fail(format!(
-                "takeover changed active swap devices: {}",
-                missing
-                    .iter()
-                    .map(|p| p.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
-        }
+        verify_swaps_preserved(&swaps_before, &swaps()?)?;
         Ok(())
     })();
     if let Err(error) = migration {
-        let recovery = restore(&backup, &systemctl);
+        let recovery = restore(&transaction, &systemctl)
+            .and_then(|()| verify_swaps_preserved(&swaps_before, &swaps()?));
         return match recovery {
-            Ok(()) => fail(format!(
-                "zmem installation failed: {error}; original configuration and controller states restored"
-            )),
+            Ok(()) => {
+                // Recovery succeeded. The permanent first-install baseline
+                // remains untouched, even when it predates every zmem binary.
+                let cleanup = fs::remove_dir_all(&transaction_directory);
+                let note = cleanup.err().map_or_else(String::new, |cleanup| {
+                    format!(
+                        "; recovered snapshot retained at {}: {cleanup}",
+                        transaction_directory.display()
+                    )
+                });
+                fail(format!(
+                    "zmem installation failed: {error}; immediately previous binary, configuration and controller states restored{note}"
+                ))
+            }
             Err(recovery) => fail(format!(
-                "zmem installation failed: {error}; rollback needs attention: {recovery}"
+                "zmem installation failed: {error}; recovery of the immediately previous version needs attention: {recovery}; transaction snapshot retained at {} (the first-install rollback baseline is unchanged)",
+                transaction_directory.display()
             )),
         };
+    }
+    if let Err(error) = fs::remove_dir_all(&transaction_directory) {
+        eprintln!(
+            "zmem is installed; could not remove completed transaction snapshot {}: {error}",
+            transaction_directory.display()
+        );
     }
     println!("zmem is active; configuration: {CONFIG}");
     println!("Existing swap was retained. Restore the original setup with: sudo zmem rollback");
@@ -218,6 +285,8 @@ pub fn install(source: Option<&Path>, replace: bool) -> Result<()> {
 /// Restore the first-install baseline without disabling any active swap.
 pub fn rollback() -> Result<()> {
     require_root()?;
+    ensure_secure_existing_dir(Path::new("/var/lib/zmem"))?;
+    let _lock = InstallLock::acquire()?;
     let backup = Backup::load()?;
     let systemctl = executable("systemctl")?;
     restore(&backup, &systemctl)?;
@@ -447,12 +516,17 @@ fn restore(backup: &Backup, systemctl: &Path) -> Result<()> {
         collect(&mut errors, checked(systemctl, &["disable", UNIT]));
     }
     for file in backup.files.iter().rev() {
-        collect(&mut errors, file.restore());
+        collect(&mut errors, file.restore(&backup.directory));
     }
     for (path, value) in &backup.sysctls {
         collect(&mut errors, fs::write(path, value).map_err(Into::into));
     }
     collect(&mut errors, checked(systemctl, &["daemon-reload"]));
+    // A partial file restoration is not a runnable configuration. In
+    // particular, never start an old controller alongside a surviving daemon.
+    if !errors.is_empty() {
+        return fail(errors.join("; "));
+    }
     for service in &backup.services {
         if !service.loaded {
             continue;
@@ -468,8 +542,38 @@ fn restore(backup: &Backup, systemctl: &Path) -> Result<()> {
             // are restored by their file records; preserve their link state.
             _ => {}
         }
+    }
+    if !errors.is_empty() {
+        return fail(errors.join("; "));
+    }
+    // Restore inactive states before any socket or controller is restarted.
+    for service in &backup.services {
+        if !service.active && service_state(systemctl, &service.name)?.active {
+            checked(systemctl, &["stop", &service.name])?;
+        }
+    }
+    for service in &backup.services {
         if service.active {
             collect(&mut errors, checked(systemctl, &["start", &service.name]));
+        }
+    }
+    for service in &backup.services {
+        let actual = service_state(systemctl, &service.name)?;
+        if actual.active != service.active {
+            errors.push(format!(
+                "{} active state was not restored (expected {}, observed {})",
+                service.name, service.active, actual.active
+            ));
+        }
+        if matches!(
+            service.enabled.as_str(),
+            "enabled" | "enabled-runtime" | "disabled" | "masked" | "masked-runtime"
+        ) && actual.enabled != service.enabled
+        {
+            errors.push(format!(
+                "{} enable state was not restored (expected {}, observed {})",
+                service.name, service.enabled, actual.enabled
+            ));
         }
     }
     if errors.is_empty() {
@@ -481,7 +585,27 @@ fn restore(backup: &Backup, systemctl: &Path) -> Result<()> {
 
 impl Backup {
     fn capture(services: Vec<SavedService>) -> Result<Self> {
-        let parent = Path::new("/var/lib/zmem");
+        Self::capture_at(services, Path::new(BASELINE), tracked_paths())
+    }
+
+    fn capture_at(
+        services: Vec<SavedService>,
+        destination: &Path,
+        paths: Vec<PathBuf>,
+    ) -> Result<Self> {
+        match fs::symlink_metadata(destination) {
+            Ok(_) => {
+                return fail(format!(
+                    "backup destination already exists: {}",
+                    destination.display()
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let parent = destination
+            .parent()
+            .ok_or("backup directory has no parent")?;
         let staging = unique_path(parent, "backup");
         fs::create_dir(&staging)?;
         fs::set_permissions(&staging, fs::Permissions::from_mode(0o700))?;
@@ -489,7 +613,7 @@ impl Backup {
             fs::create_dir(staging.join("files"))?;
             fs::set_permissions(staging.join("files"), fs::Permissions::from_mode(0o700))?;
             let mut files = Vec::new();
-            for (index, path) in tracked_paths().into_iter().enumerate() {
+            for (index, path) in paths.into_iter().enumerate() {
                 files.push(SavedFile::capture(path, index, &staging)?);
             }
             let mut sysctls = Vec::new();
@@ -504,12 +628,13 @@ impl Backup {
                 }
             }
             let backup = Self {
+                directory: destination.to_path_buf(),
                 files,
                 services,
                 sysctls,
             };
             write_atomic(&staging.join("manifest"), backup.encode().as_bytes(), 0o600)?;
-            fs::rename(&staging, BASELINE)?;
+            fs::rename(&staging, destination)?;
             File::open(parent)?.sync_all()?;
             Ok(backup)
         })();
@@ -521,13 +646,14 @@ impl Backup {
 
     fn load() -> Result<Self> {
         ensure_secure_existing_dir(Path::new(BASELINE))?;
+        ensure_secure_existing_dir(&Path::new(BASELINE).join("files"))?;
         let path = Path::new(BASELINE).join("manifest");
         reject_symlink(&path)?;
         let text = read_limited(&path, 128 * 1024)?;
         let backup = Self::decode(&text)?;
         for file in &backup.files {
             if matches!(file.kind, FileKind::Regular) {
-                let data = file.backup_path();
+                let data = file.backup_path(&backup.directory);
                 reject_symlink(&data)?;
                 let metadata = fs::metadata(&data)?;
                 if !metadata.is_file() || metadata.uid() != 0 {
@@ -645,6 +771,7 @@ impl Backup {
             return fail("zmem backup manifest does not contain the complete baseline");
         }
         Ok(Self {
+            directory: PathBuf::from(BASELINE),
             files,
             services,
             sysctls,
@@ -668,7 +795,7 @@ impl Backup {
                 || matches!(&saved.kind, FileKind::Link(original) if *original == target)
         } else if metadata.is_file() && matches!(saved.kind, FileKind::Regular) {
             read_limited_bytes(path, 1024 * 1024)?
-                == read_limited_bytes(&saved.backup_path(), 1024 * 1024)?
+                == read_limited_bytes(&saved.backup_path(&self.directory), 1024 * 1024)?
         } else {
             false
         };
@@ -720,18 +847,21 @@ impl SavedFile {
         })
     }
 
-    fn backup_path(&self) -> PathBuf {
-        Path::new(BASELINE)
-            .join("files")
-            .join(self.index.to_string())
+    fn backup_path(&self, directory: &Path) -> PathBuf {
+        directory.join("files").join(self.index.to_string())
     }
 
-    fn restore(&self) -> Result<()> {
+    fn restore(&self, directory: &Path) -> Result<()> {
         match &self.kind {
             FileKind::Missing => remove_file_if_present(&self.path),
             FileKind::Regular => {
+                let source = self.backup_path(directory);
+                reject_symlink(&source)?;
+                if !fs::metadata(&source)?.is_file() {
+                    return fail(format!("missing regular backup data: {}", source.display()));
+                }
                 remove_symlink_if_present(&self.path)?;
-                copy_atomic(&self.backup_path(), &self.path, self.mode)?;
+                copy_atomic(&source, &self.path, self.mode)?;
                 set_owner(&self.path, self.uid, self.gid)?;
                 fs::set_permissions(&self.path, fs::Permissions::from_mode(self.mode))?;
                 Ok(())
@@ -750,6 +880,13 @@ fn tracked_paths() -> Vec<PathBuf> {
         .map(PathBuf::from)
         .chain(LEGACY.iter().map(|name| unit_path(name)))
         .chain(SAVED_CONFIGS.iter().map(PathBuf::from))
+        .collect()
+}
+
+fn transaction_paths() -> Vec<PathBuf> {
+    tracked_paths()
+        .into_iter()
+        .chain([CONTROLS, CONTROL_RECOVERY].into_iter().map(PathBuf::from))
         .collect()
 }
 
@@ -947,10 +1084,200 @@ fn swaps() -> Result<Vec<Swap>> {
             Ok(Swap {
                 path: decode_proc_path(fields[0])?,
                 is_file: fields[1] == "file",
+                size_kib: fields[2].parse()?,
                 priority: fields[4].parse()?,
             })
         })
         .collect()
+}
+
+fn open_path(path: &Path, nofollow: bool) -> Result<File> {
+    Ok(OpenOptions::new()
+        .read(true)
+        // O_PATH pins the inode and mount without reading swap contents.
+        .custom_flags(0o10000000 | if nofollow { 0o400000 } else { 0 })
+        .open(path)?)
+}
+
+fn descriptor_path(file: &File) -> PathBuf {
+    Path::new("/proc/self/fd").join(file.as_raw_fd().to_string())
+}
+
+fn manager_pid(systemctl: &Path) -> Result<u64> {
+    let output = checked_output(
+        systemctl,
+        &["show", UNIT, "--property=LoadState,MainPID", "--no-pager"],
+    )?;
+    let values = properties(&String::from_utf8(output.stdout)?);
+    if let Some(pid) = values.get("MainPID") {
+        return Ok(pid.parse()?);
+    }
+    if values
+        .get("LoadState")
+        .is_some_and(|state| state == "not-found")
+    {
+        return Ok(0);
+    }
+    fail("systemd did not report zmem's MainPID before upgrade")
+}
+
+fn capture_swap_witnesses(systemctl: &Path) -> Result<Vec<SwapWitness>> {
+    let pid = manager_pid(systemctl)?;
+    let root = if pid == 0 {
+        None
+    } else {
+        // Opening through /proc/PID/root is essential: an ordinary host FD
+        // can name the same inode through a different, non-detaching mount.
+        Some(open_path(
+            &PathBuf::from(format!("/proc/{pid}/root")),
+            false,
+        )?)
+    };
+    let mut witnesses = Vec::new();
+    for swap in swaps()? {
+        let pinned = if swap.is_file {
+            match fs::symlink_metadata(&swap.path) {
+                Ok(host) => {
+                    if !host.is_file()
+                        || host.uid() != 0
+                        || fs::canonicalize(&swap.path)? != swap.path
+                    {
+                        return fail(format!(
+                            "cannot pin active swap safely before upgrade: {} is not a canonical root-owned regular file",
+                            swap.path.display()
+                        ));
+                    }
+                    let via_root = match &root {
+                        Some(root) => descriptor_path(root).join(swap.path.strip_prefix("/")?),
+                        None => swap.path.clone(),
+                    };
+                    let file = open_path(&via_root, true)?;
+                    let held = file.metadata()?;
+                    if !held.is_file()
+                        || held.uid() != 0
+                        || held.dev() != host.dev()
+                        || held.ino() != host.ino()
+                        || fs::read_link(descriptor_path(&file))? != swap.path
+                    {
+                        return fail(format!(
+                            "cannot prove the outgoing daemon's swap identity before upgrade: {}",
+                            swap.path.display()
+                        ));
+                    }
+                    Some(PinnedSwap {
+                        file,
+                        dev: held.dev(),
+                        ino: held.ino(),
+                        uid: held.uid(),
+                    })
+                }
+                // Already detached aliases have no resolvable host file.
+                // They may only survive by an exact unchanged row match.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error.into()),
+            }
+        } else {
+            None
+        };
+        witnesses.push(SwapWitness { swap, pinned });
+    }
+    if manager_pid(systemctl)? != pid {
+        return fail("zmem MainPID changed while preparing the upgrade; no service was stopped");
+    }
+    Ok(witnesses)
+}
+
+fn verify_swaps_preserved(before: &[SwapWitness], after: &[Swap]) -> Result<()> {
+    let mut aliases = Vec::with_capacity(before.len());
+    for witness in before {
+        let alias = if let Some(pin) = &witness.pinned {
+            let held = pin.file.metadata()?;
+            let host = fs::symlink_metadata(&witness.swap.path)?;
+            if !host.is_file()
+                || !held.is_file()
+                || host.uid() != pin.uid
+                || held.uid() != pin.uid
+                || host.dev() != pin.dev
+                || held.dev() != pin.dev
+                || host.ino() != pin.ino
+                || held.ino() != pin.ino
+                || fs::canonicalize(&witness.swap.path)? != witness.swap.path
+            {
+                return fail(format!(
+                    "active swap's canonical file changed during upgrade: {}",
+                    witness.swap.path.display()
+                ));
+            }
+            Some(fs::read_link(descriptor_path(&pin.file))?)
+        } else {
+            None
+        };
+        aliases.push(alias);
+    }
+    match_swap_rows(
+        &before.iter().map(|w| &w.swap).collect::<Vec<_>>(),
+        &aliases,
+        after,
+    )
+}
+
+fn same_swap_row(before: &Swap, after: &Swap, path: &Path) -> bool {
+    after.path == path
+        && before.is_file == after.is_file
+        && before.size_kib == after.size_kib
+        && before.priority == after.priority
+}
+
+fn match_swap_rows(before: &[&Swap], aliases: &[Option<PathBuf>], after: &[Swap]) -> Result<()> {
+    if before.len() != aliases.len() {
+        return fail("incomplete active swap identity evidence");
+    }
+    let mut used = vec![false; after.len()];
+    let mut matched = vec![false; before.len()];
+    // Consume original names first. A native-created swap may share the inode
+    // but not the outgoing daemon's mount, and its name correctly stays put.
+    for (index, original) in before.iter().enumerate() {
+        if let Some(found) = after.iter().enumerate().find_map(|(i, swap)| {
+            (!used[i] && same_swap_row(original, swap, &original.path)).then_some(i)
+        }) {
+            used[found] = true;
+            matched[index] = true;
+        }
+    }
+    for (index, original) in before.iter().enumerate() {
+        if matched[index] {
+            continue;
+        }
+        let Some(alias) = &aliases[index] else {
+            continue;
+        };
+        let candidates: Vec<_> = after
+            .iter()
+            .enumerate()
+            .filter(|(_, swap)| same_swap_row(original, swap, alias))
+            .map(|(i, _)| i)
+            .collect();
+        // A rendered alias is insufficient when multiple active rows could
+        // own it. Never collapse entries into a set or infer by basename.
+        if candidates.len() == 1 && !used[candidates[0]] {
+            used[candidates[0]] = true;
+            matched[index] = true;
+        }
+    }
+    let missing: Vec<_> = before
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !matched[*i])
+        .map(|(_, swap)| swap.path.display().to_string())
+        .collect();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        fail(format!(
+            "takeover could not prove preservation of active swap devices: {}",
+            missing.join(", ")
+        ))
+    }
 }
 
 fn decode_proc_path(text: &str) -> Result<PathBuf> {
@@ -1294,6 +1621,218 @@ fn fail<T>(message: impl Into<String>) -> Result<T> {
 mod tests {
     use super::*;
 
+    struct Fixture(PathBuf);
+    impl Fixture {
+        fn new() -> Self {
+            let path = unique_path(&std::env::temp_dir(), "zmem-install-test");
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn test_swap(path: &str) -> Swap {
+        Swap {
+            path: PathBuf::from(path),
+            is_file: true,
+            size_kib: 2_097_148,
+            priority: -2,
+        }
+    }
+
+    #[test]
+    fn failed_upgrade_restores_immediate_files_and_leaves_first_baseline_unchanged() {
+        let fixture = Fixture::new();
+        let paths: Vec<_> = ["zmem", "zmem.conf", "zmem.service", "controls.tsv"]
+            .iter()
+            .map(|name| fixture.0.join(name))
+            .collect();
+        let first =
+            Backup::capture_at(Vec::new(), &fixture.0.join("first"), paths.clone()).unwrap();
+        let first_manifest = fs::read(first.directory.join("manifest")).unwrap();
+        let previous = [
+            b"previous working executable".as_slice(),
+            b"profile=balanced\n# user settings\n".as_slice(),
+            b"[Service]\nExecStart=previous\n".as_slice(),
+            b"previous control journal\n".as_slice(),
+        ];
+        let modes = [0o755, 0o640, 0o644, 0o600];
+        for ((path, bytes), mode) in paths.iter().zip(previous).zip(modes) {
+            write_atomic(path, bytes, mode).unwrap();
+        }
+        let service = SavedService {
+            name: UNIT.into(),
+            loaded: true,
+            active: true,
+            enabled: "enabled-runtime".into(),
+        };
+        let transaction =
+            Backup::capture_at(vec![service], &fixture.0.join("transaction"), paths.clone())
+                .unwrap();
+        for path in &paths {
+            write_atomic(path, b"unsuccessful new version", 0o600).unwrap();
+        }
+        for file in transaction.files.iter().rev() {
+            file.restore(&transaction.directory).unwrap();
+        }
+        for ((path, bytes), mode) in paths.iter().zip(previous).zip(modes) {
+            assert_eq!(fs::read(path).unwrap(), bytes);
+            assert_eq!(fs::metadata(path).unwrap().mode() & 0o7777, mode);
+        }
+        assert!(transaction.services[0].active);
+        assert_eq!(transaction.services[0].enabled, "enabled-runtime");
+        assert_eq!(
+            fs::read(first.directory.join("manifest")).unwrap(),
+            first_manifest
+        );
+        assert!(
+            first
+                .files
+                .iter()
+                .all(|f| matches!(f.kind, FileKind::Missing))
+        );
+        // Only an explicit first-baseline restoration removes the installed
+        // files. A failed upgrade above retained the immediately previous ones.
+        for file in &first.files {
+            file.restore(&first.directory).unwrap();
+        }
+        assert!(paths.iter().all(|path| !path.exists()));
+    }
+
+    #[test]
+    fn snapshot_cannot_replace_an_existing_baseline_or_follow_backup_symlinks() {
+        let fixture = Fixture::new();
+        let target = fixture.0.join("zmem");
+        write_atomic(&target, b"working version", 0o755).unwrap();
+        let destination = fixture.0.join("snapshot");
+        let snapshot = Backup::capture_at(Vec::new(), &destination, vec![target.clone()]).unwrap();
+        let original = fs::read(destination.join("manifest")).unwrap();
+        assert!(Backup::capture_at(Vec::new(), &destination, vec![target.clone()]).is_err());
+        assert_eq!(fs::read(destination.join("manifest")).unwrap(), original);
+        let data = snapshot.files[0].backup_path(&snapshot.directory);
+        fs::remove_file(&data).unwrap();
+        symlink(&target, &data).unwrap();
+        assert!(snapshot.files[0].restore(&snapshot.directory).is_err());
+        assert_eq!(fs::read(target).unwrap(), b"working version");
+    }
+
+    #[test]
+    fn atomic_install_write_does_not_follow_a_symlink_target() {
+        let fixture = Fixture::new();
+        let victim = fixture.0.join("unrelated");
+        let target = fixture.0.join("zmem");
+        write_atomic(&victim, b"retain unrelated contents", 0o600).unwrap();
+        symlink(&victim, &target).unwrap();
+        assert!(write_atomic(&target, b"new executable", 0o755).is_err());
+        assert_eq!(fs::read(&victim).unwrap(), b"retain unrelated contents");
+        assert_eq!(fs::read_link(&target).unwrap(), victim);
+    }
+
+    #[test]
+    fn swap_alias_requires_pinned_evidence_and_unchanged_type_size_and_priority() {
+        let before = test_swap("/var/lib/zmem/swap/zmem-000001.swap");
+        let alias = PathBuf::from("/swap/zmem-000001.swap");
+        let after = test_swap(alias.to_str().unwrap());
+        assert!(match_swap_rows(&[&before], &[None], &[after]).is_err());
+        let after = test_swap(alias.to_str().unwrap());
+        assert!(match_swap_rows(&[&before], &[Some(alias.clone())], &[after]).is_ok());
+        for mismatch in 0..3 {
+            let mut after = test_swap(alias.to_str().unwrap());
+            match mismatch {
+                0 => after.is_file = false,
+                1 => after.size_kib += 1,
+                _ => after.priority += 1,
+            }
+            assert!(match_swap_rows(&[&before], &[Some(alias.clone())], &[after]).is_err());
+        }
+        let unrelated = test_swap("/elsewhere/zmem-000001.swap");
+        assert!(match_swap_rows(&[&before], &[Some(alias)], &[unrelated]).is_err());
+    }
+
+    #[test]
+    fn swap_matching_preserves_multiplicity_and_rejects_ambiguous_aliases() {
+        let before = test_swap("/var/lib/zmem/swap/zmem-000001.swap");
+        let alias = PathBuf::from("/swap/zmem-000001.swap");
+        let duplicates = [
+            test_swap(alias.to_str().unwrap()),
+            test_swap(alias.to_str().unwrap()),
+        ];
+        assert!(match_swap_rows(&[&before], &[Some(alias)], &duplicates).is_err());
+        let single = [test_swap(before.path.to_str().unwrap())];
+        assert!(match_swap_rows(&[&before, &before], &[None, None], &single).is_err());
+        let pair = [
+            test_swap(before.path.to_str().unwrap()),
+            test_swap(before.path.to_str().unwrap()),
+        ];
+        assert!(match_swap_rows(&[&before, &before], &[None, None], &pair).is_ok());
+    }
+
+    #[test]
+    fn unchanged_original_and_orphan_names_do_not_require_alias_inference() {
+        let original = test_swap("/var/lib/zmem/swap/zmem-000000.swap");
+        let orphan = test_swap("/swap/zmem-000001.swap");
+        let after = [
+            test_swap(original.path.to_str().unwrap()),
+            test_swap(orphan.path.to_str().unwrap()),
+        ];
+        assert!(
+            match_swap_rows(
+                &[&original, &orphan],
+                &[Some(PathBuf::from("/swap/zmem-000000.swap")), None],
+                &after,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn held_descriptor_proves_a_path_change_but_rejects_replaced_canonical_inode() {
+        let fixture = Fixture::new();
+        let canonical = fixture.0.join("canonical.swap");
+        let alias = fixture.0.join("alias.swap");
+        write_atomic(
+            &canonical,
+            b"swap contents are never read by the verifier",
+            0o600,
+        )
+        .unwrap();
+        let file = open_path(&canonical, true).unwrap();
+        let metadata = file.metadata().unwrap();
+        let witness = SwapWitness {
+            swap: test_swap(canonical.to_str().unwrap()),
+            pinned: Some(PinnedSwap {
+                file,
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+                uid: metadata.uid(),
+            }),
+        };
+        // A rename plus hard link provides a real kernel d_path transition
+        // without requiring a mount namespace or activating any test swap.
+        fs::rename(&canonical, &alias).unwrap();
+        fs::hard_link(&alias, &canonical).unwrap();
+        let after = [test_swap(alias.to_str().unwrap())];
+        assert!(verify_swaps_preserved(&[witness], &after).is_ok());
+        let file = open_path(&alias, true).unwrap();
+        let metadata = file.metadata().unwrap();
+        let witness = SwapWitness {
+            swap: test_swap(canonical.to_str().unwrap()),
+            pinned: Some(PinnedSwap {
+                file,
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+                uid: metadata.uid(),
+            }),
+        };
+        fs::remove_file(&canonical).unwrap();
+        write_atomic(&canonical, b"different inode", 0o600).unwrap();
+        assert!(verify_swaps_preserved(&[witness], &after).is_err());
+    }
+
     #[test]
     fn journal_format_preserves_empty_pending_column_and_rejects_unknown_rows() {
         let legacy = "/sys/fs/cgroup/example/memory.high\tmax\t12345\t10\t20\n";
@@ -1399,6 +1938,7 @@ mod tests {
             })
             .collect();
         let original = Backup {
+            directory: PathBuf::from(BASELINE),
             files,
             services,
             sysctls: vec![(PathBuf::from(SYSCTLS[0]), "150\n".to_owned())],
