@@ -2,23 +2,24 @@
 
 **Memory, with room to work.** A small Linux memory and Swap controller from [Project Z](https://github.com/LIghtJUNction/project-z).
 
-[Website](https://lightjunction.github.io/zmem/) · [Releases](https://github.com/LIghtJUNction/zmem/releases) · [crates.io](https://crates.io/crates/zmem-manager) · [Rust API](https://docs.rs/zmem-manager) · [Host acceptance](docs/acceptance-0.2.0.md) · [Prior pressure validation](docs/acceptance-pressure-journal.md) · [Prior scheduling validation](docs/acceptance-adaptive-scheduling.md)
+[Website](https://lightjunction.github.io/zmem/) · [Releases](https://github.com/LIghtJUNction/zmem/releases) · [crates.io](https://crates.io/crates/zmem-manager) · [Rust API](https://docs.rs/zmem-manager) · [Swap and dedup guide](docs/swap-lifecycle-and-dedup.md) · [0.3.0 acceptance](docs/acceptance-0.3.0.md) · [0.2.0 host acceptance](docs/acceptance-0.2.0.md) · [Prior pressure validation](docs/acceptance-pressure-journal.md) · [Prior scheduling validation](docs/acceptance-adaptive-scheduling.md)
 
-zmem observes memory pressure, preserves headroom for interactive work, and gives managed background jobs a bounded memory budget. It brings zram setup, dynamic disk swap, pressure policy and structured inspection into one tool. The Rust implementation has no third-party crate dependencies; the policy library uses `no_std` and makes no heap allocations.
+zmem observes memory pressure, preserves headroom for interactive work, and gives managed background jobs a bounded memory budget. It brings zram setup, dynamic disk swap, automatic cleanup, opt-in memory deduplication and structured inspection into one tool. The Rust implementation has no third-party crate dependencies; the policy library uses `no_std` and makes no heap allocations.
 
 ## What it does
 
 | Capability | Behavior |
 | --- | --- |
 | Pressure policy | Reports memory pressure and IO congestion separately, using available memory, PSI and paging activity with cooldowns and recovery hysteresis. |
-| Swap management | Adopts active swap, grows disk swap within capacity and free-space limits, and shrinks only unused, owned files. |
+| Swap management | Adopts active swap, grows within capacity and free-space limits, cleans retained owned files, and retires eligible owned swap after sustained recovery. |
 | zram lifecycle | Keeps the current active device during migration and prepares zram on subsequent boots. |
+| Explicit memory deduplication | Registers trusted background or disposable jobs with `--dedup`; pauses owned KSM scanning under CPU, memory or IO pressure. |
 | Workload budgets | Adjusts aggregate cgroup v2 `memory.high` budgets to managed background usage and available headroom; disposable jobs retain explicit hard limits. |
 | Interactive protection | Assigns a bounded `memory.low` budget to recognized desktop, terminal and remote-access scopes through their actual cgroup hierarchy. |
 | Observability | Reports daemon state, actual kernel controls, managed-workload coverage and on-demand process usage in human-readable and JSON output. |
 | Service migration | Saves prior service/configuration state, replaces existing management services, and offers rollback. |
 
-The Linux kernel performs actual paging, compression and final OOM handling. zmem makes earlier policy decisions using those facilities. Automatic application checkpoints, general-purpose memory deduplication and energy optimization are future work. KSM statistics describe what the kernel has already merged; they are not a claim that every application's memory can be deduplicated.
+The Linux kernel performs actual paging, compression, page merging and final OOM handling. zmem makes earlier policy decisions using those facilities. Application checkpoints, automatic recovery of computation progress and energy optimization remain future work. Deduplication requires explicit task registration and kernel support; it does not enroll every application or deduplicate active swap files on disk. KSM uses a system-wide matching domain, so choose only workloads whose data may share that domain.
 
 The default policy preserves processes. It does not issue global cache drops or automatically kill arbitrary applications. A task explicitly started as disposable can be given a hard cgroup limit, where the kernel may terminate it if the budget is exhausted.
 
@@ -39,7 +40,7 @@ sudo "$(command -v zmem)" install --replace
 
 `install --replace` is the explicit system migration operation. It preserves active swap, records the prior management configuration and installs the zmem service. Existing swap that contains data is adopted in place. Changes that require rebuilding zram take effect at a normal subsequent boot.
 
-Active Swap created in an older service mount namespace can retain an old alias in `/proc/swaps` until reactivation or a normal boot. Its capacity remains available; the alias alone does not make the file eligible for automatic shrinking.
+Active Swap created in an older service mount namespace can retain an old alias in `/proc/swaps` until reactivation or a normal boot. Its capacity remains available. Maintenance never infers inactivity from a missing canonical pathname: cleanup leaves active files protected by the kernel, and retirement requires the full-file headroom checks described in the [lifecycle guide](docs/swap-lifecycle-and-dedup.md#automatic-swap-maintenance).
 
 ### Prebuilt Linux executable
 
@@ -88,9 +89,11 @@ Read the controls and coverage alongside the plan:
 | --- | --- |
 | `memory_pressure`, `io_congested` | Separate signals for memory pressure and IO congestion. A busy storage device alone does not establish memory exhaustion. |
 | `paging` | Measured sampling interval, file/anonymous refaults, direct scans and available swap-rate estimates. Availability flags and `null` values distinguish missing observations from zero activity. |
-| `controls` | Requested and observed swappiness, its selection reason, actual page-cluster value, the protection budget and the count of successfully protected scopes. |
+| `controls` | Requested and observed swappiness, its selection reason, actual page-cluster value, protection budget, protected-scope count, and the last protection check's timestamp and errors. |
 | `managed` | Observed background groups, populated groups, task count, memory usage and currently eligible reclaim candidates. |
 | `background` | Requested aggregate budget, actual limits read back from populated groups, per-group limits, and sampling/application completeness. |
+| `dedup` | Observed and target scan state, decision reason, control ownership, registered tasks, task-observation age and coverage. |
+| `ksm` | Actual KSM controls and available kernel counters, including the signed system-wide profit estimate. Missing observations remain `null`. |
 | `plan.background_high_percent` | A pressure-severity hint retained in the policy contract. Read `background` for the byte budget actually requested and observed. |
 | `protection_complete`, `coverage_complete` | Completeness of the protection operation and managed-background observations, inside `controls` and `managed` respectively. |
 
@@ -110,9 +113,18 @@ Start background work with its classification from the beginning:
 zmem run --class background -- cargo build --release
 zmem run --class interactive -- YOUR_COMMAND
 zmem run --class disposable --max-memory 2048 -- YOUR_BATCH_COMMAND
+# Explicitly register trusted, repeat-heavy memory workloads for KSM:
+zmem run --class background --dedup -- YOUR_TRUSTED_COMMAND
+zmem run --class disposable --max-memory 2048 --dedup -- YOUR_TRUSTED_BATCH_COMMAND
 ```
 
 The `--max-memory` value is in MiB. The disposable class is for work that can be restarted if it exceeds its explicit budget. Starting a job inside a cgroup gives the kernel a consistent accounting boundary for the job's allocations.
+
+`--dedup` enables process-level KSM registration before executing the selected command and verifies that registration. It is available for `background` and `disposable`, not `interactive`. A kernel that rejects or cannot verify registration produces an explicit error before the target command starts. Ordinary `run` commands and the default managed-build wrappers do not add this flag.
+
+The default `dedup_enabled = true` permits the daemon to manage scanning for registered tasks. It does not register tasks by itself. When zmem owns the KSM controls, CPU, memory or IO pressure pauses scanning with `run=0`, preserving merged pages. Complete, fresh observations and 30 seconds of stable headroom are required before scanning resumes. The fixed scan settings are 128 pages followed by a 100 ms sleep; these are batch controls, not a hard CPU quota. Registration is refreshed through a bounded task scan every 10 seconds, with incomplete coverage reported explicitly.
+
+KSM matching crosses process, user and cgroup boundaries, including eligible memory registered by other software. zmem leaves an already running external KSM controller, an external advisor or externally changed controls alone. It never writes `run=2` or `PR_SET_MEMORY_MERGE=0` to force unmerging. See the [dedup guide](docs/swap-lifecycle-and-dedup.md#explicit-memory-deduplication) for trust boundaries, pause conditions and status interpretation.
 
 ## Policy and resource limits
 
@@ -122,13 +134,15 @@ Swappiness expresses the kernel's relative preference for swapping anonymous mem
 
 Interactive protection follows recognized processes into their real nested session and application scopes. A shared, bounded `memory.low` budget is allocated through the required ancestors and leaf scopes. The report records how many critical scopes received protection and whether the operation completed. Recursive protection in the kernel can also pass an ancestor's protection to a child whose local `memory.low` is zero; interpret the full hierarchy when inspecting a session.
 
+systemd can restore an owned ancestor or service's `memory.low` to its configured zero baseline during reload. That can interrupt the protection path even while a leaf retains a nonzero value. zmem reapplies its budget only when the cgroup identity is unchanged, the control was already owned, and both the original baseline and current value are zero. Nonzero external values and nonzero original baselines retain external-change protection. To disable this automatic protection, set `protect_sessions = false` in the service configuration and restart the service; a manual zero on a currently owned node is not a persistent opt-out. `controls.protection_sampled_at_unix` and `controls.protection_errors` retain the last protection check's time and diagnostics between checks, so an intervening ordinary sample cannot hide a failed protection operation.
+
 Background jobs inherit a dynamic budget from their managed aggregate. `run --class background` adds no fixed half-RAM limit to each new job. During a pressure episode, the daemon calculates a shared byte budget from current managed usage, available RAM and the configured reserve plus a safety margin. Populated groups share that budget with a bounded allowance for progress; empty groups consume no share. Healthy policy removes the temporary restriction while preserving existing external limits.
 
 Budget redistribution applies tighter limits before relaxing any group. A failed tightening blocks all relaxations in that batch; a failed relaxation stops the remaining relaxations. Incomplete sampling holds existing controls, and subsequent decisions use confirmed kernel readbacks, including partial application. When measured spare headroom is available, the budget can recover in bounded steps even while `memory.high` throttling keeps PSI elevated. This lets work regain capacity without waiting for its own throttling stalls to disappear first.
 
 Proactive reclaim is limited to populated, managed background groups with a conservative clean-file-page budget. Empty groups and groups without eligible file pages are skipped. The worker records its requested bytes separately from observed proactive-reclaim counters or net memory reduction, then backs off when progress is absent or unavailable. A successful request write by itself is not reported as memory saved.
 
-While the daemon is running, zmem owns the aggregate `memory.high` policy of its dedicated `zmem.slice/zmem-background.slice`, including the corresponding slice below a user manager. systemd can reset that slice to `max` when a new scope starts. If the original baseline was unlimited and the cgroup is still the same object, zmem reapplies its policy and records a `managed_background_limit_reapplied` event. A manual `max` write to this dedicated slice is therefore temporary. Finite external limits, finite original baselines, other cgroups and `memory.low` retain the normal external-change protection. Run jobs outside the background class when another tool should own their limits.
+While the daemon is running, zmem owns the aggregate `memory.high` policy of its dedicated `zmem.slice/zmem-background.slice`, including the corresponding slice below a user manager. systemd can reset that slice to `max` when a new scope starts. If the original baseline was unlimited and the cgroup is still the same object, zmem reapplies its policy and records a `managed_background_limit_reapplied` event. A manual `max` write to this dedicated slice is therefore temporary. Finite external `memory.high` limits, finite original baselines and other cgroups retain the normal external-change protection; the separate owned-zero rule above applies to `memory.low`. Run jobs outside the background class when another tool should own their limits.
 
 Recovery records for vanished or replaced cgroups are removed every 15 sampling cycles, or about 30 seconds with the default interval. Live control baselines and records with uncertain metadata errors remain intact. Reading a recovery journal larger than 1 MiB returns an error and retains the whole file for recovery.
 
@@ -138,6 +152,10 @@ The disk-swap budget includes valid owned files in the configured swap directory
 
 After a failed new-file activation, cleanup requires a confirmed kernel syscall error other than `EBUSY`, unchanged file identity and a successful fresh Swap inventory that does not list the canonical path as active. Setup errors, timeouts, malformed helper replies, missing observations and changed identities preserve the file. Retained allocations continue consuming the disk-swap budget. Numeric syscall errors are distinguished from helper setup errors; text that merely says a file is busy does not establish its identity or authorize cleanup.
 
+Automatic maintenance revisits owned files at most once per 60 seconds, one candidate per attempt, after higher-priority growth or reclaim work. Cleanup can remove an inactive retained allocation without calling `swapoff`. It requires noncritical memory pressure, no IO congestion and at least half of the configured effective RAM reserve. The final operation is an ordinary, identity-checked unlink; the kernel refuses it while the file remains active or draining. A missing `/proc/swaps` pathname or an `EINVAL` result alone never proves inactivity.
+
+Active retirement has stronger requirements: the default policy waits for 600 seconds of continuously healthy conditions and at least that long after growth. Immediately before `swapoff`, the worker rechecks low pressure, available RAM of at least twice the effective reserve plus the candidate's entire capacity, and enough free Swap to preserve the configured target after subtracting that entire capacity. Known used files are skipped. The whole-file bound covers an old mount alias whose usage cannot be established from its name. All zmem allocation, activation, retirement and removal operations share a lock that remains held for the lifetime of their helpers, including a helper that outlives a timeout. Maintenance never truncates, punches holes in, overwrites or applies filesystem deduplication to active Swap.
+
 | Default policy setting | Value |
 | --- | --- |
 | Available-memory reserve | Larger of 1 GiB or 10% of physical RAM, capped at total RAM |
@@ -146,7 +164,10 @@ After a failed new-file activation, cleanup requires a confirmed kernel syscall 
 | Disk Swap cap, including retained owned allocations | 32 GiB |
 | Filesystem free-space reserve | 8 GiB |
 | Swap growth cooldown | 30 seconds |
+| Automatic maintenance cadence | At least 60 seconds between attempts; at most one file per attempt |
 | Stable healthy time before shrinking | 600 seconds |
+| Dedup task registration | Explicit `run --dedup`; daemon scanning enabled by default |
+| Dedup recovery and scan settings | 30 stable seconds; 128 pages per batch, 100 ms sleep |
 
 These are policy defaults, not a promise about application latency. A machine can run out of physical memory and swap, or spend time waiting for a slow storage device. zmem bounds its own actions and exposes the observed pressure so the tradeoffs remain visible.
 
@@ -175,6 +196,8 @@ python3 scripts/measure_responsiveness.py --duration 60 --output artifacts/after
 It records scheduler wakeup lateness, memory/IO/CPU PSI, paging counters, zram data, daemon status and managed-background activity. `--desktop-probe` adds a bounded Hyprland monitor-query round trip when available; this measures process startup plus IPC, not frame latency. The probe does not create a load or change kernel settings. Unknown measurements remain `null`, and counter resets are excluded from rate calculations. Output files contain reproducible samples and a summary with owner-only permissions.
 
 Natural-workload before/after observations describe the machine during those windows. Workload and cache changes remain possible causes of a difference. For a controlled comparison, identify the tested source, kernel, storage and workload, repeat comparable conditions, and assess latency together with task progress, pressure and paging activity. A lower used-memory number alone does not measure responsiveness.
+
+The published [0.2.0 acceptance record](docs/acceptance-0.2.0.md) applies to its recorded binaries and observation windows. It does not validate the automatic lifecycle and dedup additions in 0.3.0 or establish a performance gain for them. The [lifecycle and dedup guide](docs/swap-lifecycle-and-dedup.md#evidence-and-limits) separates current source behavior from measured results.
 
 ## Release a version
 

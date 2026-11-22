@@ -1,10 +1,10 @@
-use crate::{Result, config::Settings, json};
+use crate::{Result, config::Settings, dedup, json};
 use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     os::{
-        fd::AsRawFd,
+        fd::{AsRawFd, FromRawFd},
         unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     },
     path::{Path, PathBuf},
@@ -17,8 +17,12 @@ use zmem::{Decision, GIB, MIB, Policy, Snapshot, reclaim as reclaim_policy};
 
 #[path = "background.rs"]
 mod background;
+#[path = "dedup_adapter.rs"]
+mod dedup_adapter;
 #[path = "protection.rs"]
 mod protection;
+#[path = "swap_lifecycle.rs"]
+mod swap_lifecycle;
 #[path = "swappiness.rs"]
 mod swappiness;
 type SwappinessGovernor = swappiness::Governor;
@@ -26,11 +30,13 @@ type SwappinessGovernor = swappiness::Governor;
 const RUNTIME: &str = "/run/zmem";
 const CONTROL_FILE: &str = "/run/zmem/controls.tsv";
 const CGROOT: &str = "/sys/fs/cgroup";
+const SWAP_MUTATION_LOCK: &str = "/var/lib/zmem/.swap-mutation.lock";
 static STOP: AtomicBool = AtomicBool::new(false);
 // These Unix interfaces provide locking, signal delivery, and the native page size.
 // The signal handler touches one lock-free atomic and performs no allocation.
 unsafe extern "C" {
     fn flock(fd: i32, operation: i32) -> i32;
+    fn fcntl(fd: i32, command: i32, ...) -> i32;
     fn signal(sig: i32, handler: extern "C" fn(i32)) -> usize;
     fn kill(pid: i32, signal: i32) -> i32;
     fn getpagesize() -> i32;
@@ -113,6 +119,74 @@ pub fn command(program: &str, args: &[&str], seconds: u64) -> Result<String> {
             return Err(format!("{program} timed out after {seconds}s").into());
         }
         thread::sleep(Duration::from_millis(20));
+    }
+}
+
+// All swap mutations, including allocation, share one stable lock inode. Its
+// descriptor survives exec so an uninterruptible child retains exclusion after
+// the worker/controller times out. Closing only our descriptor is essential:
+// LOCK_UN would also release the lock held through a child's duplicate.
+struct SwapMutationLock(File);
+
+impl SwapMutationLock {
+    fn acquire() -> Result<Self> {
+        root_required()?;
+        secure_dir(Path::new("/var/lib/zmem"), true)?;
+        let path = Path::new(SWAP_MUTATION_LOCK);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(0o400000) // O_NOFOLLOW
+            .open(path)?;
+        Self::validate(&file)?;
+        Self::lock(file)
+    }
+
+    fn validate(file: &File) -> Result<()> {
+        let current = fs::symlink_metadata(SWAP_MUTATION_LOCK)?;
+        let opened = file.metadata()?;
+        if !current.is_file()
+            || current.uid() != 0
+            || current.mode() & 0o077 != 0
+            || current.nlink() != 1
+            || SwapIdentity::of(&current) != SwapIdentity::of(&opened)
+        {
+            return Err("invalid or replaced swap mutation lock; preserving swap files".into());
+        }
+        Ok(())
+    }
+
+    fn lock(file: File) -> Result<Self> {
+        if unsafe { flock(file.as_raw_fd(), 2 | 4) } != 0 {
+            return Err(format!(
+                "swap mutation deferred while another helper holds the lock: {}",
+                std::io::Error::last_os_error()
+            )
+            .into());
+        }
+        // Only a short-lived mutation scope makes the descriptor inheritable.
+        // Allocation commands and the namespace/syscall helper must all retain
+        // this open file description until their actual exit.
+        let fd = file.as_raw_fd();
+        let flags = unsafe { fcntl(fd, 1) }; // F_GETFD
+        if flags < 0 || unsafe { fcntl(fd, 2, flags & !1) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(Self(file))
+    }
+
+    fn inherited(fd: i32) -> Result<Self> {
+        if fd < 3 || unsafe { fcntl(fd, 1) } < 0 {
+            return Err("missing inherited swap mutation lock".into());
+        }
+        // The private helper owns its inherited descriptor. It has not been
+        // wrapped in a Rust File elsewhere in this fresh exec'd process.
+        let file = unsafe { File::from_raw_fd(fd) };
+        Self::validate(&file)?;
+        Self::lock(file)
     }
 }
 
@@ -213,7 +287,11 @@ fn swap_helper_args(
     path: &Path,
     action: SwapAction,
     identity: SwapIdentity,
+    lock_fd: i32,
 ) -> Result<Vec<String>> {
+    if lock_fd < 3 {
+        return Err("invalid inherited swap mutation descriptor".into());
+    }
     let (verb, priority) = match action {
         SwapAction::Activate(priority) => {
             swap_flags(priority)?;
@@ -239,6 +317,7 @@ fn swap_helper_args(
         identity.dev.to_string(),
         identity.ino.to_string(),
         identity.rdev.to_string(),
+        lock_fd.to_string(),
     ])
 }
 
@@ -255,11 +334,33 @@ fn swap_reply_errno(reply: &str) -> Result<i32> {
     Ok(code)
 }
 
-fn host_swap_command(path: &Path, action: SwapAction, seconds: u64) -> Result<()> {
+fn host_swap_command(
+    path: &Path,
+    action: SwapAction,
+    seconds: u64,
+    lock: &SwapMutationLock,
+) -> Result<()> {
     root_required()?;
     let pinned = swap_target(path)?;
+    host_swap_pinned(path, action, seconds, lock, &pinned)
+}
+
+fn host_swap_pinned(
+    path: &Path,
+    action: SwapAction,
+    seconds: u64,
+    lock: &SwapMutationLock,
+    pinned: &File,
+) -> Result<()> {
     let identity = SwapIdentity::of(&pinned.metadata()?);
-    let args = swap_helper_args(&std::env::current_exe()?, path, action, identity)?;
+    SwapMutationLock::validate(&lock.0)?;
+    let args = swap_helper_args(
+        &std::env::current_exe()?,
+        path,
+        action,
+        identity,
+        lock.0.as_raw_fd(),
+    )?;
     let executable = ["/usr/bin/nsenter", "/bin/nsenter"]
         .into_iter()
         .map(Path::new)
@@ -315,7 +416,7 @@ fn host_swap_command(path: &Path, action: SwapAction, seconds: u64) -> Result<()
 /// is returned separately from setup/validation failures.
 pub fn swap_helper(action: &str, args: &[String]) -> Result<()> {
     root_required()?;
-    if !matches!(action, "__swap-on" | "__swap-off") || args.len() != 5 {
+    if !matches!(action, "__swap-on" | "__swap-off") || !matches!(args.len(), 5 | 6) {
         return Err("invalid private swap helper request".into());
     }
     for (current, host) in [
@@ -337,6 +438,11 @@ pub fn swap_helper(action: &str, args: &[String]) -> Result<()> {
         dev: args[2].parse()?,
         ino: args[3].parse()?,
         rdev: args[4].parse()?,
+    };
+    let _lock = if let Some(fd) = args.get(5) {
+        SwapMutationLock::inherited(fd.parse()?)?
+    } else {
+        SwapMutationLock::acquire()?
     };
     let pinned = swap_target(Path::new(&args[0]))?;
     verify_swap_identity(&pinned, expected)?;
@@ -365,8 +471,8 @@ fn swap_busy(error: &(dyn std::error::Error + 'static)) -> bool {
     swap_syscall_errno(error) == Some(16)
 }
 
-fn activate_existing_swap(path: &Path, priority: i32) -> Result<()> {
-    match host_swap_command(path, SwapAction::Activate(priority), 10) {
+fn activate_existing_swap(path: &Path, priority: i32, lock: &SwapMutationLock) -> Result<()> {
+    match host_swap_command(path, SwapAction::Activate(priority), 10, lock) {
         Err(error) if swap_busy(error.as_ref()) => {
             // An orphan mount can change /proc/swaps' displayed name. EBUSY
             // preserves an existing file without claiming an alias identity:
@@ -582,14 +688,16 @@ pub struct Applied {
     pub protection_budget_bytes: u64,
     pub protected_critical_scopes: usize,
     pub protection_complete: bool,
+    pub protection_errors: Vec<String>,
+    pub protection_sampled_at: Option<u64>,
 }
 #[derive(Clone, Debug, Default)]
 pub struct Telemetry {
     pub sample: Snapshot,
     pub swaps: Vec<Swap>,
     pub zram: Vec<Zram>,
-    pub ksm_profit: i64,
-    pub ksm_shared: u64,
+    pub ksm: dedup::KsmSnapshot,
+    pub dedup: dedup_adapter::Report,
     pub sampled_at: u64,
     pub paging: Paging,
     pub managed: Managed,
@@ -768,11 +876,8 @@ impl Sampler {
             sample,
             swaps,
             zram,
-            ksm_profit: read("/sys/kernel/mm/ksm/general_profit")
-                .ok()
-                .and_then(|s| s.trim().parse().ok())
-                .unwrap_or(0),
-            ksm_shared: number("/sys/kernel/mm/ksm/pages_sharing"),
+            ksm: dedup::read_ksm(Path::new(dedup::KSM_ROOT)),
+            dedup: dedup_adapter::Report::default(),
             sampled_at: now(),
             paging,
             managed,
@@ -909,6 +1014,11 @@ pub fn telemetry_json(
 ) -> String {
     let s = &t.sample;
     let mut all_errors = errors.to_vec();
+    for error in &t.applied.protection_errors {
+        if !all_errors.contains(error) {
+            all_errors.push(error.clone());
+        }
+    }
     for error in &t.background.errors {
         if !all_errors.contains(error) {
             all_errors.push(error.clone());
@@ -931,7 +1041,7 @@ pub fn telemetry_json(
         .join(",");
     let zram=t.zram.iter().map(|z|format!("{{\"device\":{},\"original_bytes\":{},\"compressed_bytes\":{},\"resident_bytes\":{},\"estimated_saved_bytes\":{},\"same_pages\":{}}}",json::quote(&z.name),z.original,z.compressed,z.resident,z.original.saturating_sub(z.resident),z.same_pages)).collect::<Vec<_>>().join(",");
     let mut status = format!(
-        "{{\"schema\":\"zmem.status.v1\",\"version\":{},\"pid\":{},\"sampled_at_unix\":{},\"profile\":{},\"pressure\":{},\"reason\":{},\"memory\":{{\"total_bytes\":{},\"available_bytes\":{}}},\"swap\":{{\"total_bytes\":{},\"free_bytes\":{},\"in_bytes_per_sec\":{},\"out_bytes_per_sec\":{},\"devices\":[{}]}},\"psi\":{{\"memory_some_bp\":{},\"memory_full_bp\":{},\"io_full_bp\":{}}},\"zram\":[{}],\"ksm\":{{\"general_profit_bytes\":{},\"pages_sharing\":{}}},\"plan\":{{\"grow_swap_bytes\":{},\"shrink_allowed\":{},\"background_high_percent\":{},\"reclaim_request_bytes\":{},\"swappiness_hint\":{}}},\"worker\":{},\"errors\":{},\"processes\":{}}}",
+        "{{\"schema\":\"zmem.status.v1\",\"version\":{},\"pid\":{},\"sampled_at_unix\":{},\"profile\":{},\"pressure\":{},\"reason\":{},\"memory\":{{\"total_bytes\":{},\"available_bytes\":{}}},\"swap\":{{\"total_bytes\":{},\"free_bytes\":{},\"in_bytes_per_sec\":{},\"out_bytes_per_sec\":{},\"devices\":[{}]}},\"psi\":{{\"memory_some_bp\":{},\"memory_full_bp\":{},\"io_full_bp\":{}}},\"zram\":[{}],\"ksm\":{},\"plan\":{{\"grow_swap_bytes\":{},\"shrink_allowed\":{},\"background_high_percent\":{},\"reclaim_request_bytes\":{},\"swappiness_hint\":{}}},\"worker\":{},\"errors\":{},\"processes\":{}}}",
         json::quote(env!("CARGO_PKG_VERSION")),
         std::process::id(),
         t.sampled_at,
@@ -949,8 +1059,7 @@ pub fn telemetry_json(
         s.memory_full_bp,
         s.io_full_bp,
         zram,
-        t.ksm_profit,
-        t.ksm_shared,
+        dedup_adapter::ksm_json(&t.ksm),
         d.grow_swap_bytes,
         d.shrink_allowed,
         d.background_high_percent,
@@ -974,7 +1083,7 @@ pub fn telemetry_json(
         json::quote(&z.name),z.logical_size,z.logical_used,z.resident,z.memory_limit,json::quote(&z.algorithm)
     )).collect::<Vec<_>>().join(",");
     status.push_str(&format!(
-        ",\"memory_pressure\":{},\"io_congested\":{},\"instance\":{{\"pid\":{},\"start_ticks\":{},\"boot_id\":{}}},\"paging\":{{\"rates_available\":{},\"zram_rates_available\":{},\"disk_swap_estimate_available\":{},\"zswap_enabled\":{},\"sample_interval_ms\":{},\"file_refault_bytes_per_sec\":{},\"anon_refault_bytes_per_sec\":{},\"direct_scan_bytes_per_sec\":{},\"zram_read_bytes_per_sec\":{},\"estimated_disk_swap_in_bytes_per_sec\":{}}},\"memory_usage\":{{\"free_bytes\":{},\"file_cache_bytes\":{},\"anonymous_bytes\":{}}},\"controls\":{{\"swappiness_requested\":{},\"swappiness_actual\":{},\"swappiness_reason\":{},\"page_cluster_actual\":{},\"protection_budget_bytes\":{},\"protected_critical_scopes\":{},\"protection_complete\":{}}},\"managed\":{{\"background_groups\":{},\"populated_background_groups\":{},\"background_tasks\":{},\"background_memory_bytes\":{},\"reclaim_candidates\":{},\"coverage_complete\":{}}},\"zram_devices\":[{}]}}",
+        ",\"memory_pressure\":{},\"io_congested\":{},\"instance\":{{\"pid\":{},\"start_ticks\":{},\"boot_id\":{}}},\"paging\":{{\"rates_available\":{},\"zram_rates_available\":{},\"disk_swap_estimate_available\":{},\"zswap_enabled\":{},\"sample_interval_ms\":{},\"file_refault_bytes_per_sec\":{},\"anon_refault_bytes_per_sec\":{},\"direct_scan_bytes_per_sec\":{},\"zram_read_bytes_per_sec\":{},\"estimated_disk_swap_in_bytes_per_sec\":{}}},\"memory_usage\":{{\"free_bytes\":{},\"file_cache_bytes\":{},\"anonymous_bytes\":{}}},\"controls\":{{\"swappiness_requested\":{},\"swappiness_actual\":{},\"swappiness_reason\":{},\"page_cluster_actual\":{},\"protection_budget_bytes\":{},\"protected_critical_scopes\":{},\"protection_complete\":{},\"protection_sampled_at_unix\":{},\"protection_errors\":{}}},\"managed\":{{\"background_groups\":{},\"populated_background_groups\":{},\"background_tasks\":{},\"background_memory_bytes\":{},\"reclaim_candidates\":{},\"coverage_complete\":{}}},\"zram_devices\":[{}]}}",
         json::quote(d.pressure.as_str()),d.io_congested,std::process::id(),process_start_ticks(),json::quote(boot_id.trim()),
         p.rates_available,p.zram_rates_available,p.disk_swap_estimate_available,
         p.zswap_enabled.map(|b| b.to_string()).unwrap_or_else(|| "null".into()),p.sample_interval_ms,
@@ -984,13 +1093,14 @@ pub fn telemetry_json(
         optional_number(p.zram_rates_available.then_some(p.zram_read_bytes_per_sec)),
         optional_number(p.disk_swap_estimate_available.then_some(p.estimated_disk_swap_in_bytes_per_sec)),
         t.free_bytes,t.file_cache_bytes,t.anon_bytes,
-        optional_number(a.swappiness_requested.map(u64::from)),optional_number(observed_number("/proc/sys/vm/swappiness")),json::quote(a.swappiness_reason),optional_number(observed_number("/proc/sys/vm/page-cluster")),a.protection_budget_bytes,a.protected_critical_scopes,a.protection_complete,
+        optional_number(a.swappiness_requested.map(u64::from)),optional_number(observed_number("/proc/sys/vm/swappiness")),json::quote(a.swappiness_reason),optional_number(observed_number("/proc/sys/vm/page-cluster")),a.protection_budget_bytes,a.protected_critical_scopes,a.protection_complete,optional_number(a.protection_sampled_at),json::strings(&a.protection_errors),
         m.background_groups,m.populated_background_groups,m.background_tasks,m.background_memory_bytes,m.reclaim_candidates,m.coverage_complete,device_details
     ));
     status.pop();
     status.push_str(&format!(
-        ",\"background\":{}}}",
-        background::json(&t.background)
+        ",\"background\":{},\"dedup\":{}}}",
+        background::json(&t.background),
+        dedup_adapter::report_json(&t.dedup)
     ));
     status
 }
@@ -1081,6 +1191,8 @@ struct Controls {
     pub protection_budget_bytes: u64,
     pub protected_critical_scopes: usize,
     pub protection_complete: bool,
+    pub protection_errors: Vec<String>,
+    pub protection_sampled_at: Option<u64>,
 }
 impl Controls {
     fn new() -> Self {
@@ -1091,6 +1203,8 @@ impl Controls {
             protection_budget_bytes: 0,
             protected_critical_scopes: 0,
             protection_complete: false,
+            protection_errors: Vec::new(),
+            protection_sampled_at: None,
         }
     }
     fn prune_stale(&mut self) -> bool {
@@ -1098,6 +1212,16 @@ impl Controls {
         self.entries
             .retain(|_, entry| !stale_control(entry, fs::metadata(&entry.path)));
         self.entries.len() != before
+    }
+    fn protection_reset_pending(&self) -> bool {
+        self.entries.values().any(|entry| {
+            entry.last != "0"
+                && entry.original == "0"
+                && entry.path.ends_with("memory.low")
+                && fs::metadata(&entry.path)
+                    .is_ok_and(|meta| meta.dev() == entry.dev && meta.ino() == entry.ino)
+                && read(&entry.path).is_ok_and(|value| value.trim() == "0")
+        })
     }
     fn save(&self) -> Result<()> {
         let text = self
@@ -1151,7 +1275,9 @@ impl Controls {
                 // scope joins our dedicated aggregate slice. zmem owns that
                 // slice's policy limit while running. An explicit `max` there
                 // is a temporary reset; finite external limits stay protected.
-                if managed_background_high_reset(path, &entry.original, &old) {
+                if managed_background_high_reset(path, &entry.original, &old)
+                    || owned_protection_default_reset(path, &entry.original, &old)
+                {
                     managed_reset = true;
                 } else {
                     return Err(
@@ -1227,8 +1353,14 @@ impl Controls {
         observed?;
         if managed_reset {
             println!(
-                "{{\"event\":\"managed_background_limit_reapplied\",\"path\":{},\"observed\":\"max\",\"applied\":{}}}",
+                "{{\"event\":{},\"path\":{},\"observed\":{},\"applied\":{}}}",
+                json::quote(if path.ends_with("memory.low") {
+                    "protection_default_reapplied"
+                } else {
+                    "managed_background_limit_reapplied"
+                }),
                 json::quote(&path.to_string_lossy()),
+                json::quote(&old),
                 json::quote(&value)
             );
         }
@@ -1320,7 +1452,8 @@ fn can_manage_protection(
             entry.pending_previous.as_deref(),
             current,
             page_size,
-        )? {
+        )? && !owned_protection_default_reset(path, &entry.original, current)
+        {
             return Err(format!("external control change preserved: {}", path.display()).into());
         }
         return Ok(true);
@@ -1344,6 +1477,12 @@ fn valid_control(path: &Path) -> bool {
     }
     raw == "/proc/sys/vm/swappiness"
         || raw == "/proc/sys/vm/page-cluster"
+        || matches!(
+            raw.as_ref(),
+            "/sys/kernel/mm/ksm/run"
+                | "/sys/kernel/mm/ksm/pages_to_scan"
+                | "/sys/kernel/mm/ksm/sleep_millisecs"
+        )
         || (path.starts_with(CGROOT)
             && matches!(
                 path.file_name().and_then(|s| s.to_str()),
@@ -1355,6 +1494,15 @@ fn managed_background_high_reset(path: &Path, original: &str, observed: &str) ->
         return false;
     }
     is_managed_background_control(path)
+}
+fn owned_protection_default_reset(path: &Path, original: &str, observed: &str) -> bool {
+    // systemd reapplies configured defaults on daemon-reload. A previously
+    // owned zero baseline is still managed while protect_sessions is enabled;
+    // finite nonzero external settings always retain priority.
+    original == "0"
+        && observed == "0"
+        && path.starts_with(CGROOT)
+        && path.file_name().and_then(|value| value.to_str()) == Some("memory.low")
 }
 fn is_managed_background_control(path: &Path) -> bool {
     let Some(relative) = path.strip_prefix(CGROOT).ok().and_then(|p| p.to_str()) else {
@@ -1394,6 +1542,9 @@ fn canonical_control_value(path: &Path, value: &str, page_size: u64) -> Result<S
         return Ok("max".into());
     }
     let bytes = value.parse::<u64>()?;
+    if path == Path::new(dedup::Knob::Run.path()) && bytes > 1 {
+        return Err("KSM run must be 0 or 1; unmerge is never a managed operation".into());
+    }
     if memory {
         if page_size == 0 || !page_size.is_power_of_two() {
             return Err("invalid control page size".into());
@@ -1450,6 +1601,16 @@ fn restore_controls_from(path: &Path) -> Result<()> {
 pub fn restore_control_snapshot(text: &str) -> Result<()> {
     let page_size = control_page_size()?;
     let mut errors = Vec::new();
+    // Pause only an owned run switch, before restoring any KSM scan knobs.
+    // The original state must be paused: zmem never acquires a running KSM.
+    // An external run value or identity change preserves all KSM controls.
+    let mut restore_ksm = match pause_ksm_for_restore(text, page_size) {
+        Ok(owned) => owned,
+        Err(error) => {
+            errors.push(error.to_string());
+            false
+        }
+    };
     for line in text.lines().rev() {
         let v: Vec<_> = line.split('\t').collect();
         if v.len() != 5 && v.len() != 6 {
@@ -1459,7 +1620,38 @@ pub fn restore_control_snapshot(text: &str) -> Result<()> {
         if !valid_control(p) {
             continue;
         }
-        let Ok(m) = fs::metadata(p) else { continue };
+        if p.starts_with(dedup::KSM_ROOT) {
+            if !restore_ksm {
+                continue;
+            }
+            match read(dedup::Knob::Run.path()) {
+                Ok(value) if value.trim() == "0" => {}
+                Ok(_) => {
+                    restore_ksm = false;
+                    continue;
+                }
+                Err(error) => {
+                    errors.push(error.to_string());
+                    restore_ksm = false;
+                    continue;
+                }
+            }
+            // Already restored first, before the rate controls.
+            if p == Path::new(dedup::Knob::Run.path()) {
+                continue;
+            }
+        }
+        let m = match fs::metadata(p) {
+            Ok(meta) => meta,
+            Err(error)
+                if p.starts_with(dedup::KSM_ROOT)
+                    && error.kind() != std::io::ErrorKind::NotFound =>
+            {
+                errors.push(error.to_string());
+                continue;
+            }
+            Err(_) => continue,
+        };
         if m.dev().to_string() != v[3] || m.ino().to_string() != v[4] {
             continue;
         }
@@ -1486,6 +1678,59 @@ pub fn restore_control_snapshot(text: &str) -> Result<()> {
     } else {
         Err(errors.join("; ").into())
     }
+}
+fn pause_ksm_for_restore(text: &str, page_size: u64) -> Result<bool> {
+    if !text
+        .lines()
+        .any(|line| line.split('\t').next() == Some(dedup::Knob::Run.path()))
+    {
+        return Ok(false);
+    }
+    let snapshot = dedup::read_ksm(Path::new(dedup::KSM_ROOT));
+    if snapshot.available == Some(false) || matches!(snapshot.advisor, dedup::Advisor::External(_))
+    {
+        return Ok(false);
+    }
+    if !snapshot.complete || matches!(snapshot.advisor, dedup::Advisor::Unreadable) {
+        return Err("KSM restoration observation incomplete; retaining recovery journal".into());
+    }
+    let path = Path::new(dedup::Knob::Run.path());
+    for line in text.lines() {
+        let values: Vec<_> = line.split('\t').collect();
+        if ![5, 6].contains(&values.len()) || values[0] != dedup::Knob::Run.path() {
+            continue;
+        }
+        if values[1] != "0" {
+            return Ok(false);
+        }
+        let meta = match fs::metadata(path) {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        if meta.dev().to_string() != values[3] || meta.ino().to_string() != values[4] {
+            return Ok(false);
+        }
+        let actual = read(path)?;
+        let pending = values.get(5).copied().filter(|value| !value.is_empty());
+        // A previous restore may have paused successfully and then stopped
+        // before restoring the remaining knobs. The original run=0 is an
+        // idempotent completed pause; each knob still needs its own ownership
+        // check below. Never resume scanning during recovery.
+        if actual.trim() != "0"
+            && !owned_control_value(path, values[2], pending, actual.trim(), page_size)?
+        {
+            return Ok(false);
+        }
+        if actual.trim() == "1" {
+            write_control(path, "0", false)?;
+        }
+        if read(path)?.trim() != "0" {
+            return Err("KSM pause readback changed during restoration".into());
+        }
+        return Ok(true);
+    }
+    Ok(false)
 }
 fn protect_sessions(c: &mut Controls, total: u64, errors: &mut Vec<String>) {
     c.protection_complete = false;
@@ -1859,17 +2104,24 @@ fn apply_controls(
 ) -> Vec<PathBuf> {
     // Terminal scopes and user managers disappear during normal session churn.
     // Keep recovery proportional to live controls rather than daemon uptime.
+    let protect = protect || (settings.protect_sessions && c.protection_reset_pending());
     if protect && c.prune_stale() {
         if let Err(e) = c.save() {
             errors.push(e.to_string());
         }
     }
     if protect && settings.protect_sessions {
-        protect_sessions(c, t.sample.total_bytes, errors);
+        let mut protection_errors = Vec::new();
+        protect_sessions(c, t.sample.total_bytes, &mut protection_errors);
+        c.protection_errors = protection_errors;
+        c.protection_sampled_at = Some(now());
+        errors.extend(c.protection_errors.iter().cloned());
     }
     t.applied.protection_budget_bytes = c.protection_budget_bytes;
     t.applied.protected_critical_scopes = c.protected_critical_scopes;
     t.applied.protection_complete = c.protection_complete;
+    t.applied.protection_errors = c.protection_errors.clone();
+    t.applied.protection_sampled_at = c.protection_sampled_at;
     if settings.manage_swappiness {
         let preference = c.swappiness_governor.observe(
             swappiness_preference(settings, t, d),
@@ -1899,6 +2151,10 @@ pub fn ensure_zram(settings: &Settings, total: u64) -> Result<()> {
     if !settings.zram_enabled || swaps()?.iter().any(|s| s.path.starts_with("/dev/zram")) {
         return Ok(());
     }
+    let lock = SwapMutationLock::acquire()?;
+    if swaps()?.iter().any(|s| s.path.starts_with("/dev/zram")) {
+        return Ok(());
+    }
     command("modprobe", &["zram", "num_devices=1"], 10)?;
     let base = Path::new("/sys/block/zram0");
     if number(base.join("disksize")) != 0 {
@@ -1914,14 +2170,24 @@ pub fn ensure_zram(settings: &Settings, total: u64) -> Result<()> {
     let size = (total / 100 * settings.zram_percent).min(32 * GIB) / 4096 * 4096;
     fs::write(base.join("disksize"), size.to_string())?;
     command("mkswap", &["/dev/zram0"], 10)?;
-    host_swap_command(Path::new("/dev/zram0"), SwapAction::Activate(100), 10)?;
+    host_swap_command(
+        Path::new("/dev/zram0"),
+        SwapAction::Activate(100),
+        10,
+        &lock,
+    )?;
     Ok(())
 }
 fn valid_swap_file(path: &Path) -> Result<()> {
     let m = fs::symlink_metadata(path)?;
-    if !m.is_file() || m.file_type().is_symlink() || m.uid() != 0 || m.mode() & 0o077 != 0 {
+    if !m.is_file()
+        || m.file_type().is_symlink()
+        || m.uid() != 0
+        || m.mode() & 0o077 != 0
+        || m.nlink() != 1
+    {
         return Err(format!(
-            "swap file must be root-owned regular mode 0600: {}",
+            "swap file must be root-owned private regular file with one link: {}",
             path.display()
         )
         .into());
@@ -1976,6 +2242,7 @@ fn prepare_swap_dir(settings: &Settings) -> Result<()> {
     }
     let marker = settings.swap_dir.join(".owner");
     if marker.exists() {
+        valid_swap_file(&marker)?;
         if read(&marker)?.trim() != "zmem-swap-v1" {
             return Err("swap directory belongs to another manager".into());
         }
@@ -1988,6 +2255,7 @@ fn prepare_swap_dir(settings: &Settings) -> Result<()> {
     Ok(())
 }
 pub fn ensure_disk_swaps(settings: &Settings) -> Result<Vec<String>> {
+    let lock = SwapMutationLock::acquire()?;
     let mut errors = Vec::new();
     prepare_swap_dir(settings)?;
     let active = swaps()?;
@@ -2011,7 +2279,7 @@ pub fn ensure_disk_swaps(settings: &Settings) -> Result<Vec<String>> {
                 valid_swap_file(p)?;
                 secure_dir(p.parent().unwrap(), false)?;
                 let priority = prio.parse::<i32>()?.clamp(-1, 32767);
-                activate_existing_swap(p, priority)?;
+                activate_existing_swap(p, priority, &lock)?;
                 Ok(())
             })();
             if let Err(e) = result {
@@ -2026,7 +2294,7 @@ pub fn ensure_disk_swaps(settings: &Settings) -> Result<Vec<String>> {
         }
         let result = (|| -> Result<()> {
             valid_swap_file(&p)?;
-            activate_existing_swap(&p, 10)?;
+            activate_existing_swap(&p, 10, &lock)?;
             Ok(())
         })();
         if let Err(e) = result {
@@ -2103,6 +2371,7 @@ fn can_remove_failed_swap(
 
 pub fn grow_swap(settings: &Settings, requested: u64) -> Result<()> {
     root_required()?;
+    let lock = SwapMutationLock::acquire()?;
     prepare_swap_dir(settings)?;
     let active = swaps()?;
     let owned = owned_swap_allocations(&settings.swap_dir)?;
@@ -2156,7 +2425,15 @@ pub fn grow_swap(settings: &Settings, requested: u64) -> Result<()> {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
         valid_swap_file(&path)?;
         activation_file = Some(swap_target(&path)?);
-        host_swap_command(&path, SwapAction::Activate(10), 10)?;
+        host_swap_pinned(
+            &path,
+            SwapAction::Activate(10),
+            10,
+            &lock,
+            activation_file
+                .as_ref()
+                .ok_or("missing activation identity")?,
+        )?;
         Ok(())
     })();
     if let (Err(error), Some(pinned)) = (&result, activation_file.as_ref()) {
@@ -2181,50 +2458,187 @@ pub fn grow_swap(settings: &Settings, requested: u64) -> Result<()> {
     }
     result
 }
-fn shrink_candidate(settings: &Settings, t: &Telemetry) -> Option<String> {
-    t.swaps
-        .iter()
-        .filter(|s| {
-            s.kind == "file"
-                && s.used == 0
-                && Path::new(&s.path).parent() == Some(settings.swap_dir.as_path())
-                && owned_name(Path::new(&s.path))
-                && t.sample.swap_free_bytes.saturating_sub(s.size)
-                    >= settings.policy.grow_free_bytes
-        })
-        .max_by_key(|s| s.size)
-        .map(|s| s.path.clone())
-}
-pub fn shrink_swap(settings: &Settings, path: &Path) -> Result<()> {
-    root_required()?;
+fn validate_owned_swap_path(settings: &Settings, path: &Path) -> Result<()> {
     if path.parent() != Some(settings.swap_dir.as_path()) || !owned_name(path) {
         return Err("refusing to remove an unowned swap file".into());
     }
-    prepare_swap_dir(settings)?;
+    Ok(())
+}
+
+fn log_swap_deferred(path: &Path, reason: &str, errno: Option<i32>) {
+    println!(
+        "{{\"event\":\"swap_maintenance_deferred\",\"path\":{},\"reason\":{},\"swapoff_errno\":{}}}",
+        json::quote(&path.to_string_lossy()),
+        json::quote(reason),
+        errno.map_or_else(|| "null".into(), |n| n.to_string()),
+    );
+}
+
+fn unlink_owned_swap(
+    path: &Path,
+    pinned: &File,
+    lock: &SwapMutationLock,
+    errno: Option<i32>,
+    mode: swap_lifecycle::Mode,
+) -> Result<()> {
+    let meta = pinned.metadata()?;
+    let identity = SwapIdentity::of(&meta);
     valid_swap_file(path)?;
+    verify_swap_identity(&swap_target(path)?, identity)?;
+    if swaps()?.iter().any(|s| Path::new(&s.path) == path) {
+        log_swap_deferred(path, "still_listed", errno);
+        return Ok(());
+    }
+    SwapMutationLock::validate(&lock.0)?;
+    // Linux vfs_unlink rechecks IS_SWAPFILE under inode_lock and returns EPERM
+    // for active/draining swaps; swapon holds that lock and rejects unlinked
+    // dentries. Ordinary unlink is the final atomic gate, never a truncation,
+    // hole-punch, reflink, rename-to-trash or overwrite of swap contents.
+    // In cleanup mode no swapoff is issued and no pages are migrated. An orphan
+    // active file is therefore preserved by the kernel, regardless of its name.
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if matches!(error.raw_os_error(), Some(1 | 16)) => {
+            log_swap_deferred(path, "kernel_preserved_active_or_busy_file", errno);
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    }
+    println!(
+        "{{\"event\":\"swap_file_removed\",\"mode\":{},\"path\":{},\"file_bytes\":{},\"allocated_bytes\":{},\"swapoff_errno\":{},\"inactivity_verified_by\":\"kernel_guarded_unlink\"}}",
+        json::quote(mode.as_str()),
+        json::quote(&path.to_string_lossy()),
+        meta.len(),
+        meta.blocks().saturating_mul(512),
+        errno.map_or_else(|| "null".into(), |n| n.to_string()),
+    );
+    Ok(())
+}
+
+fn retire_owned_swap(
+    settings: &Settings,
+    path: &Path,
+    expected: Option<SwapIdentity>,
+    lock: &SwapMutationLock,
+) -> Result<()> {
+    validate_owned_swap_path(settings, path)?;
+    valid_swap_file(path)?;
+    // Hold this inode through the syscall, fresh inventory and final unlink;
+    // reject observed replacements under the shared mutation lock.
+    let pinned = swap_target(path)?;
+    if let Some(expected) = expected {
+        verify_swap_identity(&pinned, expected)?;
+    }
+    let meta = pinned.metadata()?;
+    let bytes = meta.len().max(meta.blocks().saturating_mul(512));
     let t = Sampler::new().sample()?;
     let reserve = settings
         .policy
         .effective_reserve_bytes(t.sample.total_bytes);
-    let s = t
-        .swaps
+    if t.swaps
         .iter()
-        .find(|s| Path::new(&s.path) == path)
-        .ok_or("swap file is not active")?;
-    if s.used != 0
-        || t.sample.available_bytes < reserve.saturating_mul(2)
-        || t.sample.memory_some_bp > 200
-        || t.sample.memory_full_bp > 100
-        || t.sample.swap_free_bytes.saturating_sub(s.size) < settings.policy.grow_free_bytes
+        .any(|swap| Path::new(&swap.path) == path && swap.used != 0)
     {
-        return Err("swap shrink deferred until unused with ample memory and swap".into());
+        log_swap_deferred(path, "in_use", None);
+        return Ok(());
     }
-    host_swap_command(path, SwapAction::Deactivate, 20)?;
-    if swaps()?.iter().any(|s| Path::new(&s.path) == path) {
-        return Err("swap file remains active; preserving it".into());
+    if let Some(reason) =
+        swap_lifecycle::defer_reason(t.sample, reserve, settings.policy.grow_free_bytes, bytes)
+    {
+        log_swap_deferred(path, reason, None);
+        return Ok(());
     }
-    fs::remove_file(path)?;
-    Ok(())
+    let result = host_swap_pinned(path, SwapAction::Deactivate, 20, lock, &pinned);
+    let errno = match &result {
+        Ok(()) => Some(0),
+        Err(error) => swap_syscall_errno(error.as_ref()),
+    };
+    if !swap_lifecycle::cleanup_may_be_attempted(errno) {
+        log_swap_deferred(path, "swapoff_unconfirmed_or_failed", errno);
+        return result;
+    }
+    // EINVAL is not evidence of inactivity: a concurrent swapoff may have
+    // removed its entry from swap_active_head while still draining pages.
+    unlink_owned_swap(path, &pinned, lock, errno, swap_lifecycle::Mode::Shrink)
+}
+
+pub fn shrink_swap(settings: &Settings, path: &Path) -> Result<()> {
+    root_required()?;
+    validate_owned_swap_path(settings, path)?;
+    let lock = SwapMutationLock::acquire()?;
+    prepare_swap_dir(settings)?;
+    retire_owned_swap(settings, path, None, &lock)
+}
+
+pub fn maintain_swap(settings: &Settings, round: u64, mode: &str) -> Result<()> {
+    root_required()?;
+    let mode = swap_lifecycle::Mode::parse(mode).ok_or("invalid swap maintenance mode")?;
+    let lock = SwapMutationLock::acquire()?;
+    prepare_swap_dir(settings)?;
+    let t = Sampler::new().sample()?;
+    let reserve = settings
+        .policy
+        .effective_reserve_bytes(t.sample.total_bytes);
+    if let Some(reason) =
+        swap_lifecycle::cleanup_defer_reason(t.sample, reserve, settings.policy.critical_full_bp)
+    {
+        println!(
+            "{{\"event\":\"swap_maintenance_deferred\",\"reason\":{}}}",
+            json::quote(reason)
+        );
+        return Ok(());
+    }
+    let mut candidates = Vec::new();
+    for (index, entry) in fs::read_dir(&settings.swap_dir)?.enumerate() {
+        if index >= swap_lifecycle::SCAN_LIMIT {
+            return Err(
+                "owned swap directory exceeds maintenance scan limit; files preserved".into(),
+            );
+        }
+        let path = entry?.path();
+        if !owned_name(&path) {
+            continue;
+        }
+        valid_swap_file(&path)?;
+        let meta = fs::symlink_metadata(&path)?;
+        let bytes = meta.len().max(meta.blocks().saturating_mul(512));
+        let active = t.swaps.iter().find(|swap| Path::new(&swap.path) == path);
+        let listed = active.is_some();
+        match mode {
+            swap_lifecycle::Mode::Cleanup if listed => continue,
+            swap_lifecycle::Mode::Shrink
+                if active.is_some_and(|swap| swap.used != 0)
+                    || swap_lifecycle::defer_reason(
+                        t.sample,
+                        reserve,
+                        settings.policy.grow_free_bytes,
+                        bytes,
+                    )
+                    .is_some() =>
+            {
+                continue;
+            }
+            _ => {}
+        }
+        candidates.push((listed, path, SwapIdentity::of(&meta)));
+    }
+    // Unknown/incomplete files participate even when /proc/swaps contains only
+    // an old namespace alias. Never infer identity from a basename or size.
+    // Rotate after every attempt so one deferred file cannot starve the rest.
+    candidates.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+    let Some(index) = swap_lifecycle::candidate_index(round, candidates.len()) else {
+        println!("{{\"event\":\"swap_maintenance_idle\",\"eligible_files\":0}}");
+        return Ok(());
+    };
+    let (_, path, identity) = &candidates[index];
+    match mode {
+        swap_lifecycle::Mode::Shrink => retire_owned_swap(settings, path, Some(*identity), &lock),
+        swap_lifecycle::Mode::Cleanup => {
+            let pinned = swap_target(path)?;
+            verify_swap_identity(&pinned, *identity)?;
+            unlink_owned_swap(path, &pinned, &lock, None, mode)
+        }
+    }
 }
 pub fn reclaim(path: &Path, bytes: u64) -> Result<()> {
     root_required()?;
@@ -2501,7 +2915,9 @@ pub fn daemon(settings: Settings, config: PathBuf, observe: bool, once: bool) ->
     let mut sampler = Sampler::new();
     let mut policy = Policy::new(settings.policy);
     let mut controls = Controls::new();
+    let mut dedup_state = dedup_adapter::State::new(settings.interval_ms);
     let mut reclaim_tracker = reclaim_policy::Tracker::new();
+    let mut swap_maintenance = swap_lifecycle::Schedule::default();
     let reclaim_page_size = control_page_size()?;
     let mut worker: Option<Worker> = None;
     let mut loop_index = 0u64;
@@ -2549,6 +2965,11 @@ pub fn daemon(settings: Settings, config: PathBuf, observe: bool, once: bool) ->
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("zmem sample failed: {e}");
+                    if !observe {
+                        if let Err(error) = dedup_state.pause_on_sample_error(&mut controls) {
+                            eprintln!("cannot pause owned KSM after failed sample: {error}");
+                        }
+                    }
                     if once {
                         return Err(e);
                     }
@@ -2572,6 +2993,15 @@ pub fn daemon(settings: Settings, config: PathBuf, observe: bool, once: bool) ->
             } else {
                 background::preview(&settings, &mut t, &d, &mut controls.background)
             };
+            dedup_state.update(
+                &settings,
+                &mut t,
+                &d,
+                &mut controls,
+                start.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+                observe,
+                &mut errors,
+            );
             let selection = select_reclaim_candidate(
                 &mut reclaim_tracker,
                 bg.into_iter()
@@ -2591,21 +3021,44 @@ pub fn daemon(settings: Settings, config: PathBuf, observe: bool, once: bool) ->
             // arbitration. With no global reclaim request this is zero.
             t.managed.reclaim_candidates = selection.eligible;
             if !observe && worker.is_none() {
+                let maintenance_mode = if d.shrink_allowed {
+                    Some(swap_lifecycle::Mode::Shrink)
+                } else if d.pressure != zmem::Pressure::Critical
+                    && !d.io_congested
+                    && swap_lifecycle::cleanup_defer_reason(
+                        t.sample,
+                        settings
+                            .policy
+                            .effective_reserve_bytes(t.sample.total_bytes),
+                        settings.policy.critical_full_bp,
+                    )
+                    .is_none()
+                {
+                    Some(swap_lifecycle::Mode::Cleanup)
+                } else {
+                    None
+                };
                 let action = if d.grow_swap_bytes > 0 {
                     Some(("grow", vec![d.grow_swap_bytes.to_string()], None))
-                } else if d.shrink_allowed {
-                    shrink_candidate(&settings, &t).map(|p| ("shrink", vec![p], None))
+                } else if let Some(target) = selection.first {
+                    Some((
+                        "reclaim",
+                        vec![
+                            target.path.to_string_lossy().into(),
+                            target.request.bytes.to_string(),
+                        ],
+                        Some(target),
+                    ))
                 } else {
-                    selection.first.map(|target| {
-                        (
-                            "reclaim",
-                            vec![
-                                target.path.to_string_lossy().into(),
-                                target.request.bytes.to_string(),
-                            ],
-                            Some(target),
-                        )
-                    })
+                    swap_maintenance
+                        .next(maintenance_mode, elapsed)
+                        .map(|(mode, round)| {
+                            (
+                                "maintain",
+                                vec![round.to_string(), mode.as_str().into()],
+                                None,
+                            )
+                        })
                 };
                 if let Some((kind, args, mut pending_reclaim)) = action {
                     match worker_start(kind, &args, &config, pending_reclaim.as_ref()) {
@@ -2720,7 +3173,7 @@ pub fn doctor_json() -> (String, bool) {
     )
 }
 
-pub fn run_workload(class: &str, max_mib: Option<u64>, args: &[String]) -> Result<()> {
+pub fn run_workload(class: &str, max_mib: Option<u64>, dedup: bool, args: &[String]) -> Result<()> {
     if args.is_empty() {
         return Err("run requires a command after --".into());
     }
@@ -2730,9 +3183,13 @@ pub fn run_workload(class: &str, max_mib: Option<u64>, args: &[String]) -> Resul
     if max_mib.is_some() && class != "disposable" {
         return Err("--max-memory applies to explicit disposable workloads".into());
     }
+    if dedup && class == "interactive" {
+        return Err("--dedup is available only for trusted background/disposable workloads".into());
+    }
     let t = Sampler::new().sample()?;
     let total = t.sample.total_bytes;
-    let id = format!("zmem-{}-{}", class, std::process::id());
+    let marker = if dedup { "-dedup" } else { "" };
+    let id = format!("zmem-{}{}-{}", class, marker, std::process::id());
     let mut cmd = Command::new("/usr/bin/systemd-run");
     if root_required().is_err() {
         cmd.arg("--user");
@@ -2762,7 +3219,12 @@ pub fn run_workload(class: &str, max_mib: Option<u64>, args: &[String]) -> Resul
         }
     }
     use std::os::unix::process::CommandExt;
-    Err(cmd.arg("--").args(args).exec().into())
+    cmd.arg("--");
+    if dedup {
+        cmd.arg(std::env::current_exe()?)
+            .args(["__dedup-exec", "--"]);
+    }
+    Err(cmd.args(args).exec().into())
 }
 
 #[cfg(test)]
@@ -2936,6 +3398,7 @@ mod tests {
             Path::new("/var/lib/zmem/swap/zmem-000001.swap"),
             SwapAction::Activate(10),
             identity,
+            9,
         )
         .unwrap();
         assert_eq!(
@@ -2955,6 +3418,7 @@ mod tests {
                 "12",
                 "34",
                 "0",
+                "9",
             ]
             .map(str::to_owned)
         );
@@ -2963,15 +3427,80 @@ mod tests {
             Path::new("/var/lib/zmem/swap/zmem-000001.swap"),
             SwapAction::Deactivate,
             identity,
+            9,
         )
         .unwrap();
         assert_eq!(off[8], "__swap-off");
         assert_eq!(off[10], "-1");
+        assert_eq!(off[14], "9");
+        assert!(
+            swap_helper_args(
+                Path::new("/usr/local/bin/zmem"),
+                Path::new("/var/lib/zmem/swap/zmem-000001.swap"),
+                SwapAction::Deactivate,
+                identity,
+                2,
+            )
+            .is_err()
+        );
         assert_eq!(swap_flags(-1).unwrap(), 0);
         assert_eq!(swap_flags(0).unwrap(), 0x8000);
         assert_eq!(swap_flags(32767).unwrap(), 0xffff);
         assert!(swap_flags(-2).is_err());
         assert!(swap_flags(32768).is_err());
+    }
+
+    #[test]
+    fn swap_mutation_lock_survives_parent_close_until_execd_child_exits() {
+        let fixture = JournalFixture::new("swap-mutation-lock");
+        let path = fixture.0.join("lock");
+        let open = || {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap()
+        };
+        File::create(&path).unwrap();
+        let lock = SwapMutationLock::lock(open()).unwrap();
+        assert!(SwapMutationLock::lock(open()).is_err());
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "printf ready; IFS= read -r release"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut ready = [0u8; 5];
+        child.stdout.take().unwrap().read_exact(&mut ready).unwrap();
+        assert_eq!(&ready, b"ready");
+        // Simulate a worker exiting after a timed-out syscall helper. Closing
+        // its own descriptor must not permit a new mutation while the helper
+        // still owns the inherited open file description.
+        drop(lock);
+        let still_locked = SwapMutationLock::lock(open()).is_err();
+        child.stdin.take().unwrap().write_all(b"release\n").unwrap();
+        assert!(child.wait().unwrap().success());
+        assert!(still_locked);
+        let _after_child_exit = SwapMutationLock::lock(open()).unwrap();
+    }
+
+    #[test]
+    fn maintenance_accepts_only_exact_owned_directory_and_slot_names() {
+        let settings = Settings::default();
+        assert!(
+            validate_owned_swap_path(&settings, Path::new("/var/lib/zmem/swap/zmem-000001.swap"),)
+                .is_ok()
+        );
+        for path in [
+            "/swap/zmem-000001.swap",
+            "/var/lib/zmem/swap/subdir/zmem-000001.swap",
+            "/var/lib/zmem/swap/zmem-1.swap",
+            "/var/lib/zmem/swap/zmem-000001.swap.bak",
+            "/var/lib/zmem/swap/.owner",
+            "/var/lib/zmem/swap/zmem-１２３４５６.swap",
+        ] {
+            assert!(validate_owned_swap_path(&settings, Path::new(path)).is_err());
+        }
     }
 
     #[test]
@@ -3184,7 +3713,8 @@ mod tests {
             assert!(!can_manage_protection(None, path, value, 10, 20, 4096).unwrap());
         }
         assert!(can_manage_protection(Some(&entry), path, "8192", 10, 20, 4096).unwrap());
-        for external in ["0", "4096", "16384", "max"] {
+        assert!(can_manage_protection(Some(&entry), path, "0", 10, 20, 4096).unwrap());
+        for external in ["4096", "16384", "max"] {
             assert!(can_manage_protection(Some(&entry), path, external, 10, 20, 4096).is_err());
         }
         assert!(!can_manage_protection(Some(&entry), path, "8192", 10, 21, 4096).unwrap());
@@ -3681,6 +4211,79 @@ mod tests {
             "120"
         );
         assert!(canonical_control_value(high, "123", 0).is_err());
+        let ksm_run = Path::new(dedup::Knob::Run.path());
+        assert_eq!(canonical_control_value(ksm_run, "0", 4096).unwrap(), "0");
+        assert_eq!(canonical_control_value(ksm_run, "1", 4096).unwrap(), "1");
+        assert!(canonical_control_value(ksm_run, "2", 4096).is_err());
+    }
+
+    #[test]
+    fn protection_default_reset_is_reapplied_only_for_an_owned_zero_baseline() {
+        let path = Path::new("/sys/fs/cgroup/user.slice/memory.low");
+        let entry = Control {
+            path: path.into(),
+            original: "0".into(),
+            last: "4096".into(),
+            dev: 7,
+            ino: 9,
+            pending_previous: None,
+        };
+        assert!(can_manage_protection(Some(&entry), path, "0", 7, 9, 4096).unwrap());
+        assert!(can_manage_protection(Some(&entry), path, "8192", 7, 9, 4096).is_err());
+        let external_baseline = Control {
+            original: "1024".into(),
+            ..entry.clone()
+        };
+        assert!(can_manage_protection(Some(&external_baseline), path, "0", 7, 9, 4096).is_err());
+        assert!(!owned_protection_default_reset(
+            Path::new("/proc/sys/vm/swappiness"),
+            "0",
+            "0"
+        ));
+        assert!(!owned_protection_default_reset(
+            Path::new("/sys/fs/cgroup/user.slice/memory.high"),
+            "0",
+            "0"
+        ));
+    }
+
+    #[test]
+    fn status_retains_protection_failures_between_reconciliation_cycles() {
+        let mut t = Telemetry::default();
+        t.applied.protection_sampled_at = Some(123);
+        t.applied.protection_errors = vec!["protection ancestor unreadable".into()];
+        let d = Policy::new(zmem::Config::default()).observe(t.sample, 0);
+        let value =
+            crate::json::parse(&telemetry_json(&t, &d, "balanced", None, &[], false)).unwrap();
+        let errors = value
+            .get("errors")
+            .and_then(crate::json::Value::as_array)
+            .unwrap();
+        assert!(
+            errors
+                .iter()
+                .any(|value| value.as_str() == Some("protection ancestor unreadable"))
+        );
+        assert_eq!(
+            value
+                .get("controls")
+                .unwrap()
+                .get("protection_sampled_at_unix")
+                .unwrap()
+                .as_u64(),
+            Some(123)
+        );
+        assert_eq!(
+            value.get("ksm").unwrap().get("general_profit_bytes"),
+            Some(&crate::json::Value::Null)
+        );
+        t.ksm.general_profit_bytes = Some(-16384);
+        let value =
+            crate::json::parse(&telemetry_json(&t, &d, "balanced", None, &[], false)).unwrap();
+        assert_eq!(
+            value.get("ksm").unwrap().get("general_profit_bytes"),
+            Some(&crate::json::Value::Number("-16384".into()))
+        );
     }
     #[test]
     fn legacy_journal_rounding_is_owned_but_external_changes_are_not() {

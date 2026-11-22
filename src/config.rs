@@ -14,6 +14,7 @@ pub struct Settings {
     pub zram_percent: u64,
     pub protect_sessions: bool,
     pub manage_swappiness: bool,
+    pub dedup_enabled: bool,
     pub profile: String,
 }
 
@@ -27,6 +28,7 @@ impl Default for Settings {
             zram_percent: 50,
             protect_sessions: true,
             manage_swappiness: true,
+            dedup_enabled: true,
             profile: "balanced".into(),
         }
     }
@@ -83,6 +85,7 @@ impl Settings {
                 "zram_enabled" => s.zram_enabled = boolean()?,
                 "protect_sessions" => s.protect_sessions = boolean()?,
                 "manage_swappiness" => s.manage_swappiness = boolean()?,
+                "dedup_enabled" => s.dedup_enabled = boolean()?,
                 "swap_dir" => s.swap_dir = PathBuf::from(v),
                 "profile" => s.profile = v.to_owned(),
                 _ => return Err(format!("unknown config key: {k}").into()),
@@ -137,6 +140,7 @@ mod tests {
             "swap_dir=/var/lib/zmem/../x",
             "reserve_mib=18446744073709551615",
             "zram_enabled=yes",
+            "dedup_enabled=yes",
             "profile=unknown",
             "interval_ms=2000\ninterval_ms=3000",
         ] {
@@ -148,5 +152,11 @@ mod tests {
         let s = Settings::parse("swap_chunk_mib=1024\n# notes\nprofile=ai").unwrap();
         assert_eq!(s.policy.chunk_bytes, 1024 * MIB);
         assert_eq!(s.profile, "ai");
+        assert!(s.dedup_enabled);
+        assert!(
+            !Settings::parse("dedup_enabled=false")
+                .unwrap()
+                .dedup_enabled
+        );
     }
 }

@@ -3,6 +3,8 @@ mod budget;
 #[cfg(target_os = "linux")]
 mod config;
 #[cfg(target_os = "linux")]
+mod dedup;
+#[cfg(target_os = "linux")]
 mod install;
 #[cfg(target_os = "linux")]
 mod json;
@@ -19,7 +21,7 @@ Usage:
   zmem schema
   zmem daemon [--observe] [--config PATH]
   zmem once [--apply] [--config PATH]
-  zmem run --class background|interactive|disposable [--max-memory MiB] -- COMMAND...
+  zmem run --class background|interactive|disposable [--max-memory MiB] [--dedup] -- COMMAND...
   sudo zmem install --replace [--config PATH]
   sudo zmem rollback
 
@@ -30,6 +32,8 @@ Status uses the active daemon's report; --processes adds a fresh process list.
 do not retain the daemon's policy history, and cannot measure rates from one sample.
 The no_std library is portable. Live system management requires Linux + systemd + cgroup v2.
 Background tasks are throttled; disposable tasks explicitly opt into a hard memory limit.
+--dedup opts trusted background/disposable commands into automatic KSM scanning.
+KSM matching is global; only choose commands whose data may share this trust domain.
 ";
 
 #[cfg(target_os = "linux")]
@@ -45,6 +49,12 @@ fn execute() -> Result<()> {
         return Ok(());
     }
     let action = args.remove(0);
+    if action == "__dedup-exec" {
+        if args.first().map(String::as_str) != Some("--") {
+            return Err("dedup exec requires -- before the command".into());
+        }
+        return dedup::exec_registered(&args[1..]).map_err(Into::into);
+    }
     let mut configuration = PathBuf::from("/etc/zmem/zmem.conf");
     let mut custom_config = false;
     let boundary = args.iter().position(|v| v == "--").unwrap_or(args.len());
@@ -126,7 +136,7 @@ fn execute() -> Result<()> {
                 return Err("schema accepts no arguments".into());
             }
             println!(
-                "{{\"schema\":\"zmem.commands.v1\",\"version\":{},\"transport\":\"cli\",\"read_only\":[{{\"name\":\"status\",\"argv\":[\"zmem\",\"status\",\"--json\"],\"description\":\"Current memory, PSI, swap, zram and policy; counts in bytes, PSI in basis points\"}},{{\"name\":\"processes\",\"argv\":[\"zmem\",\"status\",\"--json\",\"--processes\"]}},{{\"name\":\"plan\",\"argv\":[\"zmem\",\"plan\",\"--json\"]}},{{\"name\":\"doctor\",\"argv\":[\"zmem\",\"doctor\",\"--json\"]}}],\"mutations\":[{{\"name\":\"run\",\"root\":false,\"classes\":[\"background\",\"interactive\",\"disposable\"],\"hard_limit_opt_in_class\":\"disposable\"}},{{\"name\":\"once\",\"root\":true,\"required_flag\":\"--apply\"}},{{\"name\":\"install\",\"root\":true,\"replacement_flag\":\"--replace\"}},{{\"name\":\"rollback\",\"root\":true}}],\"status_semantics\":{{\"default\":\"identity-verified daemon report when available\",\"live_flag\":\"--live\",\"live_and_plan\":\"independent preview; no daemon hysteresis history\",\"rate_unavailable\":\"null, never inferred zero\",\"controls\":\"requested and actual readback are separate\",\"coverage\":\"background pacing covers registered zmem groups only\"}},\"automatic_process_kill\":false,\"automatic_global_cache_drop\":false}}",
+                "{{\"schema\":\"zmem.commands.v1\",\"version\":{},\"transport\":\"cli\",\"read_only\":[{{\"name\":\"status\",\"argv\":[\"zmem\",\"status\",\"--json\"],\"description\":\"Current memory, PSI, swap, zram and policy; counts in bytes, PSI in basis points\"}},{{\"name\":\"processes\",\"argv\":[\"zmem\",\"status\",\"--json\",\"--processes\"]}},{{\"name\":\"plan\",\"argv\":[\"zmem\",\"plan\",\"--json\"]}},{{\"name\":\"doctor\",\"argv\":[\"zmem\",\"doctor\",\"--json\"]}}],\"mutations\":[{{\"name\":\"run\",\"root\":false,\"classes\":[\"background\",\"interactive\",\"disposable\"],\"hard_limit_opt_in_class\":\"disposable\",\"dedup_opt_in_flag\":\"--dedup\",\"dedup_classes\":[\"background\",\"disposable\"],\"dedup_matching_domain\":\"system_wide\"}},{{\"name\":\"once\",\"root\":true,\"required_flag\":\"--apply\"}},{{\"name\":\"install\",\"root\":true,\"replacement_flag\":\"--replace\"}},{{\"name\":\"rollback\",\"root\":true}}],\"status_semantics\":{{\"default\":\"identity-verified daemon report when available\",\"live_flag\":\"--live\",\"live_and_plan\":\"independent preview; no daemon hysteresis history\",\"rate_unavailable\":\"null, never inferred zero\",\"controls\":\"requested and actual readback are separate\",\"coverage\":\"background pacing covers registered zmem groups only\"}},\"automatic_process_kill\":false,\"automatic_global_cache_drop\":false}}",
                 json::quote(env!("CARGO_PKG_VERSION"))
             );
             Ok(())
@@ -150,9 +160,11 @@ fn execute() -> Result<()> {
                 .ok_or("run requires -- before the command")?;
             let mut class = "background";
             let mut max = None;
+            let mut dedup = false;
             let mut i = 0;
             while i < split {
                 match args[i].as_str() {
+                    "--dedup" => dedup = true,
                     "--class" => {
                         i += 1;
                         class = args
@@ -173,7 +185,7 @@ fn execute() -> Result<()> {
                 }
                 i += 1;
             }
-            linux::run_workload(class, max, &args[split + 1..])
+            linux::run_workload(class, max, dedup, &args[split + 1..])
         }
         "__grow" => {
             if args.len() != 1 {
@@ -186,6 +198,12 @@ fn execute() -> Result<()> {
                 return Err("invalid shrink request".into());
             }
             linux::shrink_swap(&settings, Path::new(&args[0]))
+        }
+        "__maintain" => {
+            if args.len() != 2 {
+                return Err("invalid maintenance request".into());
+            }
+            linux::maintain_swap(&settings, args[0].parse()?, &args[1])
         }
         "__reclaim" => {
             if args.len() != 2 {
@@ -834,6 +852,29 @@ mod status {
                     scaled(number(device, &["resident_bytes"]), GIB, "GiB")
                 );
             }
+        }
+        if let Some(dedup) = field(report, &["dedup"]) {
+            let _ = writeln!(
+                out,
+                "Dedup             {} · {} registered tasks · {}",
+                text(dedup, &["state"]).unwrap_or("not reported"),
+                number(dedup, &["registered_tasks"])
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "not reported".into()),
+                text(dedup, &["reason"]).unwrap_or("not reported")
+            );
+            let profit = match field(report, &["ksm", "general_profit_bytes"]) {
+                Some(Value::Number(value)) => value
+                    .parse::<i64>()
+                    .ok()
+                    .map(|value| format!("{:.2} MiB", value as f64 / MIB as f64)),
+                _ => None,
+            };
+            let _ = writeln!(
+                out,
+                "KSM profit        {} · system-wide estimate; matching crosses process/user boundaries",
+                profit.unwrap_or_else(|| "not reported".into())
+            );
         }
         if cached {
             let _ = writeln!(

@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.3.0 — 2026-11-22
+
+- Schedule automatic maintenance of owned Swap files, at most one candidate per attempt and at least 60 seconds between attempts. Give growth and managed-background reclaim priority.
+- Clean retained inactive allocations without draining Swap. Recheck file identity and inventory, use ordinary kernel-guarded unlink, and preserve active or draining files even when their canonical pathname is absent from `/proc/swaps`.
+- Retire eligible owned Swap only after sustained healthy headroom, 600 seconds by default, with immediate whole-file RAM and remaining-Swap checks. Skip known used files and never infer inactivity from a missing alias or `EINVAL` alone.
+- Serialize zmem Swap allocation, activation, retirement and removal with a shared lock inherited through the actual lifetime of allocation and syscall helpers, including helpers that outlive a timeout.
+- Add explicit `zmem run --class background|disposable --dedup -- COMMAND` registration, with process KSM enable/readback before executing the command and an explicit error when registration is unsupported or denied.
+- Manage compatible, previously stopped KSM controls for registered tasks by default. Pause owned scanning under CPU, memory or IO pressure and require 30 seconds of stable observations to resume; use 128-page batches and a 100 ms sleep rather than claiming a hard CPU quota.
+- Preserve externally running KSM, external advisors and changed controls. Pause with `run=0`; never force unmerging with `run=2` or `PR_SET_MEMORY_MERGE=0`, and never apply filesystem deduplication to active Swap.
+- Refresh bounded registered-task discovery every 10 seconds and report observed/target scan state, task age, coverage, ownership, write results and signed system-wide KSM profit. Keep missing metrics `null` and identify KSM's system-wide matching domain.
+- Repair interactive protection after systemd reload resets an owned `memory.low` ancestor or service to its original zero baseline. Reapply only for the same cgroup identity and preserve nonzero external values or baselines; use `protect_sessions=false` for a persistent opt-out.
+- Retain the last protection check's errors and `protection_sampled_at_unix` between checks so an ordinary sampling cycle cannot hide an incomplete protection operation.
+- Document the new lifecycle and dedup mechanisms separately from the 0.2.0 host observations; no performance improvement is inferred from the earlier version's measurements.
+
 ## 0.2.0
 
 - Separate memory pressure from IO congestion and select swappiness from measured file-page refaults, disk-swap reads and useful zram headroom, with hysteresis and bounded changes.

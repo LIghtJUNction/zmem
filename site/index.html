@@ -3,10 +3,10 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="zmem — Project Z 的 Linux 内存与 Swap 管理器。观察压力，保留响应空间，让后台任务有序推进。">
+  <meta name="description" content="zmem — Project Z 的 Linux 内存与 Swap 管理器。按压力分配后台预算，自动维护自有 Swap，为明确注册的任务管理 KSM 扫描。">
   <meta name="theme-color" content="#141210">
   <meta property="og:title" content="zmem — Memory, with room to work.">
-  <meta property="og:description" content="A small Linux memory and swap controller from Project Z. Pressure-aware policy. Local observability. Structured control.">
+  <meta property="og:description" content="A Linux memory and swap controller from Project Z. Managed background budgets, bounded swap maintenance and explicit KSM registration.">
   <meta property="og:type" content="website">
   <link rel="canonical" href="https://lightjunction.github.io/zmem/">
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
@@ -32,9 +32,9 @@
   <main id="main">
     <section class="hero wrap" aria-labelledby="hero-title">
       <div class="hero-copy">
-        <a class="release-label" href="https://github.com/LIghtJUNction/zmem/releases"><span class="release-dot" aria-hidden="true"></span><span data-version>v0.2.0</span><span class="release-divider">/</span><span data-i18n="hero.label">LINUX 内存控制</span><span aria-hidden="true">↗</span></a>
+        <a class="release-label" href="https://github.com/LIghtJUNction/zmem/releases"><span class="release-dot" aria-hidden="true"></span><span data-version>v0.3.0</span><span class="release-divider">/</span><span data-i18n="hero.label">LINUX 内存控制</span><span aria-hidden="true">↗</span></a>
         <h1 id="hero-title"><span data-i18n="hero.title1">给任务留空间。</span><span class="accent" data-i18n="hero.title2">给系统留余量。</span></h1>
-        <p class="hero-intro" data-i18n="hero.intro">zmem 观察内存等待与换页活动，统一管理压缩交换、磁盘 Swap 和纳管后台预算。前台保护与后台控制，都有可检查的状态。</p>
+        <p class="hero-intro" data-i18n="hero.intro">zmem 按压力分配后台预算，让磁盘 Swap 有序扩容与回收，为明确注册的任务管理内存去重。控制是否生效、覆盖了谁，都能查看。</p>
         <div class="hero-actions"><a class="button primary" href="#install"><span data-i18n="hero.cta">开始使用</span><span aria-hidden="true">↗</span></a><a class="text-link" href="#playground"><span data-i18n="hero.demo">看看策略如何工作</span><span aria-hidden="true">↓</span></a></div>
         <p class="hero-note" data-i18n="hero.note">Rust 编写 · 本地运行 · 为人和 AI 提供同一份事实</p>
       </div>
@@ -58,29 +58,31 @@
       <div class="principle-list">
         <article><span class="step-index">01</span><div><h3 data-i18n="principles.observe.title">观察实际阻塞</h3><p data-i18n="principles.observe.body">分别报告内存压力与 IO 拥塞。结合可用内存、PSI 等待时间、文件页回收后的再次访问与交换活动，判断下一步动作的代价。</p></div><span class="step-detail">observe</span></article>
         <article><span class="step-index">02</span><div><h3 data-i18n="principles.act.title">小步调节，保留任务</h3><p data-i18n="principles.act.body">按观测到的换页代价调节交换偏好，为纳管后台设置预算。沿实际 cgroup 层级保护识别出的桌面、终端与远程连接。</p></div><span class="step-detail">adapt</span></article>
-        <article><span class="step-index">03</span><div><h3 data-i18n="principles.recover.title">稳定后逐步恢复</h3><p data-i18n="principles.recover.body">迟滞约束反复调节，无进展的回收进入退避。缩容只选择空闲的自有 Swap 文件，守护程序重启保留活动交换区。</p></div><span class="step-detail">recover</span></article>
+        <article><span class="step-index">03</span><div><h3 data-i18n="principles.recover.title">稳定后逐步恢复</h3><p data-i18n="principles.recover.body">无进展的回收进入退避，遗留 Swap 文件逐个检查。活动 Swap 缩容等待持续恢复，并预留整文件迁移余量；去重扫描也等待稳定后恢复。</p></div><span class="step-detail">recover</span></article>
       </div>
     </section>
     <section class="playground-section" id="playground" aria-labelledby="playground-title">
       <div class="wrap playground">
-        <div class="playground-copy"><p class="eyebrow" data-i18n="demo.label">02 / 交互演示</p><h2 id="playground-title" data-i18n="demo.title">拖动压力，观察决策。</h2><p data-i18n="demo.intro">用一台模拟的 16 GiB 机器，看看内存余量与等待时间如何影响策略。</p><span class="simulation-tag" data-i18n="demo.tag">简化策略内核预览 · 合成输入 · 不访问设备</span><p class="demo-footnote" data-i18n="demo.footnote">演示只说明单次决策，阈值经过简化。设备成本适配、纳管覆盖、冷却与迟滞由真实守护程序处理；这里不预测本机效果。</p></div>
+        <div class="playground-copy"><p class="eyebrow" data-i18n="demo.label">02 / 交互演示</p><h2 id="playground-title" data-i18n="demo.title">拖动压力，观察决策。</h2><p data-i18n="demo.intro">用一台模拟的 16 GiB 机器，看看内存余量与等待时间如何影响策略。</p><span class="simulation-tag" data-i18n="demo.tag">简化策略内核预览 · 合成输入 · 不访问设备</span><p class="demo-footnote" data-i18n="demo.footnote">阈值与高水位数值仅作示意，不是当前实际配额。演示未实现设备成本适配、动态预算、迟滞、Swap 维护或 KSM 控制，也不预测本机效果。</p></div>
         <div class="simulator">
           <div class="scenario-tabs" aria-label="Simulation scenarios"><button type="button" class="active" data-scenario="idle" data-i18n="demo.idle" aria-pressed="true">日常工作</button><button type="button" data-scenario="build" data-i18n="demo.build" aria-pressed="false">并行构建</button><button type="button" data-scenario="model" data-i18n="demo.model" aria-pressed="false">模型加载</button></div>
           <div class="range-control"><label for="available"><span data-i18n="demo.available">可用内存</span><output id="available-value" for="available">5.8 GiB</output></label><input id="available" type="range" min="0.2" max="12" step="0.1" value="5.8"><div class="range-bounds"><span>0.2 GiB</span><span>12 GiB</span></div></div>
           <div class="range-control"><label for="pressure"><span data-i18n="demo.pressure">内存阻塞时间 · full PSI</span><output id="pressure-value" for="pressure">0.1%</output></label><input id="pressure" type="range" min="0" max="50" step="0.1" value="0.1"><div class="range-bounds"><span>0%</span><span>50%</span></div></div>
-          <div class="decision" aria-live="polite" aria-atomic="true"><div class="decision-top"><span data-i18n="demo.decision">策略</span><strong id="decision-state">healthy</strong></div><h3 id="decision-title">保留余量，保持运行。</h3><p id="decision-body">当前压力低。观察系统，不主动回收后台内存。</p><div class="decision-bottom"><span data-i18n="demo.budget">后台内存高水位</span><strong id="decision-budget">—</strong></div></div>
+          <div class="decision" aria-live="polite" aria-atomic="true"><div class="decision-top"><span data-i18n="demo.decision">策略</span><strong id="decision-state">healthy</strong></div><h3 id="decision-title">保留余量，保持运行。</h3><p id="decision-body">当前压力低。观察系统，不主动回收后台内存。</p><div class="decision-bottom"><span data-i18n="demo.budget">预览中的示意高水位</span><strong id="decision-budget">—</strong></div></div>
         </div>
       </div>
     </section>
     <section class="capabilities wrap section" id="capabilities" aria-labelledby="capabilities-title">
       <div class="section-heading"><p class="eyebrow" data-i18n="capabilities.label">03 / 明确的职责</p><h2 id="capabilities-title" data-i18n="capabilities.title">把管理能力收在一个地方。</h2></div>
       <div class="capability-grid">
-        <article><h3 data-i18n="capabilities.swap.title">接管交换空间</h3><p data-i18n="capabilities.swap.body">采用已启用的 zram 与磁盘 Swap。按需扩容，保留磁盘安全余量，在下次开机初始化 zram。</p><span>zram / swap lifecycle</span></article>
+        <article><h3 data-i18n="capabilities.swap.title">管理交换空间的生命周期</h3><p data-i18n="capabilities.swap.body">按配置批量扩容，逐个清理遗留的自有文件。活动 Swap 缩容须通过持续健康与整文件余量检查；内核保护仍在使用的文件。</p><span>zram / swap lifecycle</span></article>
         <article><h3 data-i18n="capabilities.work.title">给后台明确的预算</h3><p data-i18n="capabilities.work.body">用 zmem run 从启动时纳管任务。跳过空后台与无合适文件页的回收，无进展时退避。显式可丢弃任务可设置硬限额。</p><span>cgroup v2 / memory.high</span></article>
         <article><h3 data-i18n="capabilities.explain.title">每一步都能解释</h3><p data-i18n="capabilities.explain.body">status 保留守护程序状态，按需补充当前进程列表。--live 与 plan 明确显示独立、未应用的预览，JSON 同时提供来源与覆盖范围。</p><span>status / plan / schema</span></article>
-        <article><h3 data-i18n="capabilities.small.title">管理器也要克制</h3><p data-i18n="capabilities.small.body">无分配策略内核、无第三方 Rust 依赖。常驻路径保持有界，按需查询进程详情。</p><span>Rust / no_std policy</span></article>
+        <article><h3 data-i18n="capabilities.dedup.title">为明确注册的任务去重</h3><p data-i18n="capabilities.dedup.body">用 --dedup 注册可信的后台或可丢弃任务。CPU、内存或 IO 繁忙时暂停扫描，保留已合并的页；KSM 匹配域跨进程与用户。</p><span>KSM / explicit registration</span></article>
       </div>
-      <p class="scope-note" data-i18n="capabilities.scope">内核负责实际分页和最终 OOM 处理。zmem 管理提前调节与任务预算；应用级检查点、通用内存去重与能耗优化仍属于后续研究方向。</p>
+      <p class="scope-note" data-i18n="capabilities.bounds">维护尝试至少间隔 60 秒，一次最多一个文件；活动缩容默认等待连续健康 600 秒。去重扫描等待稳定 30 秒后恢复，采用 128 页批次与 100 ms 休眠，不代表硬性 CPU 配额。</p>
+      <p class="scope-note" data-i18n="capabilities.scope">内核负责分页、页面合并与最终 OOM。zmem 不自动注册全部应用，不强制拆散已合并页，也不对活动 Swap 做文件系统去重。应用检查点、计算进度恢复与能耗优化仍是后续方向。</p>
+      <a class="text-link" href="https://github.com/LIghtJUNction/zmem/blob/main/docs/swap-lifecycle-and-dedup.md"><span data-i18n="capabilities.guide">Swap 生命周期与去重边界</span><span aria-hidden="true">↗</span></a>
     </section>
     <section class="install-section wrap section" id="install" aria-labelledby="install-title">
       <div class="section-heading"><p class="eyebrow" data-i18n="install.label">04 / 开始使用</p><h2 id="install-title" data-i18n="install.title">先读状态，再让 zmem 接管。</h2><p data-i18n="install.intro">适用于支持 PSI、cgroup v2 与 systemd 的 Linux。安装管理服务需要 root 权限。</p></div>
@@ -89,15 +91,17 @@
 zmem doctor
 zmem status --json
 sudo "$(command -v zmem)" install --replace</code></pre><p><a href="https://github.com/LIghtJUNction/zmem/releases" data-i18n="install.binary">下载 Linux x86_64 / ARM64 预编译包 ↗</a></p></div>
-        <div class="install-notes"><h3 data-i18n="install.handoff.title">原位接管，保留恢复入口。</h3><p data-i18n="install.handoff.body">安装器保存原服务与配置，采用现有活动 Swap，并切换内存管理服务。升级或停止 zmem 会保留活动交换区。</p><p class="inline-command"><code>sudo zmem rollback</code><span data-i18n="install.rollback">恢复先前管理配置</span></p><a class="text-link" href="https://github.com/LIghtJUNction/zmem#installation"><span data-i18n="install.guide">完整安装与恢复说明</span><span aria-hidden="true">↗</span></a></div>
+        <div class="install-notes"><h3 data-i18n="install.handoff.title">原位接管，保留恢复入口。</h3><p data-i18n="install.handoff.body">安装器保存服务与配置，并保留活动 Swap。安装失败恢复本次操作前的状态；显式 rollback 使用首次安装基线。升级或停止 zmem 不主动排空交换区。</p><p class="inline-command"><code>sudo zmem rollback</code><span data-i18n="install.rollback">恢复首次安装的管理基线</span></p><a class="text-link" href="https://github.com/LIghtJUNction/zmem#installation"><span data-i18n="install.guide">完整安装与恢复说明</span><span aria-hidden="true">↗</span></a></div>
       </div>
-      <div class="command-table" role="region" aria-label="Command reference" tabindex="0"><table><thead><tr><th data-i18n="commands.command">命令</th><th data-i18n="commands.purpose">用途</th></tr></thead><tbody><tr><td><code>zmem status --json --processes</code></td><td data-i18n="commands.status">读取守护程序报告并补充当前进程</td></tr><tr><td><code>zmem status --live --json</code></td><td data-i18n="commands.live">独立取样预览，速率尚未预热</td></tr><tr><td><code>zmem plan --json</code></td><td data-i18n="commands.plan">查看独立策略预览，不执行动作</td></tr><tr><td><code>zmem daemon --observe</code></td><td data-i18n="commands.observe">持续观察并输出未应用的决策</td></tr><tr><td><code>zmem run --class background -- cargo build</code></td><td data-i18n="commands.run">用后台预算运行构建</td></tr><tr><td><code>zmem schema</code></td><td data-i18n="commands.schema">读取面向 AI 的命令契约</td></tr></tbody></table></div>
-      <p class="scope-note" data-i18n="commands.coverage">报告分别展示内存压力、IO 拥塞、请求值与实际内核控制值，以及纳管任务与保护范围。无可用守护程序报告时会标明独立快照；空后台、缺失观测和未完成操作均保留说明。</p>
+      <div class="command-table" role="region" aria-label="Command reference" tabindex="0"><table><thead><tr><th data-i18n="commands.command">命令</th><th data-i18n="commands.purpose">用途</th></tr></thead><tbody><tr><td><code>zmem status --json --processes</code></td><td data-i18n="commands.status">读取守护程序报告并补充当前进程</td></tr><tr><td><code>zmem status --live --json</code></td><td data-i18n="commands.live">独立取样预览，速率尚未预热</td></tr><tr><td><code>zmem plan --json</code></td><td data-i18n="commands.plan">查看独立策略预览，不执行动作</td></tr><tr><td><code>zmem daemon --observe</code></td><td data-i18n="commands.observe">持续观察并输出未应用的决策</td></tr><tr><td><code>zmem run --class background -- cargo build</code></td><td data-i18n="commands.run">用后台预算运行构建</td></tr><tr><td><code>zmem run --class background --dedup -- YOUR_TRUSTED_COMMAND</code></td><td data-i18n="commands.dedup">为可信任务注册内存去重</td></tr><tr><td><code>zmem schema</code></td><td data-i18n="commands.schema">读取面向 AI 的命令契约</td></tr></tbody></table></div>
+      <p class="scope-note" data-i18n="commands.coverage">报告区分计划与实际控制值，保留最近一次前台保护检查的时间与错误。去重任务每 10 秒有界扫描一次，报告覆盖、KSM 状态与系统级收益估计；缺失指标保留 null。无守护程序报告时明确返回独立快照。</p>
       <p class="scope-note" data-i18n="commands.measure">源码中的 measure_responsiveness.py 可记录自然负载下的调度延迟、PSI、换页和后台活动。可选桌面探针测量进程与 IPC 往返时间。前后观测用于比较同类工作窗口，因果判断需要控制工作负载与缓存条件。</p>
+      <p class="scope-note" data-i18n="commands.evidence">0.2.0 的实机记录只适用于其中标明的二进制和观测窗口，不能证明 0.3.0 新增的清理与去重效果。当前文档说明机制，不承诺内存节省量、桌面延迟或彻底消除卡顿。</p>
+      <a class="text-link" href="https://github.com/LIghtJUNction/zmem/blob/main/docs/acceptance-0.2.0.md"><span data-i18n="commands.acceptance">查看 0.2.0 验收记录与测量限制</span><span aria-hidden="true">↗</span></a>
     </section>
     <section class="ecosystem wrap" aria-labelledby="ecosystem-title"><div><p class="eyebrow">PROJECT Z</p><h2 id="ecosystem-title" data-i18n="ecosystem.title">与你的工作环境一起成长。</h2><p data-i18n="ecosystem.body">zmem 是独立工具，也为 oh-my-ztty 提供默认内存管理方案。源码、策略和发布流程都可以检查。</p></div><div class="ecosystem-links"><a href="https://github.com/LIghtJUNction/project-z">Project Z <span aria-hidden="true">↗</span></a><a href="https://lightjunction.github.io/oh-my-ztty/">oh-my-ztty <span aria-hidden="true">↗</span></a><a href="https://docs.rs/zmem-manager">Rust API <span aria-hidden="true">↗</span></a></div></section>
   </main>
-  <footer class="wrap site-footer"><a class="brand" href="#">zmem<span>_</span></a><span data-i18n="footer.note">Memory, with room to work.</span><a href="https://github.com/LIghtJUNction/zmem/blob/main/LICENSE">MIT</a><a href="https://github.com/LIghtJUNction/zmem/releases" data-version>v0.2.0</a></footer>
+  <footer class="wrap site-footer"><a class="brand" href="#">zmem<span>_</span></a><span data-i18n="footer.note">Memory, with room to work.</span><a href="https://github.com/LIghtJUNction/zmem/blob/main/LICENSE">MIT</a><a href="https://github.com/LIghtJUNction/zmem/releases" data-version>v0.3.0</a></footer>
   <p class="sr-only" id="action-status" role="status" aria-live="polite"></p>
 </body>
 </html>

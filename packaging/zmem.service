@@ -2,7 +2,7 @@
 Description=zmem adaptive memory and swap manager
 Documentation=https://lightjunction.github.io/zmem/
 After=local-fs.target systemd-modules-load.service
-RequiresMountsFor=/var/lib/zmem /var/lib/swapspace
+RequiresMountsFor=/var/lib/zmem
 Before=multi-user.target
 
 [Service]
@@ -31,7 +31,7 @@ TasksMax=32
 ProtectHome=true
 PrivateTmp=true
 ProtectSystem=strict
-ReadWritePaths=/proc/sys/vm /sys/fs/cgroup /sys/block /sys/devices -/sys/class/zram-control /var/lib/zmem -/var/lib/swapspace /run/zmem
+ReadWritePaths=/proc/sys/vm /sys/fs/cgroup /sys/block /sys/devices -/sys/class/zram-control -/sys/kernel/mm/ksm /var/lib/zmem -/var/lib/swapspace /run/zmem
 # Swap children enter PID 1's mount namespace and root: SYS_CHROOT permits
 # setns/chroot; SYS_PTRACE permits opening PID 1's procfs namespace/root links.
 CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_RESOURCE CAP_DAC_OVERRIDE CAP_SYS_MODULE CAP_SYS_CHROOT CAP_SYS_PTRACE
