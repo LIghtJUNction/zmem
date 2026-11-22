@@ -2,7 +2,7 @@
 
 **Memory, with room to work.** A small Linux memory and Swap controller from [Project Z](https://github.com/LIghtJUNction/project-z).
 
-[Website](https://lightjunction.github.io/zmem/) · [Releases](https://github.com/LIghtJUNction/zmem/releases) · [crates.io](https://crates.io/crates/zmem-manager) · [Rust API](https://docs.rs/zmem-manager) · [Host acceptance](docs/acceptance-0.1.2.md) · [Latest patch validation](docs/acceptance-pressure-journal.md)
+[Website](https://lightjunction.github.io/zmem/) · [Releases](https://github.com/LIghtJUNction/zmem/releases) · [crates.io](https://crates.io/crates/zmem-manager) · [Rust API](https://docs.rs/zmem-manager) · [Host acceptance](docs/acceptance-0.1.2.md) · [Scheduling validation](docs/acceptance-adaptive-scheduling.md)
 
 zmem observes memory pressure, preserves headroom for interactive work, and gives managed background jobs a bounded memory budget. It brings zram setup, dynamic disk swap, pressure policy and structured inspection into one tool. The Rust implementation has no third-party crate dependencies; the policy library uses `no_std` and makes no heap allocations.
 
@@ -13,9 +13,9 @@ zmem observes memory pressure, preserves headroom for interactive work, and give
 | Pressure policy | Combines available memory, memory/IO PSI and swap activity, with cooldowns and recovery hysteresis. |
 | Swap management | Adopts active swap, grows disk swap within capacity and free-space limits, and shrinks only unused, owned files. |
 | zram lifecycle | Keeps the current active device during migration and prepares zram on subsequent boots. |
-| Workload budgets | Uses cgroup v2 `memory.high` for managed background work and explicit hard limits for disposable jobs. |
-| Interactive protection | Protects desktop sessions and SSH through the system's memory-control hierarchy. |
-| Observability | Exposes memory, swap, compression, process usage and policy reasons through human-readable and JSON commands. |
+| Workload budgets | Adapts managed background `memory.high` to usage and available headroom; disposable jobs retain explicit hard limits. |
+| Interactive protection | Protects desktop sessions, SSH and nested terminal scopes through the system's memory-control hierarchy. |
+| Observability | Exposes memory, swap, compression, managed workload coverage, process usage and policy reasons through human-readable and JSON commands. |
 | Service migration | Saves prior service/configuration state, replaces existing management services, and offers rollback. |
 
 The Linux kernel performs actual paging, compression and final OOM handling. zmem makes earlier policy decisions using those facilities. Automatic application checkpoints, general-purpose memory deduplication and energy optimization are future work. KSM statistics describe what the kernel has already merged; they are not a claim that every application's memory can be deduplicated.
@@ -71,7 +71,18 @@ zmem doctor --json
 zmem schema
 ```
 
-`status` reports measurements. `plan` reports the policy's proposed action and its reason. `schema` describes the command contract for scripts and AI tools. Process details are collected on request rather than on every daemon tick.
+`status` reports measurements and proposed background budgets. `plan` also reports the policy's proposed action and its reason. `schema` describes the command contract for scripts and AI tools. With `--processes`, process rows include `cgroup` and `managed_background` so you can check which work belongs to zmem's managed subtree. Process details are collected on request.
+
+The JSON `background` object separates sampled controls from proposed limits:
+
+| Field | Meaning |
+| --- | --- |
+| `active_groups`, `resident_bytes`, `swap_bytes` | Populated managed groups and sampled managed memory/Swap usage. |
+| `budget_bytes`, `groups[].requested_high_bytes` | Proposed aggregate budget and per-group limits, before page rounding and external-limit checks. `null` requests no temporary restriction. |
+| `groups[].sampled_high_bytes` | Kernel `memory.high` sampled before this cycle's writes; `null` means `max`. |
+| `sample_complete` | If `false`, the daemon retains existing background limits and skips background limit changes and reclaim selection for that sample. |
+
+Unavailable Swap measurements are `null`. Proposed limits do not prove that a write succeeded; a finite external baseline can remain in force even when the proposal is unlimited.
 
 To observe policy over time before applying system changes:
 
@@ -87,7 +98,9 @@ zmem run --class interactive -- YOUR_COMMAND
 zmem run --class disposable --max-memory 2048 -- YOUR_BATCH_COMMAND
 ```
 
-The `--max-memory` value is in MiB. The disposable class is for work that can be restarted if it exceeds its explicit budget. Starting a job inside a cgroup gives the kernel a consistent accounting boundary for the job's allocations.
+Background launches enable `MemoryAccounting=yes` and use the managed parent budget. They no longer receive a permanent per-job `MemoryHigh` of half physical RAM. The `--max-memory` value is in MiB; disposable work keeps its explicit limits and must tolerate termination when it exceeds them.
+
+Classify new jobs at launch. Moving an existing process between cgroups does not transfer its existing memory charges; those remain with the original group ([kernel memory ownership](https://docs.kernel.org/admin-guide/cgroup-v2.html#memory-ownership)). Existing applications outside the managed subtree are therefore outside this background budget.
 
 ## Policy and resource limits
 
@@ -95,7 +108,13 @@ The policy core is a deterministic state machine. It receives a snapshot and a m
 
 Busy Swap/IO takes precedence over the preference for available zram capacity. When the policy reports `swap_or_io_pressure`, the adapter keeps its swappiness hint of 20, including when Swap-in is high but IO PSI is low. Outside that condition, the existing zram and profile preferences apply.
 
+During a pressure episode, the aggregate background budget starts at `U + (available − comfortable reserve)`. `U` is the sum of `memory.current` for populated managed groups, including charged cache. The comfortable reserve is the configured reserve plus one quarter of that reserve, capped at physical RAM. The budget has a shared progress floor of the smaller of 256 MiB and one quarter of RAM, and a ceiling of physical RAM minus the configured reserve; the floor takes precedence if that ceiling is smaller. Each populated group gets a base of at most 64 MiB, then a share of the remainder proportional to current usage. All-zero usage shares equally, and empty groups consume no quota.
+
+Budget reductions apply immediately. Increases require available memory above the comfortable reserve and are limited to the smaller of 256 MiB or one quarter of that spare headroom per sample. This permits gradual recovery even while PSI remains high, including stalls caused by `memory.high` itself. Pressure severity remains strict until the configured consecutive comfortable samples establish stable recovery; the policy's legacy percentage hints no longer set fixed fractions of RAM as byte budgets. Healthy policy removes the temporary background restriction, subject to external limits.
+
 While the daemon is running, zmem owns the aggregate `memory.high` policy of its dedicated `zmem.slice/zmem-background.slice`, including the corresponding slice below a user manager. systemd can reset that slice to `max` when a new scope starts. If the original baseline was unlimited and the cgroup is still the same object, zmem reapplies its policy and records a `managed_background_limit_reapplied` event. A manual `max` write to this dedicated slice is therefore temporary. Finite external limits, finite original baselines, other cgroups and `memory.low` retain the normal external-change protection. Run jobs outside the background class when another tool should own their limits.
+
+Terminal protection follows nested `.slice` hierarchies. Matched terminal scopes share the existing app protection pool; intermediate slices receive the sum of their descendants' shares. Adding terminals does not enlarge that pool, and larger external `memory.low` values remain intact.
 
 Recovery records for vanished or replaced cgroups are removed every 15 sampling cycles, or about 30 seconds with the default interval. Live control baselines and records with uncertain metadata errors remain intact. Reading a recovery journal larger than 1 MiB returns an error and retains the whole file for recovery.
 
@@ -125,7 +144,7 @@ cargo build --release --locked
 
 The public policy types can be embedded without the operating-system adapter. The `zmem` executable targets Linux; the `no_std` policy library does not depend on Linux.
 
-For meaningful host acceptance, exercise a bounded test workload in its own cgroup. Record probe latency, workload progress, PSI, swap IO and daemon RSS/CPU together. Do not infer responsiveness from a lower used-memory number alone. Exact measurements should identify the tested source, kernel, storage and workload.
+For meaningful host acceptance, exercise a bounded test workload in its own cgroup. Record probe latency, workload progress, PSI, swap IO and daemon RSS/CPU together. Do not infer responsiveness from a lower used-memory number alone. Exact measurements should identify the tested source, kernel, storage and workload. See [adaptive scheduling acceptance](docs/acceptance-adaptive-scheduling.md) for this change's measurements and validation limits, and [pressure/journal validation](docs/acceptance-pressure-journal.md) for the preceding fixes.
 
 ## Release a version
 

@@ -146,8 +146,10 @@ pub struct Decision {
     pub grow_swap_bytes: u64,
     /// Permission to consider shrinking; never permission to drain used swap.
     pub shrink_allowed: bool,
-    /// Percentage of physical RAM for the managed background aggregate.
-    /// 100 means the adapter can remove a temporary `memory.high` restriction.
+    /// Severity-based RAM percentage for adapters without workload measurements.
+    /// Demand-aware adapters can derive byte budgets from current usage and
+    /// available headroom. 100 signals stable recovery and permits removing a
+    /// temporary `memory.high` restriction.
     pub background_high_percent: u8,
     /// Maximum proactive reclaim request for explicitly managed background work.
     pub reclaim_bytes: u64,
@@ -162,6 +164,9 @@ pub struct Decision {
 pub struct Policy {
     config: Config,
     pressure: Pressure,
+    // Keep the strictest restriction from this pressure episode until recovery
+    // completes, including while the reported state is Recovering.
+    background_high_percent: u8,
     recovery_count: u32,
     last_observed_secs: Option<u64>,
     last_growth_secs: Option<u64>,
@@ -174,6 +179,7 @@ impl Policy {
         Self {
             config,
             pressure: Pressure::Healthy,
+            background_high_percent: 100,
             recovery_count: 0,
             last_observed_secs: None,
             last_growth_secs: None,
@@ -193,11 +199,13 @@ impl Policy {
     /// Advance the policy by one measurement.
     ///
     /// Use monotonic seconds. If the clock moves backwards, action cooldowns
-    /// restart at the supplied time and shrink eligibility is discarded.
+    /// restart at the supplied time and shrink eligibility is discarded. That
+    /// sample does not advance recovery or relax a background restriction.
     /// Growth/reclaim cooldowns begin when a request is emitted, including when
     /// the adapter later rejects it, so a failure cannot cause a tight retry loop.
     pub fn observe(&mut self, sample: Snapshot, now_secs: u64) -> Decision {
-        if self.last_observed_secs.is_some_and(|last| now_secs < last) {
+        let clock_regressed = self.last_observed_secs.is_some_and(|last| now_secs < last);
+        if clock_regressed {
             self.last_growth_secs = Some(now_secs);
             self.last_reclaim_secs = Some(now_secs);
             self.healthy_since_secs = None;
@@ -215,7 +223,7 @@ impl Policy {
                 pressure: self.pressure,
                 grow_swap_bytes: 0,
                 shrink_allowed: false,
-                background_high_percent: high_percent(self.pressure),
+                background_high_percent: self.background_high_percent,
                 reclaim_bytes: 0,
                 recommended_swappiness: 60,
                 reason: Reason::InvalidSnapshot,
@@ -249,26 +257,31 @@ impl Policy {
         match raw {
             Pressure::Critical => {
                 self.pressure = Pressure::Critical;
+                self.background_high_percent = 50;
                 self.recovery_count = 0;
             }
             Pressure::Elevated => {
-                // Keep a critical restriction until pressure has actually
-                // cleared; one slightly better sample is not recovery.
-                if self.pressure != Pressure::Critical {
-                    self.pressure = Pressure::Elevated;
-                }
+                // An interrupted recovery retains the most restrictive limit
+                // from this episode, just like uninterrupted pressure.
+                self.background_high_percent = self.background_high_percent.min(70);
+                self.pressure = if self.background_high_percent == 50 {
+                    Pressure::Critical
+                } else {
+                    Pressure::Elevated
+                };
                 self.recovery_count = 0;
             }
             Pressure::Healthy => {
                 if self.pressure != Pressure::Healthy {
                     self.pressure = Pressure::Recovering;
-                    self.recovery_count = if comfortable {
+                    self.recovery_count = if comfortable && !clock_regressed {
                         self.recovery_count.saturating_add(1)
                     } else {
                         0
                     };
                     if self.recovery_count >= self.config.recovery_samples.max(1) {
                         self.pressure = Pressure::Healthy;
+                        self.background_high_percent = 100;
                         self.recovery_count = 0;
                     }
                 }
@@ -356,7 +369,7 @@ impl Policy {
             pressure: self.pressure,
             grow_swap_bytes,
             shrink_allowed,
-            background_high_percent: high_percent(self.pressure),
+            background_high_percent: self.background_high_percent,
             reclaim_bytes,
             recommended_swappiness: if io_busy {
                 20
@@ -367,15 +380,6 @@ impl Policy {
             },
             reason,
         }
-    }
-}
-
-const fn high_percent(pressure: Pressure) -> u8 {
-    match pressure {
-        Pressure::Healthy => 100,
-        Pressure::Elevated => 70,
-        Pressure::Critical => 50,
-        Pressure::Recovering => 85,
     }
 }
 

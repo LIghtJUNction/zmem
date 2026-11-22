@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Adapt the aggregate background budget to managed usage and available memory above a comfortable reserve, with a shared progress floor, a reserve ceiling and usage-weighted shares for populated groups. Empty groups consume no quota.
+- Restore background capacity gradually when measured spare headroom allows it, even if PSI remains elevated. Keep pressure severity strict until stable recovery.
+- Enable memory accounting for background launches and remove their permanent per-job half-RAM `MemoryHigh`; explicit disposable limits remain in place.
+- Expose managed background usage, proposed budgets, sampled kernel limits and process cgroup classification. Incomplete background samples retain existing limits and skip background limit changes and reclaim selection.
+- Protect terminal scopes below nested slices and their intermediate ancestors within the existing shared app protection pool, preserving larger external protections.
 - Honor busy Swap/IO policy before zram and profile preferences when selecting swappiness.
 - Periodically remove recovery records for vanished or replaced cgroups while preserving live baselines and uncertain metadata errors.
 - Reject oversized reads before restoring controls, retaining the complete recovery journal on failure.

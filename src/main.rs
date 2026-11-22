@@ -1,4 +1,6 @@
 #[cfg(target_os = "linux")]
+mod budget;
+#[cfg(target_os = "linux")]
 mod config;
 #[cfg(target_os = "linux")]
 mod install;
@@ -111,6 +113,7 @@ fn execute() -> Result<()> {
             }
             let t = linux::Sampler::new().sample()?;
             let d = Policy::new(settings.policy).observe(t.sample, 0);
+            let background = linux::background_plan(&settings, &t, &d, None);
             if flag("--json") {
                 println!(
                     "{}",
@@ -118,6 +121,7 @@ fn execute() -> Result<()> {
                         &t,
                         &d,
                         &settings.profile,
+                        &background,
                         None,
                         &[],
                         flag("--processes")
@@ -150,11 +154,26 @@ fn execute() -> Result<()> {
                     t.sample.io_full_bp as f64 / 100.0
                 );
                 println!(
-                    "Policy   {} · background high {}% · swap growth {} MiB",
+                    "Policy   {} · swap growth {} MiB",
                     d.reason.as_str(),
-                    d.background_high_percent,
                     d.grow_swap_bytes / zmem::MIB
                 );
+                let resident = t
+                    .background
+                    .iter()
+                    .fold(0u64, |n, g| n.saturating_add(g.current_bytes));
+                let active = t.background.iter().filter(|g| g.populated).count();
+                let budget = background.total_bytes.map_or_else(
+                    || "unlimited".to_owned(),
+                    |n| format!("{:.2} GiB", n as f64 / GIB as f64),
+                );
+                println!(
+                    "Managed  {active} active groups · {:.2} GiB resident · proposed budget {budget}",
+                    resident as f64 / GIB as f64
+                );
+                for error in &t.background_errors {
+                    eprintln!("zmem background sample: {error}");
+                }
                 for z in &t.zram {
                     println!(
                         "{}    {:.2} GiB data → {:.2} GiB resident",

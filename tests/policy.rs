@@ -56,22 +56,26 @@ fn recovery_requires_consecutive_good_samples_and_restarts_on_pressure() {
     let mut policy = Policy::new(Config::default());
     let mut bad = healthy();
     bad.available_bytes = 128 * MIB;
-    assert_eq!(policy.observe(bad, 0).pressure, Pressure::Critical);
+    let initial = policy.observe(bad, 0);
+    assert_eq!(initial.pressure, Pressure::Critical);
+    assert_eq!(initial.background_high_percent, 50);
     for second in 1..=3 {
-        assert_eq!(
-            policy.observe(healthy(), second).pressure,
-            Pressure::Recovering
-        );
+        let recovering = policy.observe(healthy(), second);
+        assert_eq!(recovering.pressure, Pressure::Recovering);
+        assert_eq!(recovering.background_high_percent, 50);
     }
     bad.available_bytes = 512 * MIB;
-    assert_eq!(policy.observe(bad, 4).pressure, Pressure::Elevated);
+    let interrupted = policy.observe(bad, 4);
+    assert_eq!(interrupted.pressure, Pressure::Critical);
+    assert_eq!(interrupted.background_high_percent, 50);
     for second in 5..=8 {
-        assert_eq!(
-            policy.observe(healthy(), second).pressure,
-            Pressure::Recovering
-        );
+        let recovering = policy.observe(healthy(), second);
+        assert_eq!(recovering.pressure, Pressure::Recovering);
+        assert_eq!(recovering.background_high_percent, 50);
     }
-    assert_eq!(policy.observe(healthy(), 9).pressure, Pressure::Healthy);
+    let recovered = policy.observe(healthy(), 9);
+    assert_eq!(recovered.pressure, Pressure::Healthy);
+    assert_eq!(recovered.background_high_percent, 100);
 }
 
 #[test]
@@ -84,7 +88,92 @@ fn a_sample_just_above_the_low_memory_boundary_does_not_clear_pressure() {
     for second in 1..=10 {
         let decision = policy.observe(sample, second);
         assert_eq!(decision.pressure, Pressure::Recovering);
+        assert_eq!(decision.background_high_percent, 70);
         assert!(!decision.shrink_allowed);
+    }
+}
+
+#[test]
+fn recovery_retains_each_limit_through_io_stalls_and_releases_after_stability() {
+    for (available, expected_limit) in [(512 * MIB, 70), (128 * MIB, 50)] {
+        let mut policy = Policy::new(Config::default());
+        let mut sample = healthy();
+        sample.available_bytes = available;
+        assert_eq!(
+            policy.observe(sample, 0).background_high_percent,
+            expected_limit
+        );
+        for second in 1..=4 {
+            assert_eq!(
+                policy.observe(healthy(), second).background_high_percent,
+                expected_limit
+            );
+        }
+        let mut io_stall = healthy();
+        io_stall.io_full_bp = 1000;
+        let interrupted = policy.observe(io_stall, 5);
+        assert_eq!(interrupted.pressure, Pressure::Recovering);
+        assert_eq!(interrupted.background_high_percent, expected_limit);
+        assert_eq!(interrupted.reason, Reason::SwapIoPressure);
+        for second in 6..=9 {
+            let recovering = policy.observe(healthy(), second);
+            assert_eq!(recovering.pressure, Pressure::Recovering);
+            assert_eq!(recovering.background_high_percent, expected_limit);
+        }
+        let recovered = policy.observe(healthy(), 10);
+        assert_eq!(recovered.pressure, Pressure::Healthy);
+        assert_eq!(recovered.background_high_percent, 100);
+    }
+}
+
+#[test]
+fn invalid_samples_restart_recovery_without_relaxing_background_limits() {
+    for (available, expected_limit) in [(512 * MIB, 70), (128 * MIB, 50)] {
+        let mut policy = Policy::new(Config::default());
+        let mut sample = healthy();
+        sample.available_bytes = available;
+        policy.observe(sample, 0);
+        for second in 1..=4 {
+            policy.observe(healthy(), second);
+        }
+        let invalid = policy.observe(Snapshot::default(), 5);
+        assert_eq!(invalid.reason, Reason::InvalidSnapshot);
+        assert_eq!(invalid.background_high_percent, expected_limit);
+        for second in 6..=9 {
+            assert_eq!(
+                policy.observe(healthy(), second).background_high_percent,
+                expected_limit
+            );
+        }
+        assert_eq!(policy.observe(healthy(), 10).background_high_percent, 100);
+    }
+}
+
+#[test]
+fn clock_regression_cannot_complete_background_limit_recovery() {
+    for recovery_samples in [1, 5] {
+        let mut policy = Policy::new(Config {
+            recovery_samples,
+            ..Config::default()
+        });
+        let mut sample = healthy();
+        sample.available_bytes = 128 * MIB;
+        policy.observe(sample, 1000);
+        for second in 1..u64::from(recovery_samples) {
+            policy.observe(healthy(), 1000 + second);
+        }
+        let rewound = policy.observe(healthy(), 0);
+        assert_eq!(rewound.pressure, Pressure::Recovering);
+        assert_eq!(rewound.background_high_percent, 50);
+        for second in 1..u64::from(recovery_samples) {
+            assert_eq!(
+                policy.observe(healthy(), second).background_high_percent,
+                50
+            );
+        }
+        let recovered = policy.observe(healthy(), u64::from(recovery_samples));
+        assert_eq!(recovered.pressure, Pressure::Healthy);
+        assert_eq!(recovered.background_high_percent, 100);
     }
 }
 

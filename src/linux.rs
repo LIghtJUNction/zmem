@@ -1,4 +1,9 @@
-use crate::{Result, config::Settings, json};
+use crate::{
+    Result,
+    budget::{BudgetPlan, GroupUsage, plan_background},
+    config::Settings,
+    json,
+};
 use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
@@ -275,6 +280,14 @@ pub struct Zram {
     pub same_pages: u64,
 }
 #[derive(Clone, Debug)]
+pub struct BackgroundGroup {
+    pub path: PathBuf,
+    pub current_bytes: u64,
+    pub swap_bytes: Option<u64>,
+    pub populated: bool,
+    pub high_bytes: Option<u64>,
+}
+#[derive(Clone, Debug)]
 pub struct Telemetry {
     pub sample: Snapshot,
     pub swaps: Vec<Swap>,
@@ -282,6 +295,8 @@ pub struct Telemetry {
     pub ksm_profit: i64,
     pub ksm_shared: u64,
     pub sampled_at: u64,
+    pub background: Vec<BackgroundGroup>,
+    pub background_errors: Vec<String>,
 }
 pub struct Sampler {
     last: Option<(Instant, [u64; 5])>,
@@ -348,6 +363,7 @@ impl Sampler {
                 }
             }
         }
+        let (background, background_errors) = sample_background_groups();
         Ok(Telemetry {
             sample,
             swaps,
@@ -358,19 +374,138 @@ impl Sampler {
                 .unwrap_or(0),
             ksm_shared: number("/sys/kernel/mm/ksm/pages_sharing"),
             sampled_at: now(),
+            background,
+            background_errors,
         })
     }
+}
+
+fn sample_background_group(path: &Path) -> Result<BackgroundGroup> {
+    let current_bytes = read(path.join("memory.current"))?.trim().parse()?;
+    let swap_bytes = match read(path.join("memory.swap.current")) {
+        Ok(value) => Some(value.trim().parse()?),
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            None
+        }
+        Err(error) => return Err(error),
+    };
+    let events = read(path.join("cgroup.events"))?;
+    let populated = events
+        .lines()
+        .find_map(|line| {
+            let mut fields = line.split_whitespace();
+            (fields.next() == Some("populated"))
+                .then(|| fields.next())
+                .flatten()
+        })
+        .ok_or("missing cgroup populated state")?;
+    let populated = match populated {
+        "0" => false,
+        "1" => true,
+        _ => return Err("invalid cgroup populated state".into()),
+    };
+    let high = read(path.join("memory.high"))?;
+    let high_bytes = if high.trim() == "max" {
+        None
+    } else {
+        Some(high.trim().parse()?)
+    };
+    Ok(BackgroundGroup {
+        path: path.into(),
+        current_bytes,
+        swap_bytes,
+        populated,
+        high_bytes,
+    })
+}
+
+fn sample_background_groups() -> (Vec<BackgroundGroup>, Vec<String>) {
+    let mut groups = Vec::new();
+    let mut errors = Vec::new();
+    let paths = match background_groups() {
+        Ok(paths) => paths,
+        Err(error) => return (groups, vec![format!("background discovery: {error}")]),
+    };
+    for path in paths {
+        match sample_background_group(&path) {
+            Ok(group) => groups.push(group),
+            Err(_)
+                if fs::metadata(&path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) => {
+            }
+            Err(error) => errors.push(format!("background sample {}: {error}", path.display())),
+        }
+    }
+    (groups, errors)
+}
+
+pub fn background_plan(
+    settings: &Settings,
+    t: &Telemetry,
+    d: &Decision,
+    previous: Option<u64>,
+) -> BudgetPlan {
+    let groups: Vec<_> = t
+        .background
+        .iter()
+        .map(|g| GroupUsage {
+            current_bytes: g.current_bytes,
+            populated: g.populated,
+        })
+        .collect();
+    plan_background(
+        t.sample.total_bytes,
+        t.sample.available_bytes,
+        settings
+            .policy
+            .effective_reserve_bytes(t.sample.total_bytes),
+        d.background_high_percent,
+        &groups,
+        previous,
+    )
+}
+
+fn limit_json(value: Option<u64>) -> String {
+    value.map_or_else(|| "null".to_owned(), |n| n.to_string())
+}
+
+fn background_json(t: &Telemetry, plan: &BudgetPlan) -> String {
+    let mut resident = 0u64;
+    let mut swap = Some(0u64);
+    let mut active = 0usize;
+    let rows = t.background.iter().zip(&plan.limits).map(|(g, requested)| {
+        resident = resident.saturating_add(g.current_bytes);
+        swap = swap.zip(g.swap_bytes).map(|(sum, n)| sum.saturating_add(n));
+        active += usize::from(g.populated);
+        format!(
+            "{{\"path\":{},\"populated\":{},\"current_bytes\":{},\"swap_bytes\":{},\"sampled_high_bytes\":{},\"requested_high_bytes\":{}}}",
+            json::quote(&g.path.to_string_lossy()), g.populated, g.current_bytes,
+            limit_json(g.swap_bytes), limit_json(g.high_bytes), limit_json(*requested)
+        )
+    }).collect::<Vec<_>>().join(",");
+    format!(
+        "{{\"active_groups\":{active},\"resident_bytes\":{resident},\"swap_bytes\":{},\"budget_bytes\":{},\"sample_complete\":{},\"groups\":[{rows}]}}",
+        limit_json(swap),
+        limit_json(plan.total_bytes),
+        t.background_errors.is_empty()
+    )
 }
 
 pub fn telemetry_json(
     t: &Telemetry,
     d: &Decision,
     profile: &str,
+    background: &BudgetPlan,
     worker: Option<&str>,
     errors: &[String],
     processes: bool,
 ) -> String {
     let s = &t.sample;
+    let mut all_errors = errors.to_vec();
+    all_errors.extend_from_slice(&t.background_errors);
     let swap_rows = t
         .swaps
         .iter()
@@ -388,7 +523,7 @@ pub fn telemetry_json(
         .join(",");
     let zram=t.zram.iter().map(|z|format!("{{\"device\":{},\"original_bytes\":{},\"compressed_bytes\":{},\"resident_bytes\":{},\"estimated_saved_bytes\":{},\"same_pages\":{}}}",json::quote(&z.name),z.original,z.compressed,z.resident,z.original.saturating_sub(z.resident),z.same_pages)).collect::<Vec<_>>().join(",");
     format!(
-        "{{\"schema\":\"zmem.status.v1\",\"version\":{},\"pid\":{},\"sampled_at_unix\":{},\"profile\":{},\"pressure\":{},\"reason\":{},\"memory\":{{\"total_bytes\":{},\"available_bytes\":{}}},\"swap\":{{\"total_bytes\":{},\"free_bytes\":{},\"in_bytes_per_sec\":{},\"out_bytes_per_sec\":{},\"devices\":[{}]}},\"psi\":{{\"memory_some_bp\":{},\"memory_full_bp\":{},\"io_full_bp\":{}}},\"zram\":[{}],\"ksm\":{{\"general_profit_bytes\":{},\"pages_sharing\":{}}},\"plan\":{{\"grow_swap_bytes\":{},\"shrink_allowed\":{},\"background_high_percent\":{},\"reclaim_request_bytes\":{},\"swappiness_hint\":{}}},\"worker\":{},\"errors\":{},\"processes\":{}}}",
+        "{{\"schema\":\"zmem.status.v1\",\"version\":{},\"pid\":{},\"sampled_at_unix\":{},\"profile\":{},\"pressure\":{},\"reason\":{},\"memory\":{{\"total_bytes\":{},\"available_bytes\":{}}},\"swap\":{{\"total_bytes\":{},\"free_bytes\":{},\"in_bytes_per_sec\":{},\"out_bytes_per_sec\":{},\"devices\":[{}]}},\"psi\":{{\"memory_some_bp\":{},\"memory_full_bp\":{},\"io_full_bp\":{}}},\"zram\":[{}],\"ksm\":{{\"general_profit_bytes\":{},\"pages_sharing\":{}}},\"plan\":{{\"grow_swap_bytes\":{},\"shrink_allowed\":{},\"background_high_percent\":{},\"reclaim_request_bytes\":{},\"swappiness_hint\":{}}},\"background\":{},\"worker\":{},\"errors\":{},\"processes\":{}}}",
         json::quote(env!("CARGO_PKG_VERSION")),
         std::process::id(),
         t.sampled_at,
@@ -413,8 +548,9 @@ pub fn telemetry_json(
         d.background_high_percent,
         d.reclaim_bytes,
         d.recommended_swappiness,
+        background_json(t, background),
         worker.map(json::quote).unwrap_or_else(|| "null".into()),
-        json::strings(errors),
+        json::strings(&all_errors),
         if processes {
             top_processes(20)
         } else {
@@ -465,13 +601,32 @@ pub fn top_processes(limit: usize) -> String {
     format!(
         "[{}]",
         rows.iter()
-            .map(|(_, pid, name, rss, swap)| format!(
-                "{{\"pid\":{pid},\"name\":{},\"rss_bytes\":{rss},\"swap_bytes\":{swap}}}",
-                json::quote(name)
-            ))
+            .map(|(_, pid, name, rss, swap)| {
+                let cgroup = read(format!("/proc/{pid}/cgroup")).ok().and_then(|text| {
+                    text.lines().find_map(|line| line.strip_prefix("0::").map(str::to_owned))
+                });
+                let managed = cgroup.as_deref().map(is_managed_background_path);
+                format!(
+                    "{{\"pid\":{pid},\"name\":{},\"rss_bytes\":{rss},\"swap_bytes\":{swap},\"cgroup\":{},\"managed_background\":{}}}",
+                    json::quote(name), cgroup.as_deref().map(json::quote).unwrap_or_else(|| "null".into()),
+                    managed.map(|v| v.to_string()).unwrap_or_else(|| "null".into())
+                )
+            })
             .collect::<Vec<_>>()
             .join(",")
     )
+}
+
+fn is_managed_background_path(path: &str) -> bool {
+    const ROOT: &str = "/zmem.slice/zmem-background.slice";
+    let Some(index) = path.find(ROOT) else {
+        return false;
+    };
+    let end = index + ROOT.len();
+    if !path.starts_with('/') || (path.len() != end && path.as_bytes()[end] != b'/') {
+        return false;
+    }
+    is_managed_background_control(&Path::new(CGROOT).join(&path[1..end]).join("memory.high"))
 }
 
 #[derive(Clone)]
@@ -675,6 +830,9 @@ fn managed_background_high_reset(path: &Path, original: &str, observed: &str) ->
     if original != "max" || observed != "max" {
         return false;
     }
+    is_managed_background_control(path)
+}
+fn is_managed_background_control(path: &Path) -> bool {
     let Some(relative) = path.strip_prefix(CGROOT).ok().and_then(|p| p.to_str()) else {
         return false;
     };
@@ -832,6 +990,83 @@ fn user_managers() -> Vec<PathBuf> {
         })
         .collect()
 }
+fn sorted_group_children(path: &Path, limit: usize) -> Vec<PathBuf> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let mut children = std::collections::BTreeSet::new();
+    for entry in fs::read_dir(path).into_iter().flatten().flatten() {
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            children.insert(entry.path());
+            if children.len() > limit {
+                children.pop_last();
+            }
+        }
+    }
+    children.into_iter().collect()
+}
+
+fn interactive_protection(app_root: &Path, budget: u64) -> Vec<(PathBuf, u64)> {
+    const MAX_DEPTH: usize = 8;
+    const MAX_GROUPS: usize = 1024;
+    if budget == 0 {
+        return Vec::new();
+    }
+    let mut pending = std::collections::VecDeque::from([(app_root.to_path_buf(), 0)]);
+    let mut visited = 0;
+    let mut terminals = Vec::new();
+    while let Some((parent, depth)) = pending.pop_front() {
+        for path in sorted_group_children(&parent, MAX_GROUPS - visited) {
+            visited += 1;
+            let name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_lowercase();
+            if name.ends_with(".slice") {
+                if depth + 1 < MAX_DEPTH {
+                    pending.push_back((path, depth + 1));
+                }
+            } else if [
+                "ztty",
+                "kitty",
+                "foot",
+                "ssmcp",
+                "alacritty",
+                "konsole",
+                "terminal",
+            ]
+            .iter()
+            .any(|key| name.contains(key))
+            {
+                terminals.push(path);
+            }
+        }
+        if visited == MAX_GROUPS {
+            break;
+        }
+    }
+    terminals.sort_unstable();
+    if terminals.is_empty() {
+        return Vec::new();
+    }
+    let count = terminals.len() as u64;
+    let total = budget.min(count * 128 * MIB);
+    let mut paths = BTreeMap::<PathBuf, u64>::new();
+    for (index, terminal) in terminals.iter().enumerate() {
+        let bytes = total / count + u64::from((index as u64) < total % count);
+        // Each ancestor carries only the sum assigned to its descendant
+        // terminals, so nested slices do not multiply the app protection pool.
+        let mut path = terminal.as_path();
+        while path != app_root {
+            *paths.entry(path.join("memory.low")).or_default() += bytes;
+            let Some(parent) = path.parent() else { break };
+            path = parent;
+        }
+    }
+    paths.into_iter().collect()
+}
+
 fn protect_sessions(c: &mut Controls, total: u64, errors: &mut Vec<String>) {
     let reserve = (total / 8).clamp(256 * MIB, 2 * GIB);
     let users = user_managers();
@@ -850,27 +1085,10 @@ fn protect_sessions(c: &mut Controls, total: u64, errors: &mut Vec<String>) {
         paths.push((manager.join("memory.low"), share));
         paths.push((manager.join("session.slice/memory.low"), share * 3 / 4));
         paths.push((manager.join("app.slice/memory.low"), share / 4));
-        for app in child_dirs(&manager.join("app.slice")) {
-            let name = app
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_lowercase();
-            if [
-                "ztty",
-                "kitty",
-                "foot",
-                "ssmcp",
-                "alacritty",
-                "konsole",
-                "terminal",
-            ]
-            .iter()
-            .any(|x| name.contains(x))
-            {
-                paths.push((app.join("memory.low"), (128 * MIB).min(share / 4)));
-            }
-        }
+        paths.extend(interactive_protection(
+            &manager.join("app.slice"),
+            share / 4,
+        ));
     }
     for unit in ["sshd.service", "ssh.service", "systemd-logind.service"] {
         paths.push((
@@ -887,19 +1105,45 @@ fn protect_sessions(c: &mut Controls, total: u64, errors: &mut Vec<String>) {
         }
     }
 }
-fn background_groups() -> Vec<PathBuf> {
-    let mut groups = Vec::new();
-    let root = Path::new(CGROOT).join("zmem.slice/zmem-background.slice");
-    if root.join("memory.current").exists() {
-        groups.push(root);
-    }
-    for p in user_managers() {
-        let p = p.join("zmem.slice/zmem-background.slice");
-        if p.join("memory.current").exists() {
-            groups.push(p);
+fn background_groups() -> Result<Vec<PathBuf>> {
+    let mut candidates = vec![Path::new(CGROOT).join("zmem.slice/zmem-background.slice")];
+    let users = match fs::read_dir(Path::new(CGROOT).join("user.slice")) {
+        Ok(entries) => Some(entries),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    if let Some(users) = users {
+        for (index, entry) in users.enumerate() {
+            if index >= 1024 {
+                return Err("user cgroup discovery exceeds 1024 entries".into());
+            }
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(uid) = name
+                .to_str()
+                .and_then(|name| name.strip_prefix("user-"))
+                .and_then(|name| name.strip_suffix(".slice"))
+            else {
+                continue;
+            };
+            if uid.is_empty() || !uid.bytes().all(|c| c.is_ascii_digit()) {
+                continue;
+            }
+            candidates.push(entry.path().join(format!(
+                "user@{uid}.service/zmem.slice/zmem-background.slice"
+            )));
         }
     }
-    groups
+    let mut groups = Vec::new();
+    for path in candidates {
+        match fs::metadata(&path) {
+            Ok(_) => groups.push(path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    groups.sort_unstable();
+    Ok(groups)
 }
 fn capped_high(original: &str, requested: &str) -> Result<String> {
     if original == "max" {
@@ -935,6 +1179,7 @@ fn apply_controls(
     settings: &Settings,
     t: &Telemetry,
     d: &Decision,
+    background: &BudgetPlan,
     c: &mut Controls,
     protect: bool,
     errors: &mut Vec<String>,
@@ -964,17 +1209,13 @@ fn apply_controls(
             }
         }
     }
-    let mut groups = background_groups();
-    let count = groups.len().max(1) as u64;
-    for p in &groups {
-        let high = p.join("memory.high");
-        let value = if d.background_high_percent == 100 {
-            "max".into()
-        } else {
-            (t.sample.total_bytes / 100 * d.background_high_percent as u64 / count)
-                .max(256 * MIB)
-                .to_string()
-        };
+    // Keep existing restrictions when a group measurement is incomplete.
+    if !t.background_errors.is_empty() || d.reason == zmem::Reason::InvalidSnapshot {
+        return None;
+    }
+    for (group, limit) in t.background.iter().zip(&background.limits) {
+        let high = group.path.join("memory.high");
+        let value = limit.map_or_else(|| "max".to_owned(), |n| n.to_string());
         let result = (|| -> Result<()> {
             let meta = fs::metadata(&high)?;
             let original = match c
@@ -991,8 +1232,21 @@ fn apply_controls(
             errors.push(e.to_string());
         }
     }
-    groups.sort_unstable_by_key(|p| std::cmp::Reverse(number(p.join("memory.current"))));
-    groups.into_iter().next()
+    let reserve = settings
+        .policy
+        .effective_reserve_bytes(t.sample.total_bytes);
+    if t.sample.available_bytes
+        >= reserve
+            .saturating_add(reserve / 4)
+            .min(t.sample.total_bytes)
+    {
+        return None;
+    }
+    t.background
+        .iter()
+        .filter(|g| g.populated && g.current_bytes > 0)
+        .max_by_key(|g| g.current_bytes)
+        .map(|g| g.path.clone())
 }
 
 pub fn ensure_zram(settings: &Settings, total: u64) -> Result<()> {
@@ -1266,7 +1520,7 @@ pub fn shrink_swap(settings: &Settings, path: &Path) -> Result<()> {
 }
 pub fn reclaim(path: &Path, bytes: u64) -> Result<()> {
     root_required()?;
-    if !background_groups().iter().any(|p| p == path) {
+    if !background_groups()?.iter().any(|p| p == path) {
         return Err("reclaim is limited to registered background groups".into());
     }
     let before = number(path.join("memory.current"));
@@ -1392,6 +1646,7 @@ pub fn daemon(settings: Settings, config: PathBuf, observe: bool, once: bool) ->
     let start = Instant::now();
     let mut sampler = Sampler::new();
     let mut policy = Policy::new(settings.policy);
+    let mut previous_background_budget = None;
     let mut controls = Controls::new();
     let mut worker: Option<Worker> = None;
     let mut loop_index = 0u64;
@@ -1441,11 +1696,16 @@ pub fn daemon(settings: Settings, config: PathBuf, observe: bool, once: bool) ->
                 }
             };
             let d = policy.observe(t.sample, start.elapsed().as_secs());
+            let background = background_plan(&settings, &t, &d, previous_background_budget);
+            if t.background_errors.is_empty() && d.reason != zmem::Reason::InvalidSnapshot {
+                previous_background_budget = background.total_bytes;
+            }
             if !observe {
                 let bg = apply_controls(
                     &settings,
                     &t,
                     &d,
+                    &background,
                     &mut controls,
                     loop_index % 15 == 0,
                     &mut errors,
@@ -1477,6 +1737,7 @@ pub fn daemon(settings: Settings, config: PathBuf, observe: bool, once: bool) ->
                 &t,
                 &d,
                 &settings.profile,
+                &background,
                 worker.as_ref().map(|w| w.kind.as_str()),
                 &errors,
                 false,
@@ -1489,7 +1750,8 @@ pub fn daemon(settings: Settings, config: PathBuf, observe: bool, once: bool) ->
                     &(status + "\n"),
                     0o644,
                 )?;
-                if !errors.is_empty() {
+                if !errors.is_empty() || !t.background_errors.is_empty() {
+                    errors.extend_from_slice(&t.background_errors);
                     eprintln!(
                         "{{\"event\":\"diagnostic\",\"errors\":{}}}",
                         json::strings(&errors)
@@ -1581,7 +1843,7 @@ pub fn run_workload(class: &str, max_mib: Option<u64>, args: &[String]) -> Resul
         }
         "background" => {
             cmd.arg("--slice=zmem-background.slice")
-                .arg(format!("--property=MemoryHigh={}", total / 2))
+                .arg("--property=MemoryAccounting=yes")
                 .arg("--property=CPUWeight=50")
                 .arg("--property=IOWeight=50");
         }
@@ -1600,6 +1862,10 @@ pub fn run_workload(class: &str, max_mib: Option<u64>, args: &[String]) -> Resul
     use std::os::unix::process::CommandExt;
     Err(cmd.arg("--").args(args).exec().into())
 }
+
+#[cfg(test)]
+#[path = "scheduling_kernel_tests.rs"]
+mod scheduling_kernel_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1637,6 +1903,93 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn interactive_protection_reaches_nested_terminal_ancestors() {
+        let fixture = JournalFixture::new("interactive-nesting");
+        let app = fixture.0.join("app.slice");
+        let graphical = app.join("app-graphical.slice");
+        let nested = graphical.join("app-tools.slice");
+        let terminal = nested.join("app-Hyprland-xdg\\x2dterminal\\x2dexec-a.scope");
+        let browser = graphical.join("app-browser.scope");
+        let unrelated = app.join("app-editor.service/nested-kitty.scope");
+        for path in [&terminal, &browser, &unrelated] {
+            fs::create_dir_all(path).unwrap();
+        }
+        let paths: BTreeMap<_, _> = interactive_protection(&app, 256 * MIB)
+            .into_iter()
+            .collect();
+        assert_eq!(paths.len(), 3);
+        for path in [&terminal, &nested, &graphical] {
+            assert_eq!(paths.get(&path.join("memory.low")), Some(&(128 * MIB)));
+        }
+        assert!(!paths.contains_key(&browser.join("memory.low")));
+        assert!(!paths.contains_key(&unrelated.join("memory.low")));
+        assert!(!paths.contains_key(&app.join("memory.low")));
+    }
+
+    #[test]
+    fn interactive_protection_shares_one_pool_across_nested_siblings() {
+        let fixture = JournalFixture::new("interactive-budget");
+        let app = fixture.0.join("app.slice");
+        let graphical = app.join("app-graphical.slice");
+        let leaves = [
+            graphical.join("app-kitty-a.scope"),
+            graphical.join("app-kitty-b.scope"),
+            app.join("ssmcp-session.service"),
+        ];
+        for path in &leaves {
+            fs::create_dir_all(path).unwrap();
+        }
+        let budget = 129 * MIB + 1;
+        let paths: BTreeMap<_, _> = interactive_protection(&app, budget).into_iter().collect();
+        let allocations: Vec<_> = leaves
+            .iter()
+            .map(|path| paths[&path.join("memory.low")])
+            .collect();
+        assert_eq!(allocations.iter().sum::<u64>(), budget);
+        assert!(allocations.iter().all(|&n| n <= 128 * MIB));
+        assert_eq!(
+            paths[&graphical.join("memory.low")],
+            allocations[0] + allocations[1]
+        );
+        assert!(paths.values().all(|&n| n <= budget));
+        assert!(interactive_protection(&app, 0).is_empty());
+    }
+
+    #[test]
+    fn interactive_protection_bounds_depth_and_sorts_bounded_groups() {
+        let fixture = JournalFixture::new("interactive-bounds");
+        let app = fixture.0.join("app.slice");
+        let mut nested = app.clone();
+        for depth in 1..=8 {
+            nested = nested.join(format!("level-{depth}.slice"));
+            fs::create_dir_all(&nested).unwrap();
+            if depth == 7 || depth == 8 {
+                fs::create_dir(nested.join("kitty.scope")).unwrap();
+            }
+        }
+        let paths = interactive_protection(&app, 128 * MIB);
+        assert_eq!(paths.len(), 8, "seven ancestors and the reachable terminal");
+        assert!(!paths.iter().any(|(path, _)| path.starts_with(&nested)));
+
+        let bulk = fixture.0.join("bulk.slice");
+        fs::create_dir(&bulk).unwrap();
+        for index in (0..1026).rev() {
+            fs::create_dir(bulk.join(format!("ztty-{index:04}.scope"))).unwrap();
+        }
+        let paths = interactive_protection(&bulk, GIB);
+        assert_eq!(paths.len(), 1024);
+        assert_eq!(
+            paths.first().unwrap().0,
+            bulk.join("ztty-0000.scope/memory.low")
+        );
+        assert_eq!(
+            paths.last().unwrap().0,
+            bulk.join("ztty-1023.scope/memory.low")
+        );
+        assert_eq!(paths.iter().map(|(_, bytes)| bytes).sum::<u64>(), GIB);
     }
 
     #[test]
@@ -1718,6 +2071,39 @@ mod tests {
             ksm_profit: 0,
             ksm_shared: 0,
             sampled_at: 0,
+            background: Vec::new(),
+            background_errors: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn background_sampling_distinguishes_empty_groups_and_invalid_measurements() {
+        let fixture = JournalFixture::new("background-sampling");
+        for (name, value) in [
+            ("memory.current", "40960\n"),
+            ("memory.swap.current", "8192\n"),
+            ("memory.high", "16777216\n"),
+            ("cgroup.events", "populated 0\nfrozen 0\n"),
+        ] {
+            fs::write(fixture.0.join(name), value).unwrap();
+        }
+        let group = sample_background_group(&fixture.0).unwrap();
+        assert!(!group.populated);
+        assert_eq!(group.current_bytes, 40960);
+        assert_eq!(group.swap_bytes, Some(8192));
+        assert_eq!(group.high_bytes, Some(16 * MIB));
+        fs::write(fixture.0.join("cgroup.events"), "populated 1\n").unwrap();
+        fs::write(fixture.0.join("memory.high"), "max\n").unwrap();
+        let group = sample_background_group(&fixture.0).unwrap();
+        assert!(group.populated);
+        assert_eq!(group.high_bytes, None);
+        fs::remove_file(fixture.0.join("memory.swap.current")).unwrap();
+        let group = sample_background_group(&fixture.0).unwrap();
+        assert!(group.populated);
+        assert_eq!(group.swap_bytes, None);
+        for value in ["populated 2\n", "frozen 0\n"] {
+            fs::write(fixture.0.join("cgroup.events"), value).unwrap();
+            assert!(sample_background_group(&fixture.0).is_err());
         }
     }
 
