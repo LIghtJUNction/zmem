@@ -1,0 +1,293 @@
+{
+  "schema": "zmem.acceptance.0.4.2",
+  "identity": {
+    "sha256": "db2fb36c6ac411d3f454a288893f0a743365e2b178167d3c552d18e000b97b39",
+    "binary_bytes": 1162632,
+    "version": "0.4.2",
+    "kernel": "7.3.5-arch1-1",
+    "arch": "x86_64",
+    "service": "active"
+  },
+  "observation_summary": {
+    "background_groups_observed": {
+      "count": 16,
+      "max": 1,
+      "min": 1,
+      "p50": 1,
+      "p95": 1,
+      "p99": 1
+    },
+    "background_progress_interpretation": "CPU time and I/O counter progress in sampled managed groups; not useful throughput or task completion",
+    "comparison_limit": "Natural-workload observation, not a controlled causal experiment",
+    "hyprctl_process_and_ipc_round_trip_ms": {
+      "count": 16,
+      "is_frame_latency": false,
+      "max": 66.382159,
+      "min": 9.915859,
+      "p50": 16.0526675,
+      "p95": 52.34982025,
+      "p99": 63.57569124999999,
+      "statuses": {
+        "available": 16
+      },
+      "timeouts": 0
+    },
+    "interrupted": false,
+    "invalid_counter_reasons": {
+      "system_cpu_full_undefined": 15,
+      "unavailable": 30
+    },
+    "kernel_read_span_ms": {
+      "count": 16,
+      "max": 2.951365,
+      "min": 0.798336,
+      "p50": 0.9956624999999999,
+      "p95": 2.6814595,
+      "p99": 2.8973839
+    },
+    "mem_available_bytes": {
+      "count": 16,
+      "max": 2586693632,
+      "min": 2420473856,
+      "p50": 2544775168,
+      "p95": 2579585024,
+      "p99": 2585271910.4
+    },
+    "observed_duration_s": 30.025425067,
+    "observer_resources": {
+      "cpu_seconds": 0.06251899999999999,
+      "peak_rss_bytes": 42827776,
+      "probe_children_cpu_seconds": 0.123836
+    },
+    "page_size_consistent": true,
+    "requested_duration_s": 30,
+    "sample_count": 16,
+    "sample_schedule_lateness_ms": {
+      "count": 16,
+      "max": 0.489551,
+      "min": 0.013955,
+      "p50": 0.0635985,
+      "p95": 0.2658515,
+      "p99": 0.4448110999999999
+    },
+    "scheduler_wakeup_lateness_ms": {
+      "count": 300,
+      "max": 0.427027,
+      "min": 0.053597,
+      "p50": 0.13155,
+      "p95": 0.232658,
+      "p99": 0.26700069999999987,
+      "skipped_deadlines": 0
+    },
+    "schema": "zmem.responsiveness.summary.v1",
+    "window_metrics": {
+      "background.cpu_time": {
+        "count": 15,
+        "max": 0,
+        "min": 0,
+        "p50": 0,
+        "p95": 0,
+        "p99": 0,
+        "time_weighted_mean": 0,
+        "total_delta": 0,
+        "unit": "cpu_microseconds_per_second",
+        "valid_duration_s": 29.99975392
+      },
+      "background.read": {
+        "count": 0,
+        "max": null,
+        "min": null,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "time_weighted_mean": null,
+        "total_delta": null,
+        "unit": "bytes_per_second",
+        "valid_duration_s": 0
+      },
+      "background.write": {
+        "count": 0,
+        "max": null,
+        "min": null,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "time_weighted_mean": null,
+        "total_delta": null,
+        "unit": "bytes_per_second",
+        "valid_duration_s": 0
+      },
+      "paging.anon_refault": {
+        "count": 15,
+        "max": 8071721.066255739,
+        "min": 188383.99082839038,
+        "p50": 700205.6879700755,
+        "p95": 4663409.479450854,
+        "p99": 7390058.74889476,
+        "time_weighted_mean": 1351827.6219247067,
+        "total_delta": 40554496,
+        "unit": "bytes_per_second",
+        "valid_duration_s": 29.99975392
+      },
+      "paging.direct_scan": {
+        "count": 15,
+        "max": 211394470.86206296,
+        "min": 0,
+        "p50": 21084470.53632885,
+        "p95": 177826026.75882164,
+        "p99": 204680782.04141468,
+        "time_weighted_mean": 41390692.580721006,
+        "total_delta": 1241710592,
+        "unit": "bytes_per_second",
+        "valid_duration_s": 29.99975392
+      },
+      "paging.file_refault": {
+        "count": 15,
+        "max": 101045971.44076465,
+        "min": 866273.4790196505,
+        "p50": 10582812.6635545,
+        "p95": 59504272.443461895,
+        "p99": 92737631.64130408,
+        "time_weighted_mean": 22587167.67500738,
+        "total_delta": 677609472,
+        "unit": "bytes_per_second",
+        "valid_duration_s": 29.99975392
+      },
+      "paging.swap_in": {
+        "count": 15,
+        "max": 8131117.136015043,
+        "min": 161804.18045690062,
+        "p50": 692016.1477598991,
+        "p95": 4555085.974264499,
+        "p99": 7415910.903664932,
+        "time_weighted_mean": 1326841.8169744774,
+        "total_delta": 39804928,
+        "unit": "bytes_per_second",
+        "valid_duration_s": 29.99975392
+      },
+      "paging.swap_out": {
+        "count": 15,
+        "max": 2189462.0197481313,
+        "min": 0,
+        "p50": 0,
+        "p95": 1029513.0704758626,
+        "p99": 1957472.229893677,
+        "time_weighted_mean": 198521.09506903583,
+        "total_delta": 5955584,
+        "unit": "bytes_per_second",
+        "valid_duration_s": 29.99975392
+      },
+      "psi.cpu.full": {
+        "count": 0,
+        "max": null,
+        "min": null,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "time_weighted_mean": null,
+        "total_delta": null,
+        "unit": "percent",
+        "valid_duration_s": 0
+      },
+      "psi.cpu.some": {
+        "count": 15,
+        "max": 0.4749194830892708,
+        "min": 0.3002460944167006,
+        "p50": 0.3582269669678464,
+        "p95": 0.44927186628336857,
+        "p99": 0.46978995972809034,
+        "time_weighted_mean": 0.36719967868323106,
+        "total_delta": 110159,
+        "unit": "percent",
+        "valid_duration_s": 29.99975392
+      },
+      "psi.io.full": {
+        "count": 15,
+        "max": 34.92198912743127,
+        "min": 14.781812835033646,
+        "p50": 20.820396437776942,
+        "p95": 30.977738188051084,
+        "p99": 34.13313893955523,
+        "time_weighted_mean": 21.538770008684125,
+        "total_delta": 6461578,
+        "unit": "percent",
+        "valid_duration_s": 29.99975392
+      },
+      "psi.io.some": {
+        "count": 15,
+        "max": 39.18836082257743,
+        "min": 15.869587368256887,
+        "p50": 22.375948001983218,
+        "p95": 32.945276968532426,
+        "p99": 37.93974405176843,
+        "time_weighted_mean": 23.30255780978086,
+        "total_delta": 6990710,
+        "unit": "percent",
+        "valid_duration_s": 29.99975392
+      },
+      "psi.memory.full": {
+        "count": 15,
+        "max": 2.715086034980031,
+        "min": 0.002099926014356699,
+        "p50": 0.17137920255570271,
+        "p95": 1.6071799286350015,
+        "p99": 2.4935048137110245,
+        "time_weighted_mean": 0.41798676193941264,
+        "total_delta": 125395,
+        "unit": "percent",
+        "valid_duration_s": 29.99975392
+      },
+      "psi.memory.some": {
+        "count": 15,
+        "max": 2.7672396084907347,
+        "min": 0.0021499242527937635,
+        "p50": 0.17443061275882527,
+        "p95": 1.63699866051988,
+        "p99": 2.541191418896563,
+        "time_weighted_mean": 0.42670016674590105,
+        "total_delta": 128009,
+        "unit": "percent",
+        "valid_duration_s": 29.99975392
+      },
+      "zram.read": {
+        "count": 15,
+        "max": 6908377.355107995,
+        "min": 133097.38482440624,
+        "p50": 663352.7570242821,
+        "p95": 3917344.725951777,
+        "p99": 6310170.82927675,
+        "time_weighted_mean": 1115623.0177504069,
+        "total_delta": 33468416,
+        "unit": "bytes_per_second",
+        "valid_duration_s": 29.99975392
+      },
+      "zram.write": {
+        "count": 15,
+        "max": 2189462.0197481313,
+        "min": 0,
+        "p50": 0,
+        "p95": 1029513.0704758626,
+        "p99": 1957472.229893677,
+        "time_weighted_mean": 198521.09506903583,
+        "total_delta": 5955584,
+        "unit": "bytes_per_second",
+        "valid_duration_s": 29.99975392
+      }
+    },
+    "zmem": {
+      "diagnostic_occurrences": 0,
+      "memory_pressure": {
+        "healthy": 16
+      },
+      "report_sources": {
+        "daemon_cache": 16
+      },
+      "statuses": {
+        "available": 16
+      },
+      "versions": [
+        "0.4.2"
+      ]
+    }
+  }
+}

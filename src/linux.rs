@@ -1786,6 +1786,14 @@ fn protection_process_path(root: &Path, cgroup: &str) -> Result<Option<PathBuf>>
         .strip_prefix('/')
         .ok_or("nonabsolute unified cgroup membership")?;
     let parts: Vec<_> = relative.split('/').collect();
+    // A root-launched workload has no user manager. Only the explicit class
+    // marker may select a root app scope; it shares the bounded system budget.
+    if parts.len() == 2
+        && parts[0] == "app.slice"
+        && protection::explicit_interactive_unit(parts[1])
+    {
+        return Ok(Some(root.join(relative)));
+    }
     // Login sessions are accepted only when the planner also recognizes an
     // explicit Remote role. A shell or terminal alone cannot select the whole
     // login session. The planner validates the UID and session ID before reads.
@@ -1813,6 +1821,9 @@ fn protection_process_path(root: &Path, cgroup: &str) -> Result<Option<PathBuf>>
 
 fn protection_role(comm: &str, path: &Path) -> Option<protection::Role> {
     use protection::Role;
+    if explicit_interactive_scope(path) {
+        return Some(Role::Interactive);
+    }
     let name = comm.trim().to_ascii_lowercase();
     if matches!(
         name.as_str(),
@@ -1840,8 +1851,52 @@ fn protection_role(comm: &str, path: &Path) -> Option<protection::Role> {
     {
         return Some(Role::Input);
     }
+    if terminal_process_name(&name) {
+        return Some(Role::Terminal);
+    }
     if matches!(
         name.as_str(),
+        "ssmcp" | "ssmcp-server" | "007" | "sshd" | "sshd-session" | "sshd-auth"
+    ) {
+        return Some(Role::Remote);
+    }
+    // Interpreter names alone do not imply an interactive task. A specifically
+    // named remote-control unit can identify Python/Node-hosted remote tools.
+    let unit = path.file_name()?.to_str()?.to_ascii_lowercase();
+    let remote_unit = unit.strip_prefix("app-").unwrap_or(&unit);
+    if ["ssmcp", "007"].iter().any(|prefix| {
+        remote_unit.strip_prefix(prefix).is_some_and(|tail| {
+            tail.starts_with('.') || tail.starts_with('-') || tail.starts_with('@')
+        })
+    }) {
+        return Some(Role::Remote);
+    }
+    if matches!(
+        name.as_str(),
+        "chatgpt"
+            | "chrome"
+            | "google-chrome"
+            | "chromium"
+            | "chromium-browse"
+            | "firefox"
+            | "firefox-bin"
+            | "wechat"
+    ) && independent_gui_scope(path, &unit)
+    {
+        return Some(Role::Interactive);
+    }
+    None
+}
+
+fn explicit_interactive_scope(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(protection::explicit_interactive_unit)
+}
+
+fn terminal_process_name(name: &str) -> bool {
+    matches!(
+        name,
         "ztty"
             | "kitty"
             | "kitty.bin"
@@ -1860,27 +1915,84 @@ fn protection_role(comm: &str, path: &Path) -> Option<protection::Role> {
             | "xterm"
             | "urxvt"
             | "st"
-    ) {
-        return Some(Role::Terminal);
+    )
+}
+
+fn independent_gui_scope(path: &Path, unit: &str) -> bool {
+    let Some(app) = unit.strip_prefix("app-") else {
+        return false;
+    };
+    if ![".scope", ".service"].iter().any(|suffix| {
+        app.strip_suffix(suffix)
+            .is_some_and(|stem| !stem.is_empty())
+    }) {
+        return false;
     }
-    if matches!(
-        name.as_str(),
-        "ssmcp" | "ssmcp-server" | "007" | "sshd" | "sshd-session" | "sshd-auth"
-    ) {
-        return Some(Role::Remote);
+    // Decode systemd unit escapes only for classification, never for a path.
+    // In particular xdg\\x2dterminal\\x2dexec must retain its terminal marker
+    // even after the terminal process exits and only a browser child remains.
+    let mut decoded = Vec::with_capacity(app.len());
+    let mut bytes = app.bytes();
+    while let Some(byte) = bytes.next() {
+        if byte != b'\\' {
+            decoded.push(byte);
+            continue;
+        }
+        if bytes.next() != Some(b'x') {
+            return false;
+        }
+        let Some(high) = bytes.next().and_then(|byte| char::from(byte).to_digit(16)) else {
+            return false;
+        };
+        let Some(low) = bytes.next().and_then(|byte| char::from(byte).to_digit(16)) else {
+            return false;
+        };
+        decoded.push((high * 16 + low) as u8);
     }
-    // Interpreter names alone do not imply an interactive task. A specifically
-    // named remote-control unit can identify Python/Node-hosted remote tools.
-    let unit = path.file_name()?.to_str()?.to_ascii_lowercase();
-    let unit = unit.strip_prefix("app-").unwrap_or(&unit);
-    ["ssmcp", "007"]
-        .iter()
-        .any(|prefix| {
-            unit.strip_prefix(prefix).is_some_and(|tail| {
-                tail.starts_with('.') || tail.starts_with('-') || tail.starts_with('@')
-            })
+    let Ok(decoded) = String::from_utf8(decoded) else {
+        return false;
+    };
+    // A headless browser inherited by a terminal or remote session is not an
+    // independently launched desktop app. Match unit components, not broad
+    // substrings such as "st" which can occur in unrelated application names.
+    if decoded
+        .to_ascii_lowercase()
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .any(|part| {
+            terminal_process_name(part)
+                || matches!(
+                    part,
+                    "terminal"
+                        | "ssmcp"
+                        | "007"
+                        | "sshd"
+                        | "tmux"
+                        | "screen"
+                        | "bash"
+                        | "zsh"
+                        | "fish"
+                        | "dash"
+                        | "sh"
+                        | "nu"
+                )
         })
-        .then_some(Role::Remote)
+    {
+        return false;
+    }
+    for ancestor in path.ancestors().skip(1) {
+        let Some(name) = ancestor.file_name().and_then(|name| name.to_str()) else {
+            return false;
+        };
+        if name == "app.slice" {
+            return true;
+        }
+        // Nested application slices are supported; nested units would also
+        // protect a hosting service or terminal rather than just the app.
+        if !name.ends_with(".slice") {
+            return false;
+        }
+    }
+    false
 }
 
 fn discover_protection_scopes(
@@ -1950,9 +2062,17 @@ fn discover_protection_scopes(
         selected.insert(cgroup_root.join("system.slice").join(unit), vec![role]);
     }
     let mut scopes = Vec::new();
-    for (path, roles) in selected {
+    for (path, mut roles) in selected {
         if start.elapsed() >= deadline || STOP.load(Ordering::Relaxed) {
             return Err("scope discovery exceeded its limit or was interrupted".into());
+        }
+        // Unknown launcher names can still host a real terminal or remote
+        // controller. Do not let a browser child increase that mixed scope's
+        // cap. Explicit zmem-interactive scopes classify every member as
+        // Interactive above, so the user's deliberate class is preserved.
+        if roles.contains(&protection::Role::Terminal) || roles.contains(&protection::Role::Remote)
+        {
+            roles.retain(|role| *role != protection::Role::Interactive);
         }
         let current = match protection_read(&path.join("memory.current"), 64) {
             Ok(text) => text.trim().parse::<u64>()?,
@@ -3238,8 +3358,12 @@ fn workload_command(
     cmd.arg(format!("--description=zmem {class} workload"));
     match class {
         "interactive" => {
+            // Keep an initial leaf request while the daemon discovers this
+            // explicit class. Its effective protection remains bounded by the
+            // ancestor budgets the planner subsequently assigns.
             cmd.arg("--slice=app.slice")
-                .arg("--property=MemoryLow=256M");
+                .arg("--property=MemoryAccounting=yes")
+                .arg("--property=MemoryLow=512M");
         }
         "background" => {
             cmd.arg("--slice=zmem-background.slice")
@@ -3472,6 +3596,27 @@ mod tests {
         });
         assert!(result.is_err());
         assert!(called.get());
+    }
+
+    #[test]
+    fn protection_interactive_launcher_requests_the_bounded_role_cap() {
+        let command =
+            workload_command("interactive", None, false, &["program".into()], 255).unwrap();
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy())
+            .collect();
+        assert!(args.iter().any(|arg| arg == "--slice=app.slice"));
+        assert!(
+            args.iter()
+                .any(|arg| arg == "--property=MemoryAccounting=yes")
+        );
+        assert!(args.iter().any(|arg| arg == "--property=MemoryLow=512M"));
+        let unit = args.windows(2).find(|pair| pair[0] == "--unit").unwrap();
+        assert!(protection::explicit_interactive_unit(&format!(
+            "{}.scope",
+            unit[1]
+        )));
     }
 
     #[test]
@@ -3900,6 +4045,93 @@ mod tests {
     }
 
     #[test]
+    fn protection_gui_roles_require_independent_app_units_and_exact_names() {
+        use protection::Role;
+        let app = Path::new(
+            "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.chromium.Chromium-3400501.scope",
+        );
+        for comm in [
+            "ChatGPT",
+            "chrome",
+            "google-chrome",
+            "chromium",
+            "chromium-browse",
+            "firefox",
+            "firefox-bin",
+            "wechat",
+        ] {
+            assert_eq!(
+                protection_role(comm, app),
+                Some(Role::Interactive),
+                "{comm}"
+            );
+        }
+        for comm in [
+            "node",
+            "python3",
+            "electron",
+            "chrome_crashpad",
+            "firefox-helper",
+            "unrelated",
+        ] {
+            assert_eq!(protection_role(comm, app), None, "{comm}");
+        }
+        for unit in [
+            "terminal.scope",
+            "app-kitty-12.scope",
+            "app-org.wezfurlong.wezterm-12.scope",
+            "app-org.gnome.Terminal-12.scope",
+            r"app-Hyprland-xdg\x2dterminal\x2dexec-12.scope",
+            r"app-org\x2egnome\x2eTerminal-12.scope",
+            r"app-Terminal\x40host-12.service",
+            r"app-prefix\x5fterminal-12.scope",
+            r"app-\x74erminal-12.scope",
+            "app-ssmcp-session-12.service",
+            "ssmcp-session-12.service",
+            "app-bash-12.scope",
+            "appx-chatgpt.scope",
+        ] {
+            assert_ne!(
+                protection_role("chrome", &app.with_file_name(unit)),
+                Some(Role::Interactive),
+                "{unit}"
+            );
+        }
+        let hosted = app.with_file_name("ssmcp-session.service/app-chromium.scope");
+        assert_eq!(protection_role("chrome", &hosted), None);
+        let service = app.with_file_name("app-chatgpt.service");
+        assert_eq!(
+            protection_role("ChatGPT", &service),
+            Some(Role::Interactive)
+        );
+    }
+
+    #[test]
+    fn protection_explicit_interactive_marker_accepts_only_numeric_scope_ids() {
+        use protection::Role;
+        let app = Path::new(
+            "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/zmem-interactive-123.scope",
+        );
+        for comm in ["python3", "kitty", "node", "ssmcp"] {
+            assert_eq!(protection_role(comm, app), Some(Role::Interactive));
+        }
+        for unit in [
+            "zmem-interactive-.scope",
+            "zmem-interactive-123.service",
+            "zmem-interactive-123-extra.scope",
+            "zmem-interactive-1x.scope",
+            "zmem-interactive--1.scope",
+            "zmem-interactive-１２.scope",
+        ] {
+            assert_eq!(
+                protection_role("node", &app.with_file_name(unit)),
+                None,
+                "{unit}"
+            );
+        }
+    }
+
+    #[test]
     fn protection_ownership_preserves_external_nonzero_values_and_recreated_groups() {
         let path = Path::new("/sys/fs/cgroup/user.slice/memory.low");
         let mut entry = Control {
@@ -4023,6 +4255,89 @@ mod tests {
         assert!(p.limits.contains_key(&cgroup_root.join(
             "user.slice/user-1000.slice/user@1000.service/app.slice/app-graphical.slice/memory.low"
         )));
+    }
+
+    #[test]
+    fn protection_discovery_covers_actual_gui_scopes_without_promoting_mixed_sessions() {
+        let fixture = JournalFixture::new("protection-gui-discovery");
+        let proc_root = fixture.0.join("proc");
+        let cgroup_root = fixture.0.join("cgroup");
+        fs::create_dir_all(&proc_root).unwrap();
+        let main = "user.slice/user-1000.slice/user@1000.service/app.slice/app-org.chromium.Chromium-3400501.scope";
+        let renderer = r"user.slice/user-1000.slice/user@1000.service/app.slice/app-graphical.slice/app-Hyprland-gtk\x2dlaunch-d2a936ed.scope";
+        let explicit =
+            "user.slice/user-1000.slice/user@1000.service/app.slice/zmem-interactive-123.scope";
+        let root_explicit = "app.slice/zmem-interactive-456.scope";
+        let terminal =
+            "user.slice/user-1000.slice/user@1000.service/app.slice/app-custom-launcher.scope";
+        let remote =
+            "user.slice/user-1000.slice/user@1000.service/app.slice/app-custom-remote.scope";
+        let unrelated =
+            "user.slice/user-1000.slice/user@1000.service/app.slice/app-unrelated.scope";
+        for (pid, comm, path) in [
+            (3400501, "ChatGPT", main),
+            (3401618, "ChatGPT", renderer),
+            (3, "chrome", renderer),
+            (4, "node", explicit),
+            (5, "python3", root_explicit),
+            (6, "kitty", terminal),
+            (7, "chrome", terminal),
+            (8, "ssmcp", remote),
+            (9, "chrome", remote),
+            (10, "electron", unrelated),
+        ] {
+            let process = proc_root.join(pid.to_string());
+            fs::create_dir(&process).unwrap();
+            fs::write(process.join("comm"), comm).unwrap();
+            fs::write(process.join("cgroup"), format!("0::/{path}\n")).unwrap();
+            let group = cgroup_root.join(path);
+            fs::create_dir_all(&group).unwrap();
+            fs::write(group.join("memory.current"), GIB.to_string()).unwrap();
+        }
+        let scopes = discover_protection_scopes(
+            &proc_root,
+            &cgroup_root,
+            16 * GIB,
+            4096,
+            64,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(scopes.len(), 6);
+        let p = protection::plan_protection(&cgroup_root, 16 * GIB, 4096, &scopes).unwrap();
+        for path in [main, renderer, explicit, root_explicit] {
+            let leaf = p
+                .leaves
+                .iter()
+                .find(|leaf| leaf.path == cgroup_root.join(path))
+                .unwrap();
+            assert_eq!(leaf.role, protection::Role::Interactive);
+            assert!(leaf.limit_bytes > 0 && leaf.limit_bytes <= 512 * MIB);
+            for ancestor in leaf
+                .path
+                .ancestors()
+                .take_while(|path| *path != cgroup_root)
+            {
+                assert!(p.limits[&ancestor.join("memory.low")] >= leaf.limit_bytes);
+            }
+        }
+        for (path, role) in [
+            (terminal, protection::Role::Terminal),
+            (remote, protection::Role::Remote),
+        ] {
+            let leaf = p
+                .leaves
+                .iter()
+                .find(|leaf| leaf.path == cgroup_root.join(path))
+                .unwrap();
+            assert_eq!(leaf.role, role);
+            assert!(leaf.limit_bytes <= 128 * MIB);
+        }
+        assert!(
+            !p.limits
+                .contains_key(&cgroup_root.join(unrelated).join("memory.low"))
+        );
+        assert!(p.allocated_bytes <= p.budget_bytes);
     }
 
     #[test]
@@ -4162,6 +4477,31 @@ mod tests {
         );
         assert!(protection_process_path(Path::new(CGROOT), "0::relative\n").is_err());
         assert!(protection_process_path(Path::new(CGROOT), "0::/\n0::/other\n").is_err());
+    }
+
+    #[test]
+    fn protection_root_app_membership_requires_the_exact_explicit_class_path() {
+        let root = Path::new(CGROOT);
+        let path = "app.slice/zmem-interactive-123.scope";
+        assert_eq!(
+            protection_process_path(root, &format!("0::/{path}\n")).unwrap(),
+            Some(root.join(path)),
+        );
+        for path in [
+            "app.slice/app-chatgpt.scope",
+            "app.slice/zmem-interactive-.scope",
+            "app.slice/zmem-interactive-123.service",
+            "app.slice/zmem-interactive-123-extra.scope",
+            "app.slice/nested.slice/zmem-interactive-123.scope",
+            "system.slice/zmem-interactive-123.scope",
+        ] {
+            assert!(
+                protection_process_path(root, &format!("0::/{path}\n"))
+                    .unwrap()
+                    .is_none(),
+                "{path}",
+            );
+        }
     }
 
     #[test]

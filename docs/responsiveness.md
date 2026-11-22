@@ -38,11 +38,19 @@ If current swappiness cannot be read, zmem skips the write and reports `readback
 
 ## Wait before adding another working set
 
-A new compiler or model loader can worsen paging even while disk Swap still has space. Starting with 0.4, `zmem run --class background` and `--class disposable` check available RAM and memory PSI before executing the target. The default wait is bounded at 60 seconds, with exit code 75 if conditions do not recover. Interactive commands bypass admission.
+A new compiler or model loader can worsen paging even while disk Swap still has space. `zmem run --class background` and `--class disposable` check available RAM and memory PSI before executing the target. The default wait is bounded at 60 seconds, with exit code 75 if conditions do not recover. Interactive commands bypass admission.
 
 Use `--wait-timeout 300` for a longer batch window or `--wait-timeout 0` for a single immediate attempt. The launcher emits JSON events on stderr while waiting, rechecks conditions before admission, and spaces same-user starts. The [admission guide](background-admission.md) explains the thresholds and recovery rule. This gate controls new explicitly submitted work; running-task budgets remain the daemon's responsibility.
 
 Keep a persistent Cargo target directory for repeated checks. A fresh temporary target directory discards that directory's compiled-artifact reuse, while excessive concurrent compiler working sets can turn CPU work into paging stalls. Admission and cache reuse address these separate costs. Neither requires a permanent one-core limit on ordinary builds.
+
+## Protect desktop applications
+
+The daemon recognizes ChatGPT, Chrome/Chromium, Firefox and WeChat in independent user application scopes, including nested graphical slices. It also recognizes the explicit `zmem-interactive-<pid>.scope` created by `zmem run --class interactive`. Generic `node`, `python` and `electron` processes do not qualify by name. A browser inherited by a terminal or remote-control scope does not enlarge that hosting scope's protection budget. This classification does not inspect the focused window or window titles.
+
+The planner requests up to 512 MiB of observed memory for each selected interactive scope and propagates its allocation through the cgroup ancestors. The total ceiling remains `min(RAM / 8, 2 GiB)`. Each user initially divides its share 3:1 between session and application scopes; genuinely unrequested capacity can be borrowed by selected scopes in that same user's other category. Both categories retain the original split when both need their full shares. Root's explicitly marked interactive scopes share the existing system ceiling, at most one eighth of the total budget, with selected system services.
+
+The interactive launcher makes an initial 512 MiB `memory.low` request on its scope. Complete ancestor planning requires a running daemon with `protect_sessions=true`; normal reconciliation runs every 15 sampling cycles, about 30 seconds with the default interval. The daemon retains nonzero external settings and applies the shared ancestor ceilings. `memory.low` is a best-effort reclaim preference, not preallocated RAM, a hard reservation or a promise to prevent all swapping. Inspect the leaf and every ancestor, together with `controls.protection_complete` and `protection_errors`, when checking whether protection was applied.
 
 ## Make user-session I/O controls available
 
@@ -62,7 +70,7 @@ Confirm the relevant scope's actual `cgroup.controllers`, `io.stat`, `io.weight`
 
 Filesystem deduplication has a storage workload and its own I/O budget. KSM has a memory-scanning workload and zmem's separate registration and pressure gates. Neither operation should be treated as free background work.
 
-Per-service `IOReadBandwidthMax` and `IOWriteBandwidthMax` can bound an observed storage scanner while retaining its process and progress. Select the physical backing device and read back its actual `io.max` entry. Unlike a relative weight, a bandwidth cap also limits an otherwise idle device; that is a throughput tradeoff, so zmem does not install one arbitrary cap on all applications.
+Per-service `IOReadBandwidthMax` and `IOWriteBandwidthMax` can bound an observed storage scanner while retaining its process and progress. Select every physical backing device that the service accesses and read back each actual `io.max` entry. A limit on the root device leaves a separate home-data device unrestricted. Compare device-specific `io.stat` deltas with `lsblk` and stable device identifiers before configuring the service. Unlike a relative weight, a bandwidth cap also limits an otherwise idle device; that is a throughput tradeoff, so zmem does not install one arbitrary cap on all applications.
 
-The [0.3.1 acceptance record](acceptance-0.3.1.md) separates the local filesystem-scanner mitigation from the zmem policy regression tests. It records memory and I/O observations, not an input-latency benchmark or a guarantee that every source of desktop stutter has been removed.
+The [0.4.2 acceptance record](acceptance-0.4.2.md) records desktop application protection, full ancestor-chain readbacks and the scanner's two-device I/O limit repair. It includes the final installed binary's identity and a 30-second natural-workload observation. The earlier [0.3.1 acceptance record](acceptance-0.3.1.md) separates the initial filesystem-scanner mitigation from the zmem policy regression tests. These are memory and I/O observations, not input-latency benchmarks or a guarantee that every source of desktop stutter has been removed.
 

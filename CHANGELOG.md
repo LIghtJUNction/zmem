@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.2 — 2026-11-22
+
+- Protect recognized desktop applications in independent application units and explicitly marked interactive scopes through their real ancestor chain. Retain smaller budgets for terminal/remote scopes that also contain browser descendants; avoid broad interpreter-name classification.
+- Keep the shared protection ceiling at `min(RAM / 8, 2 GiB)` and allow selected session/application scopes to borrow genuinely unused capacity only within the same user's budget. Root interactive scopes share the bounded system allocation.
+- Keep launch admission based on available RAM and memory PSI so deliberately paced maintenance I/O does not block otherwise healthy background starts; add a high-I/O/healthy-memory regression.
+- Align the interactive launcher's initial leaf request with the 512 MiB role cap; retain daemon reconciliation and external-control ownership rules. Document full-chain timing and per-device background I/O limit verification.
+
 ## 0.4.1 — 2026-11-22
 
 - Use architecture-correct Linux directory and no-follow open flags. AArch64 uses different values from x86_64; the 0.4.0 formal AArch64 validation exposed the mismatch before crate or release-asset publication.

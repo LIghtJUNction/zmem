@@ -19,6 +19,7 @@ pub enum Role {
     Input,
     Terminal,
     Remote,
+    Interactive,
 }
 
 impl Role {
@@ -27,6 +28,7 @@ impl Role {
             Self::Session => 3 * GIB / 2,
             Self::Input => 64 * MIB,
             Self::Terminal | Self::Remote => 128 * MIB,
+            Self::Interactive => 512 * MIB,
         }
     }
 }
@@ -89,10 +91,11 @@ struct Candidate {
 /// Duplicate paths use the largest bounded request, not the sum of roles. When
 /// both an ancestor and a descendant were selected, only the deepest selected
 /// scopes receive leaf budgets; their ancestors carry those budgets once.
-/// System services share at most B/8. The remaining user ceiling is divided
+/// System scopes share at most B/8. The remaining user ceiling is divided
 /// equally between users that have nonzero requests; each user's session/app
-/// ceilings retain the existing 3/4 and 1/4 split. Unused shares are not assigned
-/// to whole slices or redistributed to unrelated scopes.
+/// nominal shares retain the existing 3/4 and 1/4 split. A category may borrow
+/// the other category's unrequested share within the same user's ceiling.
+/// Unused shares never cross users or go to unselected scopes or whole slices.
 pub fn plan_protection(
     cgroup_root: &Path,
     total_bytes: u64,
@@ -174,8 +177,21 @@ pub fn plan_protection(
     let per_user = user_pages / users.len().max(1) as u64;
     for (session, app) in users.into_values() {
         let session_pages = per_user * 3 / 4;
-        allocate(&mut candidates, &session, session_pages, page_size);
-        allocate(&mut candidates, &app, per_user - session_pages, page_size);
+        let app_pages = per_user - session_pages;
+        let session_request = requested_pages(&candidates, &session, page_size);
+        let app_request = requested_pages(&candidates, &app, page_size);
+        // Lend only genuinely unrequested pages, not proportional-rounding
+        // leftovers. Lending both rounding deficits could overcommit a user.
+        let session_spare =
+            session_pages.saturating_sub(session_request.min(per_user as u128) as u64);
+        let app_spare = app_pages.saturating_sub(app_request.min(per_user as u128) as u64);
+        allocate(
+            &mut candidates,
+            &session,
+            session_pages + app_spare,
+            page_size,
+        );
+        allocate(&mut candidates, &app, app_pages + session_spare, page_size);
     }
 
     let mut limits = BTreeMap::new();
@@ -215,6 +231,13 @@ fn preference(leaf: &ProtectedLeaf) -> (u64, u64, u64, Role) {
     )
 }
 
+fn requested_pages(candidates: &[Candidate], indices: &[usize], page_size: u64) -> u128 {
+    indices
+        .iter()
+        .map(|&index| (candidates[index].leaf.requested_bytes / page_size) as u128)
+        .sum()
+}
+
 /// Allocate in pages so rounding cannot exceed either the request or the cap.
 /// Proportional rounding may leave less than one page per candidate unused.
 fn allocate(
@@ -223,10 +246,7 @@ fn allocate(
     cap_pages: u64,
     page_size: u64,
 ) -> u64 {
-    let requested: u128 = indices
-        .iter()
-        .map(|&index| (candidates[index].leaf.requested_bytes / page_size) as u128)
-        .sum();
+    let requested = requested_pages(candidates, indices, page_size);
     let mut allocated = 0;
     for &index in indices {
         let leaf = &mut candidates[index].leaf;
@@ -269,6 +289,12 @@ fn uid_component(component: &str) -> Option<u32> {
     (text == uid.to_string()).then_some(uid)
 }
 
+pub(crate) fn explicit_interactive_unit(name: &str) -> bool {
+    name.strip_prefix("zmem-interactive-")
+        .and_then(|name| name.strip_suffix(".scope"))
+        .is_some_and(|pid| !pid.is_empty() && pid.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
 fn classify(root: &Path, root_parts: &[&str], scope: &Scope) -> Result<Domain, String> {
     let parts = absolute_parts(&scope.path)?;
     let reject = || format!("unsupported protection scope: {}", scope.path.display());
@@ -278,6 +304,13 @@ fn classify(root: &Path, root_parts: &[&str], scope: &Scope) -> Result<Domain, S
     let tail = &parts[root_parts.len()..];
     if tail.len() > MAX_DEPTH || !scope.path.starts_with(root) {
         return Err(reject());
+    }
+    if tail.len() == 2
+        && tail[0] == "app.slice"
+        && scope.role == Role::Interactive
+        && explicit_interactive_unit(tail[1])
+    {
+        return Ok(Domain::System);
     }
     if tail.len() == 2
         && tail[0] == "system.slice"
@@ -513,7 +546,7 @@ mod tests {
     }
 
     #[test]
-    fn protection_plan_leaves_unused_categories_unallocated() {
+    fn protection_plan_lends_unused_session_share_only_to_selected_apps() {
         let scopes: Vec<_> = (0..8)
             .map(|index| {
                 user(
@@ -526,7 +559,7 @@ mod tests {
             })
             .collect();
         let p = plan(&scopes);
-        assert_eq!(p.allocated_bytes, 512 * MIB);
+        assert_eq!(p.allocated_bytes, GIB);
         assert_eq!(p.budget_bytes, 2 * GIB);
         assert!(
             !p.limits
@@ -536,8 +569,63 @@ mod tests {
     }
 
     #[test]
+    fn protection_plan_lends_unused_app_share_to_the_same_users_session() {
+        let wm = user(1000, "session", "wm.scope", Role::Session, 2 * GIB);
+        let app = user(1000, "app", "terminal.scope", Role::Terminal, 128 * MIB);
+        let p =
+            plan_protection(Path::new(ROOT), 8 * GIB, PAGE, &[wm.clone(), app.clone()]).unwrap();
+        assert_eq!(low(&p, &wm.path), 896 * MIB);
+        assert_eq!(low(&p, &app.path), 128 * MIB);
+        assert_eq!(p.allocated_bytes, p.budget_bytes);
+    }
+
+    #[test]
+    fn protection_plan_interactive_apps_share_only_requested_bounded_memory() {
+        let wm = user(1000, "session", "wm.scope", Role::Session, 128 * MIB);
+        let app = user(
+            1000,
+            "app",
+            "app-org.chromium.Chromium-3400501.scope",
+            Role::Interactive,
+            154 * MIB,
+        );
+        let large = user(
+            1000,
+            "app",
+            "app-graphical.slice/app-chatgpt.scope",
+            Role::Interactive,
+            2 * GIB,
+        );
+        let p = plan(&[wm.clone(), app.clone(), large.clone()]);
+        assert_eq!(low(&p, &app.path), 154 * MIB);
+        assert_eq!(low(&p, &large.path), 512 * MIB);
+        assert_eq!(low(&p, &wm.path), 128 * MIB);
+        assert_eq!(p.allocated_bytes, (154 + 512 + 128) * MIB);
+        assert!(p.allocated_bytes < p.budget_bytes);
+    }
+
+    #[test]
+    fn protection_plan_does_not_lend_proportional_rounding_deficits() {
+        for page in [4096, 65536] {
+            let scopes = [
+                user(1000, "session", "wm-a.scope", Role::Session, 5 * page),
+                user(1000, "session", "wm-b.scope", Role::Session, 5 * page),
+                user(1000, "app", "app-a.scope", Role::Interactive, 2 * page),
+                user(1000, "app", "app-b.scope", Role::Interactive, 2 * page),
+            ];
+            let p = plan_protection(Path::new(ROOT), 96 * page, page, &scopes).unwrap();
+            assert_eq!(p.budget_bytes, 12 * page);
+            // Both categories want their whole nominal share. Their rounding
+            // deficits are not spare demand that can be lent in both directions.
+            assert_eq!(p.allocated_bytes, 10 * page);
+            assert!(p.allocated_bytes <= p.budget_bytes);
+            assert!(p.limits.values().all(|bytes| bytes % page == 0));
+        }
+    }
+
+    #[test]
     fn protection_plan_shares_user_ceiling_without_lending_unused_user_shares() {
-        let mut scopes: Vec<_> = (0..4)
+        let mut scopes: Vec<_> = (0..16)
             .map(|index| {
                 user(
                     1000,
@@ -552,9 +640,12 @@ mod tests {
         let p = plan(&scopes);
         let first = Path::new(ROOT).join("user.slice/user-1000.slice");
         let second = Path::new(ROOT).join("user.slice/user-1001.slice");
-        assert_eq!(low(&p, &first), 256 * MIB);
+        assert_eq!(low(&p, &first), GIB);
         assert_eq!(low(&p, &second), 128 * MIB);
-        assert_eq!(low(&p, &Path::new(ROOT).join("user.slice")), 384 * MIB);
+        assert_eq!(
+            low(&p, &Path::new(ROOT).join("user.slice")),
+            GIB + 128 * MIB
+        );
     }
 
     #[test]
@@ -575,6 +666,47 @@ mod tests {
         );
         assert!(p.allocated_bytes <= p.budget_bytes);
         assert!(p.limits.values().all(|value| *value <= p.budget_bytes));
+    }
+
+    #[test]
+    fn protection_plan_root_interactive_scope_requires_explicit_marker_and_role() {
+        let root_app = Scope {
+            path: Path::new(ROOT).join("app.slice/zmem-interactive-123.scope"),
+            role: Role::Interactive,
+            current_bytes: GIB,
+        };
+        let ssh = system("sshd.service", Role::Remote, GIB);
+        let p = plan(&[root_app.clone(), ssh]);
+        assert!(low(&p, &root_app.path) > 0);
+        assert_eq!(
+            low(&p, root_app.path.parent().unwrap()),
+            low(&p, &root_app.path)
+        );
+        assert_eq!(p.allocated_bytes, p.system_budget_bytes);
+        assert!(p.system_budget_bytes <= p.budget_bytes / 8);
+        assert_eq!(p.user_budget_bytes + p.system_budget_bytes, p.budget_bytes);
+        for role in [Role::Session, Role::Terminal, Role::Remote] {
+            let mut invalid = root_app.clone();
+            invalid.role = role;
+            assert!(plan_protection(Path::new(ROOT), 16 * GIB, PAGE, &[invalid]).is_err());
+        }
+        for path in [
+            "app.slice/app-chatgpt.scope",
+            "app.slice/zmem-interactive-.scope",
+            "app.slice/zmem-interactive-123.service",
+            "app.slice/zmem-interactive-123-extra.scope",
+            "app.slice/nested.slice/zmem-interactive-123.scope",
+            "system.slice/zmem-interactive-123.scope",
+        ] {
+            let invalid = Scope {
+                path: Path::new(ROOT).join(path),
+                ..root_app.clone()
+            };
+            assert!(
+                plan_protection(Path::new(ROOT), 16 * GIB, PAGE, &[invalid]).is_err(),
+                "{path}"
+            );
+        }
     }
 
     #[test]

@@ -1099,7 +1099,23 @@ mod tests {
         }));
         let fixture = Fixture::new();
         // There is deliberately no pressure/io node in this fixture.
-        assert!(sample(&fixture.proc(8 * GIB)).is_ok());
+        let root = fixture.proc(8 * GIB);
+        assert!(sample(&root).is_ok());
+        // Global IO pressure can include a deliberately throttled scanner.
+        // It must not prevent initial admission when memory is healthy.
+        fs::write(
+            root.join("pressure/io"),
+            "some avg10=75.00\nfull avg10=65.00\n",
+        )
+        .unwrap();
+        assert!(Gate::new(Config::default()).ready(sample(&root).unwrap(), 0));
+        // The same busy disk does not weaken the existing memory gate.
+        fs::write(
+            root.join("pressure/memory"),
+            "some avg10=5.00\nfull avg10=2.00\n",
+        )
+        .unwrap();
+        assert!(!Gate::new(Config::default()).ready(sample(&root).unwrap(), 0));
     }
 
     #[test]
