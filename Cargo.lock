@@ -3,6 +3,11 @@
 version = 4
 
 [[package]]
+name = "zconv"
+version = "0.4.1"
+source = "git+https://github.com/LIghtJUNction/zconv.git#f9448d27997dc70dac05f0c0e58857bcce43ab72"
+
+[[package]]
 name = "zhex"
 version = "0.1.3"
 source = "git+https://github.com/LIghtJUNction/zhex.git#52515207f9d97a2580182169b611b4763366b328"
@@ -11,5 +16,6 @@ source = "git+https://github.com/LIghtJUNction/zhex.git#52515207f9d97a2580182169
 name = "zmem-manager"
 version = "0.4.5"
 dependencies = [
+ "zconv",
  "zhex",
 ]

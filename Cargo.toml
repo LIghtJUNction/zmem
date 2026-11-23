@@ -15,7 +15,7 @@ include = ["src/**", "packaging/**", "Cargo.toml", "Cargo.lock", "README.md", "L
 
 [features]
 default = ["std"]
-std = ["dep:zhex"]
+std = ["dep:zconv", "dep:zhex"]
 
 [lib]
 name = "zmem"
@@ -34,4 +34,5 @@ strip = true
 panic = "abort"
 
 [dependencies]
+zconv = { git = "https://github.com/LIghtJUNction/zconv.git", default-features = false, optional = true }
 zhex = { git = "https://github.com/LIghtJUNction/zhex.git", optional = true }

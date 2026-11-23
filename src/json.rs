@@ -1,26 +1,18 @@
-use std::{
-    collections::BTreeMap,
-    fmt::{self, Write},
-};
+use std::{collections::BTreeMap, fmt};
 
 pub fn quote(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 32 => {
-                let _ = write!(out, "\\u{:04x}", c as u32);
-            }
-            _ => out.push(c),
-        }
-    }
-    out.push('"');
-    out
+    use zconv::json::{ControlEscapes, Writer};
+    let mut sizing = Writer::new(&mut []);
+    sizing.string_with_control_escapes(s.as_bytes(), ControlEscapes::Unicode);
+    let needed = match sizing.finish() {
+        Err(zconv::Error::OutputTooSmall { needed }) => needed,
+        result => panic!("valid JSON string sizing failed: {result:?}"),
+    };
+    let mut output = vec![0; needed];
+    let mut writer = Writer::new(&mut output);
+    writer.string_with_control_escapes(s.as_bytes(), ControlEscapes::Unicode);
+    writer.finish().expect("sized JSON string output");
+    String::from_utf8(output).expect("validated UTF-8 JSON string")
 }
 
 pub fn strings(values: &[String]) -> String {
@@ -430,5 +422,19 @@ mod tests {
             assert!(super::parse(text).is_err(), "{text}");
         }
         assert!(super::parse(&format!("{}0{}", "[".repeat(66), "]".repeat(66))).is_err());
+    }
+}
+
+#[cfg(test)]
+mod shared_escape_contract {
+    #[test]
+    fn serialized_control_bytes_keep_the_consumer_contract() {
+        let controls: String = (0u8..32).map(char::from).collect();
+        let expected = r#""\u0000\u0001\u0002\u0003\u0004\u0005\u0006\u0007\u0008\t\n\u000b\u000c\r\u000e\u000f\u0010\u0011\u0012\u0013\u0014\u0015\u0016\u0017\u0018\u0019\u001a\u001b\u001c\u001d\u001e\u001f""#;
+        assert_eq!(super::quote(&controls), expected);
+        assert_eq!(
+            super::quote("literal \\b \\f \\u0008 \" 模型🚀"),
+            r#""literal \\b \\f \\u0008 \" 模型🚀""#
+        );
     }
 }

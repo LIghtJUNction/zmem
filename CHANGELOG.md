@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Route JSON string output through zconv while preserving lowercase `\u0008` and `\u000c` escapes, raw number text and report ordering. The optional dependency belongs to `std`; the policy core remains dependency-free with default features disabled.
+
 ## 0.4.5 — 2026-11-23
 
 - Preserve the original 30-second file-refault observation across repeated successful reclaim. Accumulated reuse now triggers the existing 60-second pause, including when a later worker finishes.

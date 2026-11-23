@@ -4,7 +4,7 @@
 
 [Website](https://lightjunction.github.io/zmem/) · [Releases](https://github.com/LIghtJUNction/zmem/releases) · [crates.io](https://crates.io/crates/zmem-manager) · [Rust API](https://docs.rs/zmem-manager) · [Background admission](docs/background-admission.md) · [0.4.4 acceptance](docs/acceptance-0.4.4.md) · [0.4.3 acceptance](docs/acceptance-0.4.3.md) · [Responsiveness guide](docs/responsiveness.md) · [Swap and dedup guide](docs/swap-lifecycle-and-dedup.md) · [0.2.0 host acceptance](docs/acceptance-0.2.0.md)
 
-zmem observes memory and I/O pressure, waits before starting new managed background work under pressure, and gives running background jobs a bounded memory budget. It brings zram setup, dynamic disk swap, automatic cleanup, opt-in memory deduplication and structured inspection into one tool. The policy library uses `no_std`, has no dependencies and makes no heap allocations. The standard-library Linux application reuses Project Z’s `zhex` library for backup path encoding.
+zmem observes memory and I/O pressure, waits before starting new managed background work under pressure, and gives running background jobs a bounded memory budget. It brings zram setup, dynamic disk swap, automatic cleanup, opt-in memory deduplication and structured inspection into one tool. The policy library uses `no_std`, has no dependencies and makes no heap allocations. The standard-library Linux application reuses Project Z’s `zhex` library for backup path encoding and `zconv` for JSON string escaping.
 
 ## What it does
 
@@ -206,7 +206,7 @@ cargo check --locked --lib --no-default-features
 cargo build --release --locked
 ```
 
-Rust 1.99.1 or newer is required. Formal Project Z builds use Rust 1.100.0. The `std` feature enables the application’s `zhex` dependency; disabling default features keeps the policy library dependency-free.
+Rust 1.99.1 or newer is required. Formal Project Z builds use Rust 1.100.0. The `std` feature enables the application’s `zhex` and `zconv` dependencies; disabling default features keeps the policy library dependency-free.
 
 The public policy types can be embedded without the operating-system adapter. The `zmem` executable targets Linux; the `no_std` policy library does not depend on Linux.
 
