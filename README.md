@@ -4,7 +4,7 @@
 
 [Website](https://lightjunction.github.io/zmem/) · [Releases](https://github.com/LIghtJUNction/zmem/releases) · [crates.io](https://crates.io/crates/zmem-manager) · [Rust API](https://docs.rs/zmem-manager) · [Background admission](docs/background-admission.md) · [0.4.4 acceptance](docs/acceptance-0.4.4.md) · [0.4.3 acceptance](docs/acceptance-0.4.3.md) · [Responsiveness guide](docs/responsiveness.md) · [Swap and dedup guide](docs/swap-lifecycle-and-dedup.md) · [0.2.0 host acceptance](docs/acceptance-0.2.0.md)
 
-zmem observes memory and I/O pressure, waits before starting new managed background work under pressure, and gives running background jobs a bounded memory budget. It brings zram setup, dynamic disk swap, automatic cleanup, opt-in memory deduplication and structured inspection into one tool. The Rust implementation has no third-party crate dependencies; the policy library uses `no_std` and makes no heap allocations.
+zmem observes memory and I/O pressure, waits before starting new managed background work under pressure, and gives running background jobs a bounded memory budget. It brings zram setup, dynamic disk swap, automatic cleanup, opt-in memory deduplication and structured inspection into one tool. The policy library uses `no_std`, has no dependencies and makes no heap allocations. The standard-library Linux application reuses Project Z’s `zhex` library for backup path encoding.
 
 ## What it does
 
@@ -206,6 +206,8 @@ cargo check --locked --lib --no-default-features
 cargo build --release --locked
 ```
 
+Rust 1.99.1 or newer is required. Formal Project Z builds use Rust 1.100.0. The `std` feature enables the application’s `zhex` dependency; disabling default features keeps the policy library dependency-free.
+
 The public policy types can be embedded without the operating-system adapter. The `zmem` executable targets Linux; the `no_std` policy library does not depend on Linux.
 
 The repository includes a read-only probe for observations during ordinary work:
@@ -226,9 +228,19 @@ The published [0.2.0 acceptance record](docs/acceptance-0.2.0.md) applies to its
 
 Open **Actions → Release zmem → Run workflow**. Leave `tag` empty and set `version` to `patch`, `minor`, `major`, or an explicit `X.Y.Z`.
 
-The workflow updates `Cargo.toml`, `Cargo.lock` and the website version, validates the source, commits to `main`, and creates the release tag. The same run builds native Linux x86_64 and ARM64 executables, publishes the crate with the repository's `CARGO_REGISTRY_TOKEN` secret, and uploads the archives and checksums to GitHub Releases. A direct version-tag push runs the release pipeline too. All releases share a concurrency group to prevent overlapping version publication.
+The workflow updates `Cargo.toml`, `Cargo.lock` and the website version, validates the source, commits to `main`, and creates the release tag. The same run builds native Linux x86_64 and ARM64 executables and uploads their archives and checksums to GitHub Releases. A direct version-tag push runs this pipeline too. GitHub releases share a concurrency group to prevent overlapping version publication. They do not require a crates.io token or a successful registry publication.
 
-To rebuild an existing tag after a failed infrastructure step, set `tag` to that version. An existing crate version is retained; an existing release asset must match the rebuilt file exactly. The workflow does not silently replace published artifacts.
+To rebuild an existing tag after a failed infrastructure step, set `tag` to that version. An existing release asset must match the rebuilt file exactly. The workflow does not silently replace published artifacts.
+
+### Publish the registry crate separately
+
+Open **Actions → Publish zmem registry crate → Run workflow** and select an existing `vX.Y.Z` tag. Tag pushes and the GitHub release workflow never start this separate entry. Leave `publish` unchecked for a dry run; check it only when a crates.io upload is intended. Uploads require the repository's `CARGO_REGISTRY_TOKEN` secret. A failed registry run does not block GitHub release assets.
+
+Provide `receipts_url`, an HTTPS URL containing the reviewed Project Z dependency receipt file, and `receipts_sha256`, its SHA-256 obtained independently from the release authority. The schema-v1 file contains `schema_version: 1` and a `receipts` array. Each record identifies `package`, `version`, `github`, `git_sha` and `archive_sha256`. These records must establish that the registry archive came from the exact Git commit in the selected tag's `Cargo.lock`; a matching version alone is insufficient. See the [shared receipt contract](https://github.com/LIghtJUNction/project-z/blob/dbeecf0c038d9184825e6fb2a25dfdc5eb951e40/docs/release-projection.md#verify-upstream-registry-receipts). No production receipt is supplied by this repository.
+
+The workflow reuses Project Z's `release_projection.py` and `release_receipts.py` at the fixed revision `dbeecf0c038d9184825e6fb2a25dfdc5eb951e40`. It archives the selected source into a directory outside Git, converts its internal Git dependencies to exact registry versions, downloads their crate archives, and verifies the supplied receipts without changing the development manifest or lock. It then generates a registry lock, checks that Cargo selected the verified archive checksums, and runs `cargo publish --dry-run --locked --registry crates-io` from staging. Only a successful check followed by an explicit `publish` selection permits upload from that same staging directory.
+
+Missing receipts, different source commits, unavailable archives and checksum mismatches fail the registry run. The workflow does not create prerequisite crate releases or overwrite an existing crate version. Its `zmem-registry-review` artifact records the source commit, projection, receipt verification and registry lock for review. Fixture receipts used by the adapter's offline tests are synthetic and do not establish provenance for a production release.
 
 Local version editing is also available:
 

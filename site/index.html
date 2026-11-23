@@ -52,7 +52,7 @@
         <p class="visual-caption" data-i18n="terminal.caption">示意数据。实际 status 标明守护程序报告的来源与采样年龄。</p>
       </div>
     </section>
-    <div class="facts wrap" aria-label="Project properties"><div><strong>0</strong><span data-i18n="facts.deps">Rust 第三方依赖</span></div><div><strong>no_std</strong><span data-i18n="facts.core">无分配策略内核</span></div><div><strong>JSON</strong><span data-i18n="facts.ai">可被 AI 读取和调用</span></div><div><strong>Linux</strong><span data-i18n="facts.host">PSI + cgroup v2</span></div></div>
+    <div class="facts wrap" aria-label="Project properties"><div><strong>0</strong><span data-i18n="facts.deps">策略内核依赖</span></div><div><strong>no_std</strong><span data-i18n="facts.core">无分配策略内核</span></div><div><strong>JSON</strong><span data-i18n="facts.ai">可被 AI 读取和调用</span></div><div><strong>Linux</strong><span data-i18n="facts.host">PSI + cgroup v2</span></div></div>
     <section id="principles" class="principles wrap section" aria-labelledby="principles-title">
       <div class="section-heading"><p class="eyebrow" data-i18n="principles.label">01 / 控制回路</p><h2 id="principles-title" data-i18n="principles.title">先看压力，再分配余量。</h2><p data-i18n="principles.intro">内存用得多很正常。zmem 更关心任务是否正在等待内存，以及下一步动作会带来多少代价。</p></div>
       <div class="principle-list">

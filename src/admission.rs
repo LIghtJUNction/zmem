@@ -1175,11 +1175,11 @@ mod tests {
             threads.push(thread::spawn(move || {
                 let coordinator = Coordinator::at(path, identity).unwrap();
                 barrier.wait();
-                if let Some(lock) = coordinator.try_lock().unwrap() {
-                    if lock.remaining_ms(1000).unwrap() == 0 {
-                        lock.reserve(1000).unwrap();
-                        admitted.fetch_add(1, Ordering::Relaxed);
-                    }
+                if let Some(lock) = coordinator.try_lock().unwrap()
+                    && lock.remaining_ms(1000).unwrap() == 0
+                {
+                    lock.reserve(1000).unwrap();
+                    admitted.fetch_add(1, Ordering::Relaxed);
                 }
             }));
         }

@@ -2,7 +2,7 @@
 name = "zmem-manager"
 version = "0.4.5"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.99.1"
 description = "A lightweight, pressure-aware Linux memory and swap manager with a no_std policy core"
 license = "MIT"
 repository = "https://github.com/LIghtJUNction/zmem"
@@ -15,7 +15,7 @@ include = ["src/**", "packaging/**", "Cargo.toml", "Cargo.lock", "README.md", "L
 
 [features]
 default = ["std"]
-std = []
+std = ["dep:zhex"]
 
 [lib]
 name = "zmem"
@@ -34,3 +34,4 @@ strip = true
 panic = "abort"
 
 [dependencies]
+zhex = { git = "https://github.com/LIghtJUNction/zhex.git", optional = true }

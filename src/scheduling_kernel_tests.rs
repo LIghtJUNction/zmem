@@ -204,10 +204,11 @@ impl SchedulingFixture {
                 Err(error) => errors.push(error.to_string()),
             }
         }
-        if self.monitor.exists() && !self.moved {
-            if let Err(error) = fs::remove_dir(&self.monitor) {
-                errors.push(error.to_string());
-            }
+        if self.monitor.exists()
+            && !self.moved
+            && let Err(error) = fs::remove_dir(&self.monitor)
+        {
+            errors.push(error.to_string());
         }
         self.cleaned = errors.is_empty();
         if self.cleaned {
@@ -220,10 +221,10 @@ impl SchedulingFixture {
 
 impl Drop for SchedulingFixture {
     fn drop(&mut self) {
-        if !self.cleaned {
-            if let Err(error) = self.cleanup() {
-                eprintln!("isolated scheduling fixture cleanup: {error}");
-            }
+        if !self.cleaned
+            && let Err(error) = self.cleanup()
+        {
+            eprintln!("isolated scheduling fixture cleanup: {error}");
         }
     }
 }

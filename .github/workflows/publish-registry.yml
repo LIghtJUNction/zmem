@@ -1,0 +1,96 @@
+name: Publish zmem registry crate
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag, for example v0.4.6"
+        type: string
+        required: true
+      receipts_url:
+        description: "HTTPS URL of the reviewed Project Z schema-v1 dependency receipts"
+        type: string
+        required: true
+      receipts_sha256:
+        description: "Receipt-file SHA-256 obtained independently from the release authority"
+        type: string
+        required: true
+      publish:
+        description: "Upload to crates.io after receipt verification and a successful dry run"
+        type: boolean
+        default: false
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zmem-registry-release
+  cancel-in-progress: false
+
+jobs:
+  registry:
+    runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: 1.100.0
+      CARGO_TARGET_DIR: ${{ runner.temp }}/zmem-registry-target
+      PROJECT_Z_TOOLS: ${{ github.workspace }}/project-z-tools
+      RELEASE_TAG: ${{ inputs.tag }}
+      RECEIPTS_URL: ${{ inputs.receipts_url }}
+      RECEIPTS_SHA256: ${{ inputs.receipts_sha256 }}
+    steps:
+      - name: Check out release automation
+        uses: actions/checkout@v7
+        with:
+          path: automation
+          persist-credentials: false
+      - name: Check out the tagged source
+        uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          path: release-source
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check out shared Project Z release tools
+        uses: actions/checkout@v7
+        with:
+          repository: LIghtJUNction/project-z
+          ref: dbeecf0c038d9184825e6fb2a25dfdc5eb951e40
+          path: project-z-tools
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /.gitmodules
+            /scripts/cargo_versions.py
+            /scripts/release_projection.py
+            /scripts/release_receipts.py
+      - name: Install the release toolchain
+        run: rustup toolchain install 1.100.0 --profile minimal
+      - name: Check the release adapter with offline fixtures
+        run: python3 -m unittest discover -s automation/scripts -p test_registry_release.py -v
+      - name: Verify receipts and dry-run the registry projection
+        run: |
+          python3 automation/scripts/registry_release.py \
+            --repo "$GITHUB_WORKSPACE/release-source" \
+            --tools "$PROJECT_Z_TOOLS" --tag "$RELEASE_TAG" \
+            --receipts-url "$RECEIPTS_URL" \
+            --trusted-receipts-sha256 "$RECEIPTS_SHA256" \
+            --output "$RUNNER_TEMP/zmem-registry"
+      - name: Publish the verified registry crate
+        if: inputs.publish
+        working-directory: ${{ runner.temp }}/zmem-registry/source
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          test -n "$CARGO_REGISTRY_TOKEN" || { echo 'CARGO_REGISTRY_TOKEN is required for publication.' >&2; exit 1; }
+          cargo publish --locked --registry crates-io
+      - name: Preserve registry review evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: zmem-registry-review
+          if-no-files-found: ignore
+          path: |
+            ${{ runner.temp }}/zmem-registry/*.json
+            ${{ runner.temp }}/zmem-registry/source/Cargo.toml
+            ${{ runner.temp }}/zmem-registry/source/Cargo.lock

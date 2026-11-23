@@ -295,10 +295,10 @@ impl Tracker {
             return Err(SkipReason::RequestTooSmall);
         }
 
-        if let Some(entry) = self.entries.iter_mut().find(|e| e.matches(sample)) {
-            if let Some(reason) = entry.defer(sample, page_size, now_secs) {
-                return Err(reason);
-            }
+        if let Some(entry) = self.entries.iter_mut().find(|e| e.matches(sample))
+            && let Some(reason) = entry.defer(sample, page_size, now_secs)
+        {
+            return Err(reason);
         }
         Ok(Request {
             bytes: amount,
@@ -398,12 +398,11 @@ impl Tracker {
                         page_size: request.page_size,
                     },
                 };
-                if let Some(after) = comparable {
-                    if entry.defer(after, request.page_size, now_secs)
+                if let Some(after) = comparable
+                    && entry.defer(after, request.page_size, now_secs)
                         == Some(SkipReason::RefaultBackoff)
-                    {
-                        outcome.retry_after_secs = now_secs.saturating_add(REFAULT_BACKOFF_SECS);
-                    }
+                {
+                    outcome.retry_after_secs = now_secs.saturating_add(REFAULT_BACKOFF_SECS);
                 }
                 self.record(entry);
             } else if let Some(entry) = self.entries.iter_mut().find(|e| e.matches(request.before))

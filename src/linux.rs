@@ -1320,27 +1320,27 @@ impl Controls {
             return Ok(());
         }
         let mut managed_reset = false;
-        if let Some(entry) = self.entries.get(path) {
-            if !owned_control_value(
+        if let Some(entry) = self.entries.get(path)
+            && !owned_control_value(
                 path,
                 &entry.last,
                 entry.pending_previous.as_deref(),
                 &old,
                 page_size,
-            )? {
-                // systemd can reapply the default unlimited value when a new
-                // scope joins our dedicated aggregate slice. zmem owns that
-                // slice's policy limit while running. An explicit `max` there
-                // is a temporary reset; finite external limits stay protected.
-                if managed_background_high_reset(path, &entry.original, &old)
-                    || owned_protection_default_reset(path, &entry.original, &old)
-                {
-                    managed_reset = true;
-                } else {
-                    return Err(
-                        format!("external control change preserved: {}", path.display()).into(),
-                    );
-                }
+            )?
+        {
+            // systemd can reapply the default unlimited value when a new
+            // scope joins our dedicated aggregate slice. zmem owns that
+            // slice's policy limit while running. An explicit `max` there
+            // is a temporary reset; finite external limits stay protected.
+            if managed_background_high_reset(path, &entry.original, &old)
+                || owned_protection_default_reset(path, &entry.original, &old)
+            {
+                managed_reset = true;
+            } else {
+                return Err(
+                    format!("external control change preserved: {}", path.display()).into(),
+                );
             }
         }
         let previous = self.entries.get(path).cloned();
@@ -1451,11 +1451,11 @@ impl Controls {
     }
 
     fn forget_protection(&mut self, path: &Path) -> Result<()> {
-        if let Some(entry) = self.entries.remove(path) {
-            if let Err(error) = self.save() {
-                self.entries.insert(path.into(), entry);
-                return Err(error);
-            }
+        if let Some(entry) = self.entries.remove(path)
+            && let Err(error) = self.save()
+        {
+            self.entries.insert(path.into(), entry);
+            return Err(error);
         }
         Ok(())
     }
@@ -2373,10 +2373,11 @@ fn apply_controls(
     // Terminal scopes and user managers disappear during normal session churn.
     // Keep recovery proportional to live controls rather than daemon uptime.
     let protect = protect || (settings.protect_sessions && c.protection_reset_pending());
-    if protect && c.prune_stale() {
-        if let Err(e) = c.save() {
-            errors.push(e.to_string());
-        }
+    if protect
+        && c.prune_stale()
+        && let Err(e) = c.save()
+    {
+        errors.push(e.to_string());
     }
     if protect && settings.protect_sessions {
         let mut protection_errors = Vec::new();
@@ -2404,10 +2405,10 @@ fn apply_controls(
         }) {
             errors.push(e.to_string());
         }
-        if !t.zram.is_empty() {
-            if let Err(e) = c.set(Path::new("/proc/sys/vm/page-cluster"), "0", false) {
-                errors.push(e.to_string());
-            }
+        if !t.zram.is_empty()
+            && let Err(e) = c.set(Path::new("/proc/sys/vm/page-cluster"), "0", false)
+        {
+            errors.push(e.to_string());
         }
     }
     background::apply(settings, t, d, c, errors)
@@ -2710,16 +2711,14 @@ pub fn grow_swap(settings: &Settings, requested: u64) -> Result<()> {
             pinned.metadata(),
             swap_target(&path).and_then(|file| Ok(file.metadata()?)),
             swaps(),
+        ) && can_remove_failed_swap(
+            &path,
+            SwapIdentity::of(&expected),
+            Some(SwapIdentity::of(&current)),
+            swap_syscall_errno(error.as_ref()),
+            &active,
         ) {
-            if can_remove_failed_swap(
-                &path,
-                SwapIdentity::of(&expected),
-                Some(SwapIdentity::of(&current)),
-                swap_syscall_errno(error.as_ref()),
-                &active,
-            ) {
-                let _ = fs::remove_file(&path);
-            }
+            let _ = fs::remove_file(&path);
         }
     }
     result
@@ -3263,10 +3262,9 @@ pub fn daemon(settings: Settings, config: PathBuf, observe: bool, once: bool) ->
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("zmem sample failed: {e}");
-                    if !observe {
-                        if let Err(error) = dedup_state.pause_on_sample_error(&mut controls) {
-                            eprintln!("cannot pause owned KSM after failed sample: {error}");
-                        }
+                    if !observe && let Err(error) = dedup_state.pause_on_sample_error(&mut controls)
+                    {
+                        eprintln!("cannot pause owned KSM after failed sample: {error}");
                     }
                     if once {
                         return Err(e);
@@ -3284,7 +3282,7 @@ pub fn daemon(settings: Settings, config: PathBuf, observe: bool, once: bool) ->
                     &mut t,
                     &d,
                     &mut controls,
-                    loop_index % 15 == 0,
+                    loop_index.is_multiple_of(15),
                     elapsed,
                     &mut errors,
                 )

@@ -7,7 +7,7 @@
     "hero.cta": "Get started", "hero.demo": "Explore the policy", "hero.note": "Written in Rust · Runs locally · One view for people and AI",
     "terminal.label": "ILLUSTRATIVE OUTPUT", "terminal.available": "Available memory", "terminal.active": "In use", "terminal.headroom": "Headroom", "terminal.availableShort": "Available",
     "terminal.swap": "Swap available", "terminal.policy": "Current policy", "terminal.normal": "hold / observe", "terminal.last": "Read the pressure. Bound the action.", "terminal.caption": "Illustrative values. Actual status identifies the daemon report's source and sample age.",
-    "facts.deps": "Third-party Rust dependencies", "facts.core": "Allocation-free policy", "facts.ai": "Structured control for AI", "facts.host": "PSI + cgroup v2",
+    "facts.deps": "Policy-core dependencies", "facts.core": "Allocation-free policy", "facts.ai": "Structured control for AI", "facts.host": "PSI + cgroup v2",
     "principles.label": "01 / THE CONTROL LOOP", "principles.title": "Measure pressure. Preserve headroom.", "principles.intro": "Memory is there to be used. zmem looks at how long tasks wait for it, and the cost of the next action.",
     "principles.observe.title": "Observe real stalls", "principles.observe.body": "Report memory pressure and IO congestion separately. Use available memory, PSI stall time, file-page refaults and paging activity to assess the next action's cost.",
     "principles.act.title": "Take small steps. Keep tasks alive.", "principles.act.body": "Adjust swap preference from measured paging cost and budget managed background work. Follow recognized desktop, terminal and remote-access processes through their actual cgroup hierarchy.",

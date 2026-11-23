@@ -332,10 +332,10 @@ fn stop_manager(systemctl: &Path) -> Result<()> {
     // Version 0.1.0 may delete its journal while skipping page-rounded limits.
     // Persist the captured journal before stopping that writer. A failed
     // recovery retains this file, so a subsequent install cannot lose it.
-    if !recovery.exists() {
-        if let Some(text) = &snapshot {
-            write_atomic(recovery, text.as_bytes(), 0o600)?;
-        }
+    if !recovery.exists()
+        && let Some(text) = &snapshot
+    {
+        write_atomic(recovery, text.as_bytes(), 0o600)?;
     }
     // Only the live journal identifies the running writer's format. A saved
     // five-column journal may coexist with a newer daemon on a recovery retry.
@@ -1356,16 +1356,15 @@ fn wait_ready(systemctl: &Path) -> Result<()> {
             .get("MainPID")
             .and_then(|p| p.parse::<u64>().ok())
             .unwrap_or(0);
-        if observed == "active" && pid != 0 {
-            if let Ok(metadata) = fs::symlink_metadata(STATUS) {
-                if metadata.is_file() && metadata.uid() == 0 {
-                    if let Ok(status) = read_limited(Path::new(STATUS), 256 * 1024) {
-                        if json_u64(&status, "pid") == Some(pid) {
-                            return Ok(());
-                        }
-                    }
-                }
-            }
+        if observed == "active"
+            && pid != 0
+            && let Ok(metadata) = fs::symlink_metadata(STATUS)
+            && metadata.is_file()
+            && metadata.uid() == 0
+            && let Ok(status) = read_limited(Path::new(STATUS), 256 * 1024)
+            && json_u64(&status, "pid") == Some(pid)
+        {
+            return Ok(());
         }
         thread::sleep(Duration::from_millis(250));
     }
@@ -1613,25 +1612,39 @@ fn read_limited(path: &Path, limit: u64) -> Result<String> {
 }
 
 fn encode_path(path: &Path) -> String {
-    const HEX: &[u8] = b"0123456789abcdef";
-    let mut text = String::with_capacity(path.as_os_str().as_bytes().len() * 2);
-    for byte in path.as_os_str().as_bytes() {
-        text.push(HEX[(byte >> 4) as usize] as char);
-        text.push(HEX[(byte & 15) as usize] as char);
-    }
-    text
+    let bytes = path.as_os_str().as_bytes();
+    let mut encoded =
+        vec![0; zhex::encoded_len(bytes.len()).expect("path encoding length overflow")];
+    zhex::encode_lower(bytes, &mut encoded).expect("encoded path fits its calculated length");
+    String::from_utf8(encoded).expect("hexadecimal output is ASCII")
 }
 
 fn decode_path(text: &str) -> Result<PathBuf> {
-    if text.len() % 2 != 0 {
+    if !text.len().is_multiple_of(2) {
         return fail("invalid path encoding in zmem backup");
     }
-    let bytes: std::result::Result<Vec<_>, _> = text
+    // Older backups accepted a leading plus in each two-character byte.
+    // Normalize only that spelling before using the shared hexadecimal codec.
+    let normalized = if text
         .as_bytes()
-        .chunks_exact(2)
-        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap_or("!"), 16))
-        .collect();
-    let bytes = bytes?;
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .any(|pair| pair[0] == b'+')
+    {
+        let mut normalized = text.as_bytes().to_vec();
+        for pair in normalized.as_chunks_mut::<2>().0 {
+            if pair[0] == b'+' {
+                pair[0] = b'0';
+            }
+        }
+        std::borrow::Cow::Owned(normalized)
+    } else {
+        std::borrow::Cow::Borrowed(text.as_bytes())
+    };
+    let mut bytes = vec![0; text.len() / 2];
+    // Invalid pairs previously returned ParseIntError; retain its type and text.
+    zhex::decode(&normalized, &mut bytes).map_err(|_| u8::from_str_radix("!", 16).unwrap_err())?;
     if bytes.contains(&0) {
         return fail("NUL in zmem backup path");
     }
@@ -1986,6 +1999,81 @@ mod tests {
         assert!(decode_path("0").is_err());
         assert!(decode_path("zz").is_err());
         assert!(decode_path("00").is_err());
+    }
+
+    #[test]
+    fn backup_path_codec_preserves_unix_bytes_and_legacy_plus_pairs() {
+        let bytes = (1..=255).collect::<Vec<u8>>();
+        let path = PathBuf::from(OsString::from_vec(bytes.clone()));
+        let encoded = encode_path(&path);
+        assert_eq!(encoded.len(), bytes.len() * 2);
+        assert!(
+            encoded
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
+        assert_eq!(decode_path(&encoded).unwrap().as_os_str().as_bytes(), bytes);
+        assert_eq!(decode_path(&encoded.to_uppercase()).unwrap(), path);
+        assert_eq!(decode_path("").unwrap(), PathBuf::new());
+        for digit in b"123456789abcdefABCDEF" {
+            let encoded = String::from_utf8(vec![b'+', *digit]).unwrap();
+            let expected = u8::from_str_radix(&encoded, 16).unwrap();
+            assert_eq!(
+                decode_path(&encoded).unwrap().as_os_str().as_bytes(),
+                &[expected]
+            );
+        }
+        assert_eq!(
+            decode_path("+a2F+F").unwrap().as_os_str().as_bytes(),
+            &[10, b'/', 15]
+        );
+        assert_eq!(
+            decode_path("+0").unwrap_err().to_string(),
+            "NUL in zmem backup path"
+        );
+        assert_eq!(
+            decode_path("0").unwrap_err().to_string(),
+            "invalid path encoding in zmem backup"
+        );
+        for encoded in ["zz", "++", "a+", "+g", "-1", "é"] {
+            let error = decode_path(encoded).unwrap_err();
+            assert!(
+                error.is::<std::num::ParseIntError>(),
+                "{encoded:?}: {error}"
+            );
+            assert_eq!(error.to_string(), "invalid digit found in string");
+        }
+    }
+
+    #[test]
+    fn backup_path_decoding_preserves_every_legacy_ascii_pair() {
+        let (mut decoded, mut nul, mut invalid) = (0, 0, 0);
+        for first in 0..=127u8 {
+            for second in 0..=127u8 {
+                let text = String::from_utf8(vec![first, second]).unwrap();
+                // The previous backup parser delegated each pair to this API.
+                match u8::from_str_radix(&text, 16) {
+                    Ok(0) => {
+                        assert_eq!(
+                            decode_path(&text).unwrap_err().to_string(),
+                            "NUL in zmem backup path"
+                        );
+                        nul += 1;
+                    }
+                    Ok(byte) => {
+                        assert_eq!(decode_path(&text).unwrap().as_os_str().as_bytes(), &[byte]);
+                        decoded += 1;
+                    }
+                    Err(expected) => {
+                        let actual = decode_path(&text).unwrap_err();
+                        assert!(actual.is::<std::num::ParseIntError>());
+                        assert_eq!(actual.to_string(), expected.to_string());
+                        invalid += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!((decoded, nul, invalid), (504, 2, 15_878));
     }
 
     #[test]
