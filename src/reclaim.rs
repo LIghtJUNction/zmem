@@ -11,11 +11,14 @@ pub const MIN_REQUEST_BYTES: u64 = 4 * MIB;
 pub const MAX_REQUEST_BYTES: u64 = 128 * MIB;
 pub const NO_PROGRESS_BACKOFF_SECS: u64 = 60;
 pub const GROWTH_RETRY_BYTES: u64 = 64 * MIB;
+pub const REFAULT_WINDOW_SECS: u64 = 30;
+pub const REFAULT_BACKOFF_SECS: u64 = 60;
 const TRACKED_GROUPS: usize = 64;
 
 /// Values from one cgroup identity. `populated` comes from cgroup.events and
 /// includes descendants; an empty parent cgroup.procs is not an empty subtree.
-/// All memory.stat sizes are bytes. pgsteal_proactive is a page counter.
+/// All memory.stat sizes are bytes. pgsteal_proactive and
+/// workingset_refault_file are page counters.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Sample {
     pub dev: u64,
@@ -28,6 +31,7 @@ pub struct Sample {
     pub writeback_bytes: u64,
     pub shmem_bytes: u64,
     pub pgsteal_proactive: Option<u64>,
+    pub workingset_refault_file: Option<u64>,
 }
 
 impl Sample {
@@ -56,6 +60,7 @@ pub enum SkipReason {
     NoCleanFileBudget,
     RequestTooSmall,
     NoProgressBackoff,
+    RefaultBackoff,
 }
 
 impl SkipReason {
@@ -68,6 +73,7 @@ impl SkipReason {
             Self::NoCleanFileBudget => "no_clean_file_budget",
             Self::RequestTooSmall => "small_reclaim_request",
             Self::NoProgressBackoff => "no_progress_backoff",
+            Self::RefaultBackoff => "working_set_refault_backoff",
         }
     }
 }
@@ -78,6 +84,7 @@ pub struct Request {
     pub bytes: u64,
     pub before: Sample,
     page_size: u64,
+    observed_at_secs: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -120,25 +127,110 @@ pub struct Outcome {
 }
 
 #[derive(Clone, Copy, Debug)]
+enum Feedback {
+    Empty,
+    NoProgress {
+        current_bytes: u64,
+    },
+    RefaultWatch {
+        before_pages: u64,
+        last_pages: u64,
+        threshold_pages: u64,
+        page_size: u64,
+    },
+    RefaultBackoff,
+}
+
+#[derive(Clone, Copy, Debug)]
 struct Entry {
-    occupied: bool,
     dev: u64,
     ino: u64,
-    failed_at_secs: u64,
-    current_after_failure: u64,
+    observed_at_secs: u64,
+    feedback: Feedback,
 }
 
 impl Entry {
     const EMPTY: Self = Self {
-        occupied: false,
         dev: 0,
         ino: 0,
-        failed_at_secs: 0,
-        current_after_failure: 0,
+        observed_at_secs: 0,
+        feedback: Feedback::Empty,
     };
 
     fn matches(self, sample: Sample) -> bool {
-        self.occupied && self.dev == sample.dev && self.ino == sample.ino
+        !matches!(self.feedback, Feedback::Empty)
+            && self.dev == sample.dev
+            && self.ino == sample.ino
+    }
+
+    fn expired(self, now_secs: u64) -> bool {
+        let lifetime = match self.feedback {
+            Feedback::Empty => return true,
+            Feedback::NoProgress { .. } => NO_PROGRESS_BACKOFF_SECS,
+            Feedback::RefaultWatch { .. } => REFAULT_WINDOW_SECS,
+            Feedback::RefaultBackoff => REFAULT_BACKOFF_SECS,
+        };
+        now_secs
+            .checked_sub(self.observed_at_secs)
+            .is_some_and(|elapsed| elapsed >= lifetime)
+    }
+
+    fn defer(&mut self, sample: Sample, page_size: u64, now_secs: u64) -> Option<SkipReason> {
+        if now_secs < self.observed_at_secs {
+            // A reset clock invalidates a rate window, but must not release
+            // an existing backoff before another complete interval passes.
+            if matches!(self.feedback, Feedback::RefaultWatch { .. }) {
+                self.feedback = Feedback::Empty;
+            }
+            self.observed_at_secs = now_secs;
+        }
+        let elapsed = now_secs.saturating_sub(self.observed_at_secs);
+        match self.feedback {
+            Feedback::NoProgress { current_bytes }
+                if elapsed < NO_PROGRESS_BACKOFF_SECS
+                    && sample.current_bytes.saturating_sub(current_bytes) < GROWTH_RETRY_BYTES =>
+            {
+                Some(SkipReason::NoProgressBackoff)
+            }
+            Feedback::RefaultBackoff if elapsed < REFAULT_BACKOFF_SECS => {
+                Some(SkipReason::RefaultBackoff)
+            }
+            Feedback::RefaultWatch {
+                before_pages,
+                last_pages,
+                threshold_pages,
+                page_size: previous_page_size,
+            } if elapsed < REFAULT_WINDOW_SECS && page_size == previous_page_size => {
+                match sample.workingset_refault_file {
+                    Some(pages) if pages >= last_pages => {
+                        if pages - before_pages >= threshold_pages {
+                            // Refaults do not identify which reclaim caused
+                            // them. Pause optional work when the same group's
+                            // file working set is being used again rapidly.
+                            self.feedback = Feedback::RefaultBackoff;
+                            self.observed_at_secs = now_secs;
+                            Some(SkipReason::RefaultBackoff)
+                        } else {
+                            self.feedback = Feedback::RefaultWatch {
+                                before_pages,
+                                last_pages: pages,
+                                threshold_pages,
+                                page_size,
+                            };
+                            None
+                        }
+                    }
+                    _ => {
+                        self.feedback = Feedback::Empty;
+                        None
+                    }
+                }
+            }
+            _ => {
+                self.feedback = Feedback::Empty;
+                None
+            }
+        }
     }
 }
 
@@ -164,6 +256,9 @@ impl Tracker {
 
     /// Select a page-aligned request of 4..=128 MiB, also bounded by one eighth
     /// of current usage, the clean-file estimate, and the caller's request.
+    /// A successful reclaim is observed for 30 seconds. Refaults of at least
+    /// 4 MiB and half its reclaimed pages pause further attempts for 60 seconds;
+    /// without a reclaim counter, the request supplies the comparison amount.
     /// This does not reserve an in-flight worker; the adapter serializes those.
     pub fn plan(
         &mut self,
@@ -198,24 +293,15 @@ impl Tracker {
         }
 
         if let Some(entry) = self.entries.iter_mut().find(|e| e.matches(sample)) {
-            if now_secs < entry.failed_at_secs {
-                // A clock regression cannot make a deferred candidate ready.
-                entry.failed_at_secs = now_secs;
+            if let Some(reason) = entry.defer(sample, page_size, now_secs) {
+                return Err(reason);
             }
-            let grew = sample
-                .current_bytes
-                .saturating_sub(entry.current_after_failure)
-                >= GROWTH_RETRY_BYTES;
-            let elapsed = now_secs.saturating_sub(entry.failed_at_secs) >= NO_PROGRESS_BACKOFF_SECS;
-            if !grew && !elapsed {
-                return Err(SkipReason::NoProgressBackoff);
-            }
-            entry.occupied = false;
         }
         Ok(Request {
             bytes: amount,
             before: sample,
             page_size,
+            observed_at_secs: now_secs,
         })
     }
 
@@ -258,34 +344,82 @@ impl Tracker {
             }
         }
         if outcome.progress.made_progress() {
-            if let Some(entry) = self.entries.iter_mut().find(|e| e.matches(request.before)) {
-                entry.occupied = false;
+            let refaults = request
+                .before
+                .workingset_refault_file
+                .zip(comparable.and_then(|sample| sample.workingset_refault_file))
+                .filter(|(before, after)| after >= before);
+            if let Some((before_pages, last_pages)) = refaults.filter(|_| {
+                now_secs >= request.observed_at_secs
+                    && now_secs - request.observed_at_secs < REFAULT_WINDOW_SECS
+            }) {
+                let reclaimed_pages = outcome
+                    .reclaimed_pages
+                    .unwrap_or(request.bytes / request.page_size);
+                self.record(Entry {
+                    dev: request.before.dev,
+                    ino: request.before.ino,
+                    observed_at_secs: request.observed_at_secs,
+                    feedback: Feedback::RefaultWatch {
+                        before_pages,
+                        last_pages,
+                        threshold_pages: reclaimed_pages
+                            .div_ceil(2)
+                            .max(MIN_REQUEST_BYTES.div_ceil(request.page_size)),
+                        page_size: request.page_size,
+                    },
+                });
+            } else if let Some(entry) = self.entries.iter_mut().find(|e| e.matches(request.before))
+            {
+                entry.feedback = Feedback::Empty;
             }
         } else {
-            let index = self
-                .entries
-                .iter()
-                .position(|e| e.matches(request.before))
-                .or_else(|| self.entries.iter().position(|e| !e.occupied))
-                .unwrap_or_else(|| {
-                    self.entries
-                        .iter()
-                        .enumerate()
-                        .min_by_key(|(_, e)| e.failed_at_secs)
-                        .map(|(i, _)| i)
-                        .unwrap_or(0)
-                });
-            self.entries[index] = Entry {
-                occupied: true,
+            self.record(Entry {
                 dev: request.before.dev,
                 ino: request.before.ino,
-                failed_at_secs: now_secs,
-                current_after_failure: comparable
-                    .map_or(request.before.current_bytes, |s| s.current_bytes),
-            };
+                observed_at_secs: now_secs,
+                feedback: Feedback::NoProgress {
+                    current_bytes: comparable
+                        .map_or(request.before.current_bytes, |s| s.current_bytes),
+                },
+            });
             outcome.retry_after_secs = now_secs.saturating_add(NO_PROGRESS_BACKOFF_SECS);
         }
         outcome
+    }
+
+    fn record(&mut self, entry: Entry) {
+        let slot = self
+            .entries
+            .iter()
+            .position(|e| e.dev == entry.dev && e.ino == entry.ino)
+            .or_else(|| {
+                self.entries
+                    .iter()
+                    .position(|e| e.expired(entry.observed_at_secs))
+            })
+            .or_else(|| {
+                self.entries
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, e)| matches!(e.feedback, Feedback::RefaultWatch { .. }))
+                    .min_by_key(|(_, e)| e.observed_at_secs)
+                    .map(|(i, _)| i)
+            });
+        // A speculative success watch must not displace an established
+        // no-progress/refault backoff when every cache slot is already used.
+        let index = match slot {
+            Some(index) => index,
+            None if matches!(entry.feedback, Feedback::RefaultWatch { .. }) => return,
+            None => self
+                .entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, e)| e.observed_at_secs)
+                .map(|(i, _)| i)
+                .unwrap_or(0),
+        };
+        self.entries[index] = entry;
     }
 }
 
@@ -494,6 +628,324 @@ mod tests {
             Err(SkipReason::NoProgressBackoff)
         );
         assert!(tracker.plan(after, 64 * MIB, 4096, 61).is_ok());
+    }
+
+    fn refault_sample() -> Sample {
+        Sample {
+            workingset_refault_file: Some(4096),
+            ..usable()
+        }
+    }
+
+    fn reclaimed(mut sample: Sample, bytes: u64, page_size: u64) -> Sample {
+        sample.current_bytes -= bytes;
+        sample.pgsteal_proactive = sample
+            .pgsteal_proactive
+            .map(|pages| pages + bytes / page_size);
+        sample
+    }
+
+    #[test]
+    fn rapid_refaults_pause_successful_reclaim_even_when_usage_grows() {
+        let mut tracker = Tracker::new();
+        let before = refault_sample();
+        let request = tracker.plan(before, 64 * MIB, 4096, 0).unwrap();
+        let mut after = reclaimed(before, 64 * MIB, 4096);
+        let outcome = tracker.finish(request, Some(after), 2);
+        assert_eq!(outcome.progress, Progress::Reclaimed);
+        assert_eq!(outcome.reclaimed_bytes, Some(64 * MIB));
+        assert_eq!(outcome.retry_after_secs, 0);
+
+        after.workingset_refault_file = Some(4096 + 32 * MIB / 4096);
+        assert_eq!(
+            tracker.plan(after, 64 * MIB, 4096, 10),
+            Err(SkipReason::RefaultBackoff)
+        );
+        after.current_bytes += 128 * MIB;
+        for now in [11, 30, 69] {
+            assert_eq!(
+                tracker.plan(after, 64 * MIB, 4096, now),
+                Err(SkipReason::RefaultBackoff)
+            );
+        }
+        assert!(tracker.plan(after, 64 * MIB, 4096, 70).is_ok());
+        assert!(tracker.plan(after, 64 * MIB, 4096, 71).is_ok());
+    }
+
+    #[test]
+    fn refaults_during_the_worker_are_included_in_the_short_window() {
+        let mut tracker = Tracker::new();
+        let before = refault_sample();
+        let request = tracker.plan(before, 64 * MIB, 4096, 0).unwrap();
+        let mut after = reclaimed(before, 64 * MIB, 4096);
+        after.workingset_refault_file = Some(4096 + 32 * MIB / 4096);
+        tracker.finish(request, Some(after), 2);
+        assert_eq!(
+            tracker.plan(after, 64 * MIB, 4096, 10),
+            Err(SkipReason::RefaultBackoff)
+        );
+    }
+
+    #[test]
+    fn cold_pages_and_expired_windows_keep_reclaim_available() {
+        let mut tracker = Tracker::new();
+        let before = refault_sample();
+        let request = tracker.plan(before, 64 * MIB, 4096, 0).unwrap();
+        let mut after = reclaimed(before, 64 * MIB, 4096);
+        tracker.finish(request, Some(after), 2);
+        assert!(tracker.plan(after, 64 * MIB, 4096, 10).is_ok());
+        after.workingset_refault_file = Some(4096 + 32 * MIB / 4096 - 1);
+        assert!(tracker.plan(after, 64 * MIB, 4096, 20).is_ok());
+        after.workingset_refault_file = Some(u64::MAX);
+        assert!(tracker.plan(after, 64 * MIB, 4096, 30).is_ok());
+
+        let request = tracker.plan(before, 64 * MIB, 4096, 40).unwrap();
+        // A worker completing outside the observation window must not turn
+        // unrelated, long-accumulated refaults into a fresh short-window signal.
+        tracker.finish(request, Some(after), 70);
+        assert!(tracker.plan(after, 64 * MIB, 4096, 71).is_ok());
+    }
+
+    #[test]
+    fn refault_guard_requires_four_mib_with_either_native_page_size() {
+        for page_size in [4096, 65536] {
+            let mut tracker = Tracker::new();
+            let before = refault_sample();
+            let request = tracker.plan(before, 64 * MIB, page_size, 0).unwrap();
+            let mut after = reclaimed(before, page_size, page_size);
+            tracker.finish(request, Some(after), 2);
+            after.workingset_refault_file = Some(4096 + 4 * MIB / page_size - 1);
+            assert!(tracker.plan(after, 64 * MIB, page_size, 10).is_ok());
+            after.workingset_refault_file = Some(4096 + 4 * MIB / page_size);
+            assert_eq!(
+                tracker.plan(after, 64 * MIB, page_size, 12),
+                Err(SkipReason::RefaultBackoff)
+            );
+        }
+    }
+
+    #[test]
+    fn net_reduction_fallback_compares_refaults_with_the_requested_amount() {
+        let mut tracker = Tracker::new();
+        let before = Sample {
+            pgsteal_proactive: None,
+            ..refault_sample()
+        };
+        let request = tracker.plan(before, 64 * MIB, 4096, 0).unwrap();
+        let mut after = reclaimed(before, 8 * MIB, 4096);
+        let outcome = tracker.finish(request, Some(after), 2);
+        assert_eq!(outcome.progress, Progress::NetReduction);
+        assert_eq!(outcome.reclaimed_bytes, None);
+        after.workingset_refault_file = Some(4096 + 8 * MIB / 4096);
+        assert!(tracker.plan(after, 64 * MIB, 4096, 10).is_ok());
+        after.workingset_refault_file = Some(4096 + 32 * MIB / 4096);
+        assert_eq!(
+            tracker.plan(after, 64 * MIB, 4096, 12),
+            Err(SkipReason::RefaultBackoff)
+        );
+    }
+
+    #[test]
+    fn missing_and_regressed_refault_counters_discard_the_observation() {
+        for (before_pages, after_pages, next_pages) in [
+            (None, Some(4096), Some(u64::MAX)),
+            (Some(4096), None, Some(u64::MAX)),
+            (Some(4096), Some(4095), Some(u64::MAX)),
+            (Some(4096), Some(4096), None),
+            (Some(4096), Some(4097), Some(4096)),
+        ] {
+            let mut tracker = Tracker::new();
+            let before = Sample {
+                workingset_refault_file: before_pages,
+                ..usable()
+            };
+            let request = tracker.plan(before, 64 * MIB, 4096, 0).unwrap();
+            let mut after = reclaimed(before, 64 * MIB, 4096);
+            after.workingset_refault_file = after_pages;
+            tracker.finish(request, Some(after), 2);
+            after.workingset_refault_file = next_pages;
+            assert!(tracker.plan(after, 64 * MIB, 4096, 10).is_ok());
+            after.workingset_refault_file = Some(u64::MAX);
+            assert!(tracker.plan(after, 64 * MIB, 4096, 12).is_ok());
+        }
+    }
+
+    #[test]
+    fn refault_feedback_is_isolated_by_cgroup_identity() {
+        let mut tracker = Tracker::new();
+        let before = refault_sample();
+        let request = tracker.plan(before, 64 * MIB, 4096, 0).unwrap();
+        let mut after = reclaimed(before, 64 * MIB, 4096);
+        tracker.finish(request, Some(after), 2);
+        after.workingset_refault_file = Some(u64::MAX);
+        for replacement in [
+            Sample {
+                dev: after.dev + 1,
+                ..after
+            },
+            Sample {
+                ino: after.ino + 1,
+                ..after
+            },
+        ] {
+            assert!(tracker.plan(replacement, 64 * MIB, 4096, 10).is_ok());
+        }
+        assert_eq!(
+            tracker.plan(after, 64 * MIB, 4096, 10),
+            Err(SkipReason::RefaultBackoff)
+        );
+        let replacement = Sample {
+            ino: after.ino + 1,
+            ..after
+        };
+        assert!(tracker.plan(replacement, 64 * MIB, 4096, 12).is_ok());
+    }
+
+    #[test]
+    fn clock_regressions_discard_watches_but_restart_existing_refault_backoff() {
+        for enter_backoff in [false, true] {
+            let mut tracker = Tracker::new();
+            let before = refault_sample();
+            let request = tracker.plan(before, 64 * MIB, 4096, 1000).unwrap();
+            let mut after = reclaimed(before, 64 * MIB, 4096);
+            tracker.finish(request, Some(after), 1001);
+            after.workingset_refault_file = Some(u64::MAX);
+            if enter_backoff {
+                assert_eq!(
+                    tracker.plan(after, 64 * MIB, 4096, 1002),
+                    Err(SkipReason::RefaultBackoff)
+                );
+            }
+            for now in [1, 20, 60] {
+                let result = tracker.plan(after, 64 * MIB, 4096, now);
+                if enter_backoff {
+                    assert_eq!(result, Err(SkipReason::RefaultBackoff));
+                } else {
+                    assert!(result.is_ok());
+                }
+            }
+            assert!(tracker.plan(after, 64 * MIB, 4096, 61).is_ok());
+        }
+    }
+
+    #[test]
+    fn feedback_capacity_remains_bounded_and_new_groups_replace_the_oldest() {
+        let mut tracker = Tracker::new();
+        for index in 0..=TRACKED_GROUPS {
+            let before = Sample {
+                ino: 1001 + index as u64,
+                ..refault_sample()
+            };
+            let request = tracker.plan(before, 64 * MIB, 4096, 0).unwrap();
+            tracker.finish(request, Some(reclaimed(before, 64 * MIB, 4096)), 1);
+        }
+        assert_eq!(
+            tracker
+                .entries
+                .iter()
+                .filter(|entry| !matches!(entry.feedback, Feedback::Empty))
+                .count(),
+            TRACKED_GROUPS
+        );
+        let sample = Sample {
+            workingset_refault_file: Some(u64::MAX),
+            ..refault_sample()
+        };
+        assert!(tracker.plan(sample, 64 * MIB, 4096, 2).is_ok());
+        for index in 1..=TRACKED_GROUPS {
+            let retained = Sample {
+                ino: 1001 + index as u64,
+                ..sample
+            };
+            assert_eq!(
+                tracker.plan(retained, 64 * MIB, 4096, 2),
+                Err(SkipReason::RefaultBackoff)
+            );
+        }
+    }
+
+    #[test]
+    fn successful_groups_cannot_evict_existing_no_progress_backoffs() {
+        let mut tracker = Tracker::new();
+        for index in 0..TRACKED_GROUPS {
+            let before = Sample {
+                ino: 1001 + index as u64,
+                ..refault_sample()
+            };
+            let request = tracker.plan(before, 64 * MIB, 4096, 0).unwrap();
+            tracker.finish(request, Some(before), 1);
+        }
+        let before = Sample {
+            ino: 1001 + TRACKED_GROUPS as u64,
+            ..refault_sample()
+        };
+        let request = tracker.plan(before, 64 * MIB, 4096, 2).unwrap();
+        tracker.finish(request, Some(reclaimed(before, 64 * MIB, 4096)), 3);
+        for index in 0..TRACKED_GROUPS {
+            let retained = Sample {
+                ino: 1001 + index as u64,
+                ..refault_sample()
+            };
+            assert_eq!(
+                tracker.plan(retained, 64 * MIB, 4096, 4),
+                Err(SkipReason::NoProgressBackoff)
+            );
+        }
+    }
+
+    #[test]
+    fn expired_backoffs_release_slots_without_displacing_active_backoffs() {
+        for refault_backoff in [false, true] {
+            let mut tracker = Tracker::new();
+            for index in 0..TRACKED_GROUPS {
+                let started = if index < TRACKED_GROUPS / 2 { 0 } else { 40 };
+                let before = Sample {
+                    ino: 1001 + index as u64,
+                    ..refault_sample()
+                };
+                let request = tracker.plan(before, 64 * MIB, 4096, started).unwrap();
+                if refault_backoff {
+                    let mut after = reclaimed(before, 64 * MIB, 4096);
+                    after.workingset_refault_file = Some(4096 + 32 * MIB / 4096);
+                    tracker.finish(request, Some(after), started + 1);
+                    assert_eq!(
+                        tracker.plan(after, 64 * MIB, 4096, started + 2),
+                        Err(SkipReason::RefaultBackoff)
+                    );
+                } else {
+                    tracker.finish(request, Some(before), started + 1);
+                }
+            }
+            // The first half's backoffs have expired without those groups
+            // being sampled again. A new group must be able to keep feedback.
+            let now = if refault_backoff { 62 } else { 61 };
+            let before = Sample {
+                ino: 1001 + TRACKED_GROUPS as u64,
+                ..refault_sample()
+            };
+            let request = tracker.plan(before, 64 * MIB, 4096, now).unwrap();
+            let mut after = reclaimed(before, 64 * MIB, 4096);
+            tracker.finish(request, Some(after), now + 1);
+            after.workingset_refault_file = Some(4096 + 32 * MIB / 4096);
+            assert_eq!(
+                tracker.plan(after, 64 * MIB, 4096, now + 2),
+                Err(SkipReason::RefaultBackoff)
+            );
+            for index in TRACKED_GROUPS / 2..TRACKED_GROUPS {
+                let retained = Sample {
+                    ino: 1001 + index as u64,
+                    ..refault_sample()
+                };
+                assert_eq!(
+                    tracker.plan(retained, 64 * MIB, 4096, now + 2),
+                    Err(if refault_backoff {
+                        SkipReason::RefaultBackoff
+                    } else {
+                        SkipReason::NoProgressBackoff
+                    })
+                );
+            }
+        }
     }
 
     #[test]

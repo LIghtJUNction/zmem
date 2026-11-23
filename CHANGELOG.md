@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.4 — 2026-11-23
+
+- Retain swapped demand for terminal and remote-control scopes within their existing role caps and shared protection budgets. Input methods retain priority; desktop sessions and ordinary applications continue to use resident demand.
+- Pause optional file-page reclaim for 60 seconds when a recently reclaimed managed cgroup reports substantial file refaults within 30 seconds. Keep cold-page candidates eligible, preserve no-progress feedback, and report per-decision `managed.reclaim_refault_skips`.
+- Skip full process discovery when a complete cgroup inventory has no populated managed background groups. Refresh immediately when work appears or the inventory becomes uncertain; retain KSM ownership, pause and readback behavior.
+
 ## 0.4.3 — 2026-11-23
 
 - Give recognized input methods priority within their existing protection category. Bound each request at 256 MiB and retain the global, per-user and ancestor budgets.

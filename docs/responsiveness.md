@@ -54,9 +54,17 @@ The interactive launcher makes an initial 512 MiB `memory.low` request on its sc
 
 ### Keep input-method demand visible after eviction
 
-Recognized Fcitx and IBus scopes receive priority within their existing session or application share. Each input scope requests at most 256 MiB, using `memory.current + memory.swap.current` as its bounded demand estimate. This allows pages used during typing to return under protection after eviction has reduced resident usage. Other roles continue to request protection from resident usage. The total ceiling, each user's share and the session/application split remain in force.
+Recognized Fcitx and IBus scopes receive priority within their existing session or application share. Each input scope requests at most 256 MiB, using `memory.current + memory.swap.current` as its bounded demand estimate. This allows pages used during typing to return under protection after eviction has reduced resident usage. The total ceiling, each user's share and the session/application split remain in force.
+
+Terminal and remote-control scopes also retain swapped demand, each within the existing 128 MiB cap. A control process with little resident memory can therefore retain a bounded request while waiting for its pages to return. These scopes share their category's remaining budget after input methods; a larger control request can reduce another application's share. Desktop sessions and ordinary browser/application scopes continue to request protection from resident usage; cold swapped content in a large shared desktop scope does not enlarge its request.
 
 Input methods share their category's allowance proportionally when their combined requests exceed it. Other selected scopes share the remaining allowance. A mixed scope containing an input method retains the input role and its cap; protection applies to the whole scope. This does not separate an input method from other processes launched in that same scope. Missing swap accounting falls back to resident usage; malformed or inaccessible accounting retains the preceding complete protection plan.
+
+### Retain file pages that are quickly used again
+
+Proactive reclaim observes whether a managed cgroup reuses recently evicted file pages. After a successful reclaim, the controller keeps a 30-second observation window starting at the request. If `workingset_refault_file` grows by at least 4 MiB and half the observed reclaimed pages, it pauses further proactive reclaim of that group for 60 seconds. When `pgsteal_proactive` is unavailable, half the requested amount supplies the comparison threshold. Other eligible groups remain available for reclaim.
+
+The refault counter signals reuse across the cgroup; it does not attribute those reads to one specific reclaim operation. Missing or regressed counters discard the observation. New memory growth cannot bypass the refault pause. Identity checks, the 4–128 MiB request bounds, clean-file selection and the original no-progress backoff remain in force. `managed.reclaim_refault_skips` reports how many candidates the current decision skipped for this reason; a cycle without a reclaim request reports zero. The policy uses a fixed 64-entry cache without heap allocation. See the [implementation](../src/reclaim.rs) and the kernel's [memory.stat counter definitions](https://docs.kernel.org/admin-guide/cgroup-v2.html).
 
 ### Measure an input-method stall
 

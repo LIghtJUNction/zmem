@@ -684,6 +684,7 @@ pub struct Managed {
     pub background_tasks: usize,
     pub background_memory_bytes: u64,
     pub reclaim_candidates: usize,
+    pub reclaim_refault_skips: usize,
     pub coverage_complete: bool,
 }
 #[derive(Clone, Debug, Default)]
@@ -930,6 +931,7 @@ fn reclaim_sample(path: &Path) -> Result<reclaim_policy::Sample> {
         writeback_bytes: get("file_writeback"),
         shmem_bytes: get("shmem"),
         pgsteal_proactive: stats.get("pgsteal_proactive").copied(),
+        workingset_refault_file: stats.get("workingset_refault_file").copied(),
     })
 }
 fn managed_snapshot(background: &background::Report) -> Managed {
@@ -1088,7 +1090,7 @@ pub fn telemetry_json(
         json::quote(&z.name),z.logical_size,z.logical_used,z.resident,z.memory_limit,json::quote(&z.algorithm)
     )).collect::<Vec<_>>().join(",");
     status.push_str(&format!(
-        ",\"memory_pressure\":{},\"io_congested\":{},\"instance\":{{\"pid\":{},\"start_ticks\":{},\"boot_id\":{}}},\"paging\":{{\"rates_available\":{},\"zram_rates_available\":{},\"disk_swap_estimate_available\":{},\"zswap_enabled\":{},\"sample_interval_ms\":{},\"file_refault_bytes_per_sec\":{},\"anon_refault_bytes_per_sec\":{},\"direct_scan_bytes_per_sec\":{},\"zram_read_bytes_per_sec\":{},\"estimated_disk_swap_in_bytes_per_sec\":{}}},\"memory_usage\":{{\"free_bytes\":{},\"file_cache_bytes\":{},\"anonymous_bytes\":{}}},\"controls\":{{\"swappiness_requested\":{},\"swappiness_actual\":{},\"swappiness_reason\":{},\"page_cluster_actual\":{},\"protection_budget_bytes\":{},\"protected_critical_scopes\":{},\"protection_complete\":{},\"protection_sampled_at_unix\":{},\"protection_errors\":{}}},\"managed\":{{\"background_groups\":{},\"populated_background_groups\":{},\"background_tasks\":{},\"background_memory_bytes\":{},\"reclaim_candidates\":{},\"coverage_complete\":{}}},\"zram_devices\":[{}]}}",
+        ",\"memory_pressure\":{},\"io_congested\":{},\"instance\":{{\"pid\":{},\"start_ticks\":{},\"boot_id\":{}}},\"paging\":{{\"rates_available\":{},\"zram_rates_available\":{},\"disk_swap_estimate_available\":{},\"zswap_enabled\":{},\"sample_interval_ms\":{},\"file_refault_bytes_per_sec\":{},\"anon_refault_bytes_per_sec\":{},\"direct_scan_bytes_per_sec\":{},\"zram_read_bytes_per_sec\":{},\"estimated_disk_swap_in_bytes_per_sec\":{}}},\"memory_usage\":{{\"free_bytes\":{},\"file_cache_bytes\":{},\"anonymous_bytes\":{}}},\"controls\":{{\"swappiness_requested\":{},\"swappiness_actual\":{},\"swappiness_reason\":{},\"page_cluster_actual\":{},\"protection_budget_bytes\":{},\"protected_critical_scopes\":{},\"protection_complete\":{},\"protection_sampled_at_unix\":{},\"protection_errors\":{}}},\"managed\":{{\"background_groups\":{},\"populated_background_groups\":{},\"background_tasks\":{},\"background_memory_bytes\":{},\"reclaim_candidates\":{},\"reclaim_refault_skips\":{},\"coverage_complete\":{}}},\"zram_devices\":[{}]}}",
         json::quote(d.pressure.as_str()),d.io_congested,std::process::id(),process_start_ticks(),json::quote(boot_id.trim()),
         p.rates_available,p.zram_rates_available,p.disk_swap_estimate_available,
         p.zswap_enabled.map(|b| b.to_string()).unwrap_or_else(|| "null".into()),p.sample_interval_ms,
@@ -1099,7 +1101,7 @@ pub fn telemetry_json(
         optional_number(p.disk_swap_estimate_available.then_some(p.estimated_disk_swap_in_bytes_per_sec)),
         t.free_bytes,t.file_cache_bytes,t.anon_bytes,
         optional_number(a.swappiness_requested.map(u64::from)),optional_number(observed_number("/proc/sys/vm/swappiness")),json::quote(a.swappiness_reason),optional_number(observed_number("/proc/sys/vm/page-cluster")),a.protection_budget_bytes,a.protected_critical_scopes,a.protection_complete,optional_number(a.protection_sampled_at),json::strings(&a.protection_errors),
-        m.background_groups,m.populated_background_groups,m.background_tasks,m.background_memory_bytes,m.reclaim_candidates,m.coverage_complete,device_details
+        m.background_groups,m.populated_background_groups,m.background_tasks,m.background_memory_bytes,m.reclaim_candidates,m.reclaim_refault_skips,m.coverage_complete,device_details
     ));
     status.pop();
     status.push_str(&format!(
@@ -2080,10 +2082,10 @@ fn discover_protection_scopes(
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error.into()),
         };
-        // A swapped-out input method still needs room for its working set to
-        // return as the user types. Resident usage alone shrinks its request
-        // after eviction. Kernels without swap accounting retain RSS coverage.
-        let swap = if roles.contains(&protection::Role::Input) {
+        // Input and control scopes still need room when their evicted pages
+        // return on interaction. Keep demand within the existing role caps and
+        // shared budget. Kernels without swap accounting retain RSS coverage.
+        let swap = if roles.iter().any(|role| role.uses_swap_demand()) {
             match protection_read(&path.join("memory.swap.current"), 64) {
                 Ok(text) => text.trim().parse::<u64>()?,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
@@ -2097,11 +2099,7 @@ fn discover_protection_scopes(
                 path: path.clone(),
                 role,
                 current_bytes: current,
-                swap_bytes: if role == protection::Role::Input {
-                    swap
-                } else {
-                    0
-                },
+                swap_bytes: if role.uses_swap_demand() { swap } else { 0 },
             });
         }
     }
@@ -2882,6 +2880,7 @@ struct ReclaimTarget {
 struct ReclaimSelection {
     first: Option<ReclaimTarget>,
     eligible: usize,
+    refault_skips: usize,
 }
 
 fn select_reclaim_candidate(
@@ -2896,11 +2895,15 @@ fn select_reclaim_candidate(
         return selection;
     }
     for (path, sample) in candidates {
-        if let Ok(request) = tracker.plan(sample, requested_bytes, page_size, now_secs) {
-            selection.eligible += 1;
-            if selection.first.is_none() {
-                selection.first = Some(ReclaimTarget { path, request });
+        match tracker.plan(sample, requested_bytes, page_size, now_secs) {
+            Ok(request) => {
+                selection.eligible += 1;
+                if selection.first.is_none() {
+                    selection.first = Some(ReclaimTarget { path, request });
+                }
             }
+            Err(reclaim_policy::SkipReason::RefaultBackoff) => selection.refault_skips += 1,
+            Err(_) => {}
         }
     }
     selection
@@ -3179,6 +3182,7 @@ pub fn daemon(settings: Settings, config: PathBuf, observe: bool, once: bool) ->
             // eligibility filters, and feedback backoff, before worker/priority
             // arbitration. With no global reclaim request this is zero.
             t.managed.reclaim_candidates = selection.eligible;
+            t.managed.reclaim_refault_skips = selection.refault_skips;
             if !observe && worker.is_none() {
                 let maintenance_mode = if d.shrink_allowed {
                     Some(swap_lifecycle::Mode::Shrink)
@@ -3562,6 +3566,44 @@ mod reclaim_integration_tests {
     }
 
     #[test]
+    fn refault_feedback_skips_hot_pages_and_selects_another_group() {
+        let mut tracker = reclaim_policy::Tracker::new();
+        let before = reclaim_policy::Sample {
+            workingset_refault_file: Some(0),
+            ..sample(1)
+        };
+        let selected = select_reclaim_candidate(
+            &mut tracker,
+            [(PathBuf::from("/hot"), before)],
+            64 * MIB,
+            4096,
+            0,
+        );
+        let mut pending = selected.first;
+        let after = reclaim_policy::Sample {
+            pgsteal_proactive: Some(100 + 64 * MIB / 4096),
+            workingset_refault_file: Some(32 * MIB / 4096),
+            ..before
+        };
+        let (_, outcome) =
+            finish_pending_reclaim(&mut pending, &mut tracker, Some(after), 2).unwrap();
+        assert_eq!(outcome.progress, reclaim_policy::Progress::Reclaimed);
+        let next = select_reclaim_candidate(
+            &mut tracker,
+            [
+                (PathBuf::from("/hot"), after),
+                (PathBuf::from("/cold"), sample(2)),
+            ],
+            64 * MIB,
+            4096,
+            10,
+        );
+        assert_eq!(next.refault_skips, 1);
+        assert_eq!(next.eligible, 1);
+        assert_eq!(next.first.unwrap().path, Path::new("/cold"));
+    }
+
+    #[test]
     fn deadline_feedback_is_not_recorded_again_when_the_worker_is_later_reaped() {
         let mut tracker = reclaim_policy::Tracker::new();
         let before = sample(1);
@@ -3817,6 +3859,28 @@ mod tests {
 
     #[test]
     fn swap_mutation_lock_survives_parent_close_until_execd_child_exits() {
+        const ISOLATED: &str = "ZMEM_SWAP_LOCK_TEST_ISOLATED";
+        if std::env::var_os(ISOLATED).is_none() {
+            // This lock is intentionally inherited across exec. Other tests
+            // spawn children concurrently, so create it only in a dedicated
+            // test process where unrelated children cannot inherit its fd.
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "linux::tests::swap_mutation_lock_survives_parent_close_until_execd_child_exits",
+                    "--test-threads=1",
+                ])
+                .env(ISOLATED, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated lock test failed: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
         let fixture = JournalFixture::new("swap-mutation-lock");
         let path = fixture.0.join("lock");
         let open = || {
@@ -4276,14 +4340,23 @@ mod tests {
     }
 
     #[test]
-    fn protection_discovery_retains_swapped_input_demand_without_promoting_other_jobs() {
+    fn protection_discovery_retains_swapped_control_demand_without_promoting_other_jobs() {
         let fixture = JournalFixture::new("protection-input-swap");
         let proc_root = fixture.0.join("proc");
         let cgroup_root = fixture.0.join("cgroup");
         fs::create_dir_all(&proc_root).unwrap();
         let input = "user.slice/user-1000.slice/user@1000.service/app.slice/app-fcitx5.scope";
         let terminal = "user.slice/user-1000.slice/user@1000.service/app.slice/app-kitty.scope";
-        for (pid, comm, path) in [(1, "fcitx5", input), (2, "kitty", terminal)] {
+        let app = "user.slice/user-1000.slice/user@1000.service/app.slice/app-chrome.scope";
+        let remote = "user.slice/user-1000.slice/user@1000.service/app.slice/ssmcp.service";
+        let session = "user.slice/user-1000.slice/user@1000.service/session.slice/wm.service";
+        for (pid, comm, path) in [
+            (1, "fcitx5", input),
+            (2, "kitty", terminal),
+            (3, "chrome", app),
+            (4, "ssmcp", remote),
+            (5, "Hyprland", session),
+        ] {
             let process = proc_root.join(pid.to_string());
             fs::create_dir(&process).unwrap();
             fs::write(process.join("comm"), comm).unwrap();
@@ -4294,12 +4367,17 @@ mod tests {
         }
         let swap = cgroup_root.join(input).join("memory.swap.current");
         fs::write(&swap, (600 * MIB).to_string()).unwrap();
-        // Non-input swap usage must not be queried or inflate protection.
-        fs::write(
-            cgroup_root.join(terminal).join("memory.swap.current"),
-            "invalid",
-        )
-        .unwrap();
+        let terminal_swap = cgroup_root.join(terminal).join("memory.swap.current");
+        fs::write(&terminal_swap, (256 * MIB).to_string()).unwrap();
+        for scope in [remote, session] {
+            fs::write(
+                cgroup_root.join(scope).join("memory.swap.current"),
+                (32 * MIB).to_string(),
+            )
+            .unwrap();
+        }
+        // Ordinary applications retain their resident-only demand estimate.
+        fs::write(cgroup_root.join(app).join("memory.swap.current"), "invalid").unwrap();
         let discover = || {
             discover_protection_scopes(
                 &proc_root,
@@ -4324,10 +4402,26 @@ mod tests {
         );
         assert_eq!(
             p.limits[&cgroup_root.join(terminal).join("memory.low")],
+            128 * MIB
+        );
+        assert_eq!(
+            p.limits[&cgroup_root.join(app).join("memory.low")],
+            16 * MIB
+        );
+        assert_eq!(
+            p.limits[&cgroup_root.join(remote).join("memory.low")],
+            48 * MIB
+        );
+        assert_eq!(
+            p.limits[&cgroup_root.join(session).join("memory.low")],
             16 * MIB
         );
 
         fs::remove_file(&swap).unwrap();
+        fs::remove_file(&terminal_swap).unwrap();
+        for scope in [remote, session] {
+            fs::remove_file(cgroup_root.join(scope).join("memory.swap.current")).unwrap();
+        }
         assert!(
             discover()
                 .unwrap()
@@ -4338,6 +4432,12 @@ mod tests {
         assert!(
             discover().is_err(),
             "invalid input accounting retains the preceding complete plan"
+        );
+        fs::remove_file(&swap).unwrap();
+        fs::write(&terminal_swap, "invalid").unwrap();
+        assert!(
+            discover().is_err(),
+            "invalid terminal accounting retains the preceding complete plan"
         );
     }
 

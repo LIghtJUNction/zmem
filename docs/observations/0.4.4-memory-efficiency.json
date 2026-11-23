@@ -1,0 +1,827 @@
+{
+  "schema": "zmem.memory-efficiency-observation.v1",
+  "date": "2026-11-23",
+  "timezone": "Asia/Taipei",
+  "comparison": "Two 40-second natural-workload windows. Workload, cache state and input-method activity were not controlled. Query timings include process startup and IPC; they are not keystroke-to-screen or frame latency.",
+  "initial_diagnosis": {
+    "physical_memory_bytes": 16476700672,
+    "dedup_processes_examined": 689,
+    "dedup_refresh_interval_ms": 10000,
+    "populated_managed_background_groups": 0
+  },
+  "verified_controls": {
+    "protection": [
+      {
+        "roles": [
+          "remote"
+        ],
+        "memory.current": 118784,
+        "memory.swap.current": 1142784,
+        "memory.low": 1261568
+      },
+      {
+        "roles": [
+          "remote"
+        ],
+        "memory.current": 21880832,
+        "memory.swap.current": 409600,
+        "memory.low": 0
+      },
+      {
+        "roles": [
+          "remote"
+        ],
+        "memory.current": 17330176,
+        "memory.swap.current": 17461248,
+        "memory.low": 0
+      },
+      {
+        "roles": [
+          "remote"
+        ],
+        "memory.current": 4661248,
+        "memory.swap.current": 851968,
+        "memory.low": 3055616
+      },
+      {
+        "roles": [
+          "desktop"
+        ],
+        "memory.current": 1233858560,
+        "memory.swap.current": 887152640,
+        "memory.low": 1234395136
+      },
+      {
+        "roles": [
+          "remote"
+        ],
+        "memory.current": 331112448,
+        "memory.swap.current": 133681152,
+        "memory.low": 74469376
+      },
+      {
+        "roles": [
+          "remote"
+        ],
+        "memory.current": 18001920,
+        "memory.swap.current": 5603328,
+        "memory.low": 13209600
+      },
+      {
+        "roles": [
+          "browser"
+        ],
+        "memory.current": 361869312,
+        "memory.swap.current": 720093184,
+        "memory.low": 155201536
+      },
+      {
+        "roles": [
+          "remote",
+          "terminal"
+        ],
+        "memory.current": 778149888,
+        "memory.swap.current": 888864768,
+        "memory.low": 74469376
+      },
+      {
+        "roles": [
+          "terminal"
+        ],
+        "memory.current": 1097728,
+        "memory.swap.current": 0,
+        "memory.low": 606208
+      },
+      {
+        "roles": [
+          "terminal"
+        ],
+        "memory.current": 2625536,
+        "memory.swap.current": 0,
+        "memory.low": 1454080
+      },
+      {
+        "roles": [
+          "browser"
+        ],
+        "memory.current": 77033472,
+        "memory.swap.current": 0,
+        "memory.low": 33673216
+      },
+      {
+        "roles": [
+          "browser",
+          "remote",
+          "terminal"
+        ],
+        "memory.current": 1466384384,
+        "memory.swap.current": 1483698176,
+        "memory.low": 74469376
+      },
+      {
+        "roles": [
+          "terminal"
+        ],
+        "memory.current": 143360,
+        "memory.swap.current": 720896,
+        "memory.low": 479232
+      },
+      {
+        "roles": [
+          "remote"
+        ],
+        "memory.current": 16052224,
+        "memory.swap.current": 16785408,
+        "memory.low": 18173952
+      },
+      {
+        "roles": [
+          "terminal"
+        ],
+        "memory.current": 135168,
+        "memory.swap.current": 716800,
+        "memory.low": 471040
+      },
+      {
+        "roles": [
+          "terminal"
+        ],
+        "memory.current": 147456,
+        "memory.swap.current": 712704,
+        "memory.low": 475136
+      },
+      {
+        "roles": [
+          "browser"
+        ],
+        "memory.current": 63492096,
+        "memory.swap.current": 148307968,
+        "memory.low": 27930624
+      },
+      {
+        "roles": [
+          "terminal"
+        ],
+        "memory.current": 143360,
+        "memory.swap.current": 720896,
+        "memory.low": 479232
+      },
+      {
+        "roles": [
+          "input"
+        ],
+        "memory.current": 19390464,
+        "memory.swap.current": 563359744,
+        "memory.low": 268435456,
+        "ancestor_low_min_bytes": 822632448,
+        "all_ancestors_cover_input": true
+      }
+    ],
+    "running_binary_sha256": "22222087799eb545299b25ca8854cf2e329cf22b12983758fa4d3495b8c7d346",
+    "errors": [],
+    "controls": {
+      "page_cluster_actual": 0,
+      "protected_critical_scopes": 20,
+      "protection_budget_bytes": 2059587584,
+      "protection_complete": true,
+      "protection_errors": [],
+      "protection_sampled_at_unix": 1795416527,
+      "swappiness_actual": 80,
+      "swappiness_reason": "file_working_set_refaults",
+      "swappiness_requested": 80
+    },
+    "dedup": {
+      "control_owned": false,
+      "coverage_complete": true,
+      "enabled": true,
+      "errors": [],
+      "hard_cpu_quota": false,
+      "marked_processes": 0,
+      "matching_domain": "system_wide",
+      "processes_examined": 0,
+      "reason": "no_registered_tasks",
+      "registered_tasks": 0,
+      "registration": "explicit_run_dedup",
+      "state": "idle",
+      "target_state": "idle",
+      "task_observation_age_ms": 0,
+      "task_refresh_interval_ms": 10000,
+      "tasks": [],
+      "truncated": false,
+      "write_succeeded": null
+    },
+    "managed": {
+      "background_groups": 1,
+      "background_memory_bytes": 28672,
+      "background_tasks": 0,
+      "coverage_complete": true,
+      "populated_background_groups": 0,
+      "reclaim_candidates": 0,
+      "reclaim_refault_skips": 0
+    },
+    "swap_entries": 16,
+    "installed_version": "zmem 0.4.4",
+    "installed_binary_sha256": "22222087799eb545299b25ca8854cf2e329cf22b12983758fa4d3495b8c7d346",
+    "service": "ActiveState=active\nNRestarts=0\nMemoryCurrent=1728512\nCPUUsageNSec=91935000"
+  },
+  "before": {
+    "version": "0.4.3",
+    "background_groups_observed": {
+      "count": 21,
+      "max": 1,
+      "min": 1,
+      "p50": 1,
+      "p95": 1,
+      "p99": 1
+    },
+    "background_progress_interpretation": "CPU time and I/O counter progress in sampled managed groups; not useful throughput or task completion",
+    "comparison_limit": "Natural-workload observation, not a controlled causal experiment",
+    "fcitx5_process_and_ipc_round_trip_ms": {
+      "count": 21,
+      "is_keystroke_latency": false,
+      "max": 44.431591,
+      "min": 2.439287,
+      "p50": 5.814192,
+      "p95": 15.278981,
+      "p99": 38.60106900000002,
+      "states": {
+        "active": 21
+      },
+      "statuses": {
+        "available": 21
+      },
+      "timeouts": 0
+    },
+    "hyprctl_process_and_ipc_round_trip_ms": {
+      "count": 21,
+      "is_frame_latency": false,
+      "max": 148.199014,
+      "min": 25.990963,
+      "p50": 58.19279,
+      "p95": 122.090466,
+      "p99": 142.97730440000004,
+      "statuses": {
+        "available": 21
+      },
+      "timeouts": 0
+    },
+    "interrupted": false,
+    "invalid_counter_reasons": {
+      "system_cpu_full_undefined": 20,
+      "unavailable": 40
+    },
+    "kernel_read_span_ms": {
+      "count": 21,
+      "max": 21.020299,
+      "min": 1.14408,
+      "p50": 2.208887,
+      "p95": 16.316724,
+      "p99": 20.079584000000004
+    },
+    "mem_available_bytes": {
+      "count": 21,
+      "max": 2734522368,
+      "min": 1347661824,
+      "p50": 1655803904,
+      "p95": 2342604800,
+      "p99": 2656138854.4
+    },
+    "observed_duration_s": 40.153577166,
+    "observer_resources": {
+      "cpu_seconds": 0.17402800000000004,
+      "peak_rss_bytes": 40689664,
+      "probe_children_cpu_seconds": 0.5954889999999999
+    },
+    "page_size_consistent": true,
+    "requested_duration_s": 40,
+    "sample_count": 21,
+    "sample_schedule_lateness_ms": {
+      "count": 21,
+      "max": 2.558483,
+      "min": 0.063645,
+      "p50": 0.109508,
+      "p95": 1.072035,
+      "p99": 2.2611934000000007
+    },
+    "scheduler_wakeup_lateness_ms": {
+      "count": 400,
+      "max": 1.594853,
+      "min": 0.071399,
+      "p50": 0.10618649999999999,
+      "p95": 0.1963828999999999,
+      "p99": 0.2681866999999999,
+      "skipped_deadlines": 0
+    },
+    "schema": "zmem.responsiveness.summary.v1",
+    "window_metrics": {
+      "background.cpu_time": {
+        "count": 20,
+        "max": 0,
+        "min": 0,
+        "p50": 0,
+        "p95": 0,
+        "p99": 0,
+        "time_weighted_mean": 0,
+        "total_delta": 0,
+        "unit": "cpu_microseconds_per_second",
+        "valid_duration_s": 40.003962935
+      },
+      "background.read": {
+        "count": 0,
+        "max": null,
+        "min": null,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "time_weighted_mean": null,
+        "total_delta": null,
+        "unit": "bytes_per_second",
+        "valid_duration_s": 0
+      },
+      "background.write": {
+        "count": 0,
+        "max": null,
+        "min": null,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "time_weighted_mean": null,
+        "total_delta": null,
+        "unit": "bytes_per_second",
+        "valid_duration_s": 0
+      },
+      "paging.anon_refault": {
+        "count": 20,
+        "max": 176364755.87409672,
+        "min": 1541919.661482692,
+        "p50": 21335955.87122497,
+        "p95": 105275864.38055089,
+        "p99": 162146977.57538745,
+        "time_weighted_mean": 32238572.415825583,
+        "total_delta": 1289670656,
+        "unit": "bytes_per_second",
+        "valid_duration_s": 40.003962935
+      },
+      "paging.direct_scan": {
+        "count": 20,
+        "max": 640030538.7467903,
+        "min": 64394414.92763546,
+        "p50": 260652714.17247283,
+        "p95": 543011612.4514143,
+        "p99": 620626753.487715,
+        "time_weighted_mean": 305436312.1937034,
+        "total_delta": 12218662912,
+        "unit": "bytes_per_second",
+        "valid_duration_s": 40.003962935
+      },
+      "paging.file_refault": {
+        "count": 20,
+        "max": 344677286.6962406,
+        "min": 18843300.49535864,
+        "p50": 104774222.30804035,
+        "p95": 256156648.9016072,
+        "p99": 326973159.1373138,
+        "time_weighted_mean": 122508336.28565855,
+        "total_delta": 4900818944,
+        "unit": "bytes_per_second",
+        "valid_duration_s": 40.003962935
+      },
+      "paging.swap_in": {
+        "count": 20,
+        "max": 173758661.88095996,
+        "min": 1376055.7935144342,
+        "p50": 20574688.64315665,
+        "p95": 104434833.66163105,
+        "p99": 159893896.23709407,
+        "time_weighted_mean": 31689353.228824057,
+        "total_delta": 1267699712,
+        "unit": "bytes_per_second",
+        "valid_duration_s": 40.003962935
+      },
+      "paging.swap_out": {
+        "count": 20,
+        "max": 349010006.7197061,
+        "min": 110590.0958597295,
+        "p50": 35128119.868831016,
+        "p95": 231589906.8871195,
+        "p99": 325525986.7531886,
+        "time_weighted_mean": 70736441.5020049,
+        "total_delta": 2829737984,
+        "unit": "bytes_per_second",
+        "valid_duration_s": 40.003962935
+      },
+      "psi.cpu.full": {
+        "count": 0,
+        "max": null,
+        "min": null,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "time_weighted_mean": null,
+        "total_delta": null,
+        "unit": "percent",
+        "valid_duration_s": 0
+      },
+      "psi.cpu.some": {
+        "count": 20,
+        "max": 1.083106624821671,
+        "min": 0.3373649602804812,
+        "p50": 0.47827652409239346,
+        "p95": 0.9523732405752319,
+        "p99": 1.056959947972383,
+        "time_weighted_mean": 0.5349095047100488,
+        "total_delta": 213985,
+        "unit": "percent",
+        "valid_duration_s": 40.003962935
+      },
+      "psi.io.full": {
+        "count": 20,
+        "max": 5.076034912760414,
+        "min": 0.9851535908716167,
+        "p50": 1.6466099744063296,
+        "p95": 3.705659895088071,
+        "p99": 4.8019599092259435,
+        "time_weighted_mean": 1.949376868654476,
+        "total_delta": 779828,
+        "unit": "percent",
+        "valid_duration_s": 40.003962935
+      },
+      "psi.io.some": {
+        "count": 20,
+        "max": 5.408541589759892,
+        "min": 1.0587969518214302,
+        "p50": 1.820588446403477,
+        "p95": 3.880431657325913,
+        "p99": 5.102919603273094,
+        "time_weighted_mean": 2.2098985578914627,
+        "total_delta": 884047,
+        "unit": "percent",
+        "valid_duration_s": 40.003962935
+      },
+      "psi.memory.full": {
+        "count": 20,
+        "max": 15.705645290982362,
+        "min": 0.9932828976550682,
+        "p50": 3.3320501567711442,
+        "p95": 13.164475481884434,
+        "p99": 15.197411329162772,
+        "time_weighted_mean": 4.810413416107721,
+        "total_delta": 1924356,
+        "unit": "percent",
+        "valid_duration_s": 40.003962935
+      },
+      "psi.memory.some": {
+        "count": 20,
+        "max": 15.778135898795538,
+        "min": 1.0296322717915445,
+        "p50": 3.3488731940489744,
+        "p95": 13.321050947799492,
+        "p99": 15.286718908596326,
+        "time_weighted_mean": 4.851806815123978,
+        "total_delta": 1940915,
+        "unit": "percent",
+        "valid_duration_s": 40.003962935
+      },
+      "zram.read": {
+        "count": 20,
+        "max": 165358297.77925807,
+        "min": 1376055.7935144342,
+        "p50": 20563419.756235197,
+        "p95": 104014815.45654595,
+        "p99": 153089601.31471556,
+        "time_weighted_mean": 31204332.481466442,
+        "total_delta": 1248296960,
+        "unit": "bytes_per_second",
+        "valid_duration_s": 40.003962935
+      },
+      "zram.write": {
+        "count": 20,
+        "max": 269831794.42617065,
+        "min": 110590.0958597295,
+        "p50": 35114801.95478056,
+        "p95": 227548989.42406616,
+        "p99": 261375233.4257497,
+        "time_weighted_mean": 66206304.71794532,
+        "total_delta": 2648514560,
+        "unit": "bytes_per_second",
+        "valid_duration_s": 40.003962935
+      }
+    },
+    "zmem": {
+      "diagnostic_occurrences": 0,
+      "memory_pressure": {
+        "elevated": 12,
+        "healthy": 7,
+        "recovering": 2
+      },
+      "report_sources": {
+        "daemon_cache": 21
+      },
+      "statuses": {
+        "available": 21
+      },
+      "versions": [
+        "0.4.3"
+      ]
+    }
+  },
+  "after": {
+    "version": "0.4.4",
+    "background_groups_observed": {
+      "count": 21,
+      "max": 1,
+      "min": 1,
+      "p50": 1,
+      "p95": 1,
+      "p99": 1
+    },
+    "background_progress_interpretation": "CPU time and I/O counter progress in sampled managed groups; not useful throughput or task completion",
+    "comparison_limit": "Natural-workload observation, not a controlled causal experiment",
+    "fcitx5_process_and_ipc_round_trip_ms": {
+      "count": 21,
+      "is_keystroke_latency": false,
+      "max": 4.264035,
+      "min": 1.698355,
+      "p50": 2.569471,
+      "p95": 4.219493,
+      "p99": 4.2551266,
+      "states": {
+        "inactive": 21
+      },
+      "statuses": {
+        "available": 21
+      },
+      "timeouts": 0
+    },
+    "hyprctl_process_and_ipc_round_trip_ms": {
+      "count": 21,
+      "is_frame_latency": false,
+      "max": 42.811728,
+      "min": 12.830025,
+      "p50": 31.268965,
+      "p95": 41.045344,
+      "p99": 42.458451200000006,
+      "statuses": {
+        "available": 21
+      },
+      "timeouts": 0
+    },
+    "interrupted": false,
+    "invalid_counter_reasons": {
+      "system_cpu_full_undefined": 20,
+      "unavailable": 40
+    },
+    "kernel_read_span_ms": {
+      "count": 21,
+      "max": 1.485664,
+      "min": 0.834327,
+      "p50": 0.948912,
+      "p95": 1.428322,
+      "p99": 1.4741956
+    },
+    "mem_available_bytes": {
+      "count": 21,
+      "max": 2320330752,
+      "min": 1976823808,
+      "p50": 2188795904,
+      "p95": 2317819904,
+      "p99": 2319828582.4
+    },
+    "observed_duration_s": 40.036513539,
+    "observer_resources": {
+      "cpu_seconds": 0.07148899999999998,
+      "peak_rss_bytes": 43757568,
+      "probe_children_cpu_seconds": 0.15459099999999998
+    },
+    "page_size_consistent": true,
+    "requested_duration_s": 40,
+    "sample_count": 21,
+    "sample_schedule_lateness_ms": {
+      "count": 21,
+      "max": 0.628678,
+      "min": 0.062042,
+      "p50": 0.13835,
+      "p95": 0.174447,
+      "p99": 0.5378318000000003
+    },
+    "scheduler_wakeup_lateness_ms": {
+      "count": 400,
+      "max": 0.706917,
+      "min": 0.078667,
+      "p50": 0.1499115,
+      "p95": 0.263737,
+      "p99": 0.301413,
+      "skipped_deadlines": 0
+    },
+    "schema": "zmem.responsiveness.summary.v1",
+    "window_metrics": {
+      "background.cpu_time": {
+        "count": 20,
+        "max": 0,
+        "min": 0,
+        "p50": 0,
+        "p95": 0,
+        "p99": 0,
+        "time_weighted_mean": 0,
+        "total_delta": 0,
+        "unit": "cpu_microseconds_per_second",
+        "valid_duration_s": 39.999545536
+      },
+      "background.read": {
+        "count": 0,
+        "max": null,
+        "min": null,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "time_weighted_mean": null,
+        "total_delta": null,
+        "unit": "bytes_per_second",
+        "valid_duration_s": 0
+      },
+      "background.write": {
+        "count": 0,
+        "max": null,
+        "min": null,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "time_weighted_mean": null,
+        "total_delta": null,
+        "unit": "bytes_per_second",
+        "valid_duration_s": 0
+      },
+      "paging.anon_refault": {
+        "count": 20,
+        "max": 49811543.37265861,
+        "min": 55289.22621280592,
+        "p50": 222230.59200776689,
+        "p95": 14557335.677712485,
+        "p99": 42760701.833669335,
+        "time_weighted_mean": 3408832.3297893982,
+        "total_delta": 136351744,
+        "unit": "bytes_per_second",
+        "valid_duration_s": 39.999545536
+      },
+      "paging.direct_scan": {
+        "count": 20,
+        "max": 289472247.03719515,
+        "min": 0,
+        "p50": 199659.0880412605,
+        "p95": 189174130.59567672,
+        "p99": 269412623.7488913,
+        "time_weighted_mean": 25277317.59077154,
+        "total_delta": 1011081216,
+        "unit": "bytes_per_second",
+        "valid_duration_s": 39.999545536
+      },
+      "paging.file_refault": {
+        "count": 20,
+        "max": 52744523.56277022,
+        "min": 0,
+        "p50": 2246751.463503636,
+        "p95": 44659037.922526784,
+        "p99": 51127426.434721515,
+        "time_weighted_mean": 8497453.34466592,
+        "total_delta": 339894272,
+        "unit": "bytes_per_second",
+        "valid_duration_s": 39.999545536
+      },
+      "paging.swap_in": {
+        "count": 20,
+        "max": 49088538.65183014,
+        "min": 55289.22621280592,
+        "p50": 179183.9514503891,
+        "p95": 15130067.500891099,
+        "p99": 42296844.42164227,
+        "time_weighted_mean": 3377190.3702861113,
+        "total_delta": 135086080,
+        "unit": "bytes_per_second",
+        "valid_duration_s": 39.999545536
+      },
+      "paging.swap_out": {
+        "count": 20,
+        "max": 18898483.170210566,
+        "min": 0,
+        "p50": 6143.176550185683,
+        "p95": 3868725.228822732,
+        "p99": 15892531.581932977,
+        "time_weighted_mean": 1121497.5420064733,
+        "total_delta": 44859392,
+        "unit": "bytes_per_second",
+        "valid_duration_s": 39.999545536
+      },
+      "psi.cpu.full": {
+        "count": 0,
+        "max": null,
+        "min": null,
+        "p50": null,
+        "p95": null,
+        "p99": null,
+        "time_weighted_mean": null,
+        "total_delta": null,
+        "unit": "percent",
+        "valid_duration_s": 0
+      },
+      "psi.cpu.some": {
+        "count": 20,
+        "max": 0.5200436753480304,
+        "min": 0.26219804046294465,
+        "p50": 0.3424012256404362,
+        "p95": 0.4394280715274875,
+        "p99": 0.5039205545839217,
+        "time_weighted_mean": 0.3471539442242527,
+        "total_delta": 138860,
+        "unit": "percent",
+        "valid_duration_s": 39.999545536
+      },
+      "psi.io.full": {
+        "count": 20,
+        "max": 17.773439509441648,
+        "min": 0.2461222964649591,
+        "p50": 0.48300188286060386,
+        "p95": 12.162841325310763,
+        "p99": 16.651319872615463,
+        "time_weighted_mean": 2.465595513109982,
+        "total_delta": 986227,
+        "unit": "percent",
+        "valid_duration_s": 39.999545536
+      },
+      "psi.io.some": {
+        "count": 20,
+        "max": 18.581716318366848,
+        "min": 0.2478724550135721,
+        "p50": 0.5096237790395467,
+        "p95": 12.670409399238169,
+        "p99": 17.399454934541104,
+        "time_weighted_mean": 2.580981824083093,
+        "total_delta": 1032381,
+        "unit": "percent",
+        "valid_duration_s": 39.999545536
+      },
+      "psi.memory.full": {
+        "count": 20,
+        "max": 2.1332291571175315,
+        "min": 0,
+        "p50": 0.020473223838479382,
+        "p95": 0.7623012488412867,
+        "p99": 1.8590435754622805,
+        "time_weighted_mean": 0.17275946282391283,
+        "total_delta": 69103,
+        "unit": "percent",
+        "valid_duration_s": 39.999545536
+      },
+      "psi.memory.some": {
+        "count": 20,
+        "max": 2.1394796820616184,
+        "min": 0,
+        "p50": 0.020898207211217417,
+        "p95": 0.7639435769101204,
+        "p99": 1.8643724610313168,
+        "time_weighted_mean": 0.17475698551896668,
+        "total_delta": 69902,
+        "unit": "percent",
+        "valid_duration_s": 39.999545536
+      },
+      "zram.read": {
+        "count": 20,
+        "max": 41977285.42033874,
+        "min": 43002.731498849054,
+        "p50": 130052.12499125925,
+        "p95": 12838921.296428546,
+        "p99": 36149612.59555666,
+        "time_weighted_mean": 2876653.4833862167,
+        "total_delta": 115064832,
+        "unit": "bytes_per_second",
+        "valid_duration_s": 39.999545536
+      },
+      "zram.write": {
+        "count": 20,
+        "max": 18898483.170210566,
+        "min": 0,
+        "p50": 6143.176550185683,
+        "p95": 3868725.228822732,
+        "p99": 15892531.581932977,
+        "time_weighted_mean": 1121497.5420064733,
+        "total_delta": 44859392,
+        "unit": "bytes_per_second",
+        "valid_duration_s": 39.999545536
+      }
+    },
+    "zmem": {
+      "diagnostic_occurrences": 0,
+      "memory_pressure": {
+        "healthy": 21
+      },
+      "report_sources": {
+        "daemon_cache": 21
+      },
+      "statuses": {
+        "available": 21
+      },
+      "versions": [
+        "0.4.4"
+      ]
+    }
+  }
+}

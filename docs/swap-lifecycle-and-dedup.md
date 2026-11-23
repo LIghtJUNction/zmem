@@ -102,6 +102,8 @@ Starting or resuming scanning requires 30 seconds of stable, complete observatio
 
 The daemon refreshes registered-task discovery every 10 seconds. Discovery checks managed scope membership and stable PID identity around each process's KSM observation. It is bounded by process and task limits and does not read command lines, environments or memory contents. Enumeration limits, permission failures or malformed observations make coverage incomplete. `status --processes` adds the ordinary fresh process list; it does not replace the daemon's cached dedup discovery with a new scan.
 
+A complete inventory with no populated managed background aggregate supplies an immediate empty task observation and skips process traversal. The kernel's `cgroup.events` population flag includes descendants. New work or an incomplete inventory invalidates this empty observation immediately and triggers a real scan. The normal KSM governor still handles the resulting observation, including pausing an owned scanner after the last task exits. See the kernel's [population notification semantics](https://docs.kernel.org/admin-guide/cgroup-v2.html#un-populated-notification).
+
 | JSON field | Interpretation |
 | --- | --- |
 | `dedup.state`, `dedup.target_state`, `dedup.reason` | Observed control state, desired next state and the decision reason. A requested pause is not reported as completed if the kernel still reports scanning. |

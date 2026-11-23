@@ -36,6 +36,7 @@ pub struct State {
     governor: dedup::Governor,
     tasks: dedup::TaskScan,
     sampled_ms: Option<u64>,
+    empty_background: bool,
     last_update_ms: u64,
 }
 impl State {
@@ -44,8 +45,39 @@ impl State {
             governor: dedup::Governor::new(interval_ms),
             tasks: dedup::TaskScan::default(),
             sampled_ms: None,
+            empty_background: false,
             last_update_ms: 0,
         }
+    }
+
+    fn refresh_tasks(
+        &mut self,
+        background_complete: bool,
+        any_populated: bool,
+        now_ms: u64,
+        scan: impl FnOnce() -> dedup::TaskScan,
+    ) {
+        let empty_background = background_complete && !any_populated;
+        if empty_background {
+            // Every registered dedup scope belongs to one of these aggregates.
+            // cgroup.events populated includes descendants, so a complete empty
+            // inventory needs no process traversal and retires stale tasks now.
+            self.tasks = dedup::TaskScan {
+                complete: true,
+                ..dedup::TaskScan::default()
+            };
+            self.sampled_ms = Some(now_ms);
+        } else if self.empty_background
+            || self.sampled_ms.is_none_or(|previous| {
+                now_ms < previous || now_ms.saturating_sub(previous) >= TASK_REFRESH_MS
+            })
+        {
+            // A populated or unknown inventory invalidates an empty fast-path
+            // observation immediately, without waiting for the scan interval.
+            self.tasks = scan();
+            self.sampled_ms = Some(now_ms);
+        }
+        self.empty_background = empty_background;
     }
 
     pub fn pause_on_sample_error(&mut self, controls: &mut Controls) -> Result<()> {
@@ -111,12 +143,12 @@ impl State {
         errors: &mut Vec<String>,
     ) {
         self.last_update_ms = now_ms;
-        if self.sampled_ms.is_none_or(|previous| {
-            now_ms < previous || now_ms.saturating_sub(previous) >= TASK_REFRESH_MS
-        }) {
-            self.tasks = dedup::scan_tasks(Path::new("/proc"), dedup::ScanLimits::default());
-            self.sampled_ms = Some(now_ms);
-        }
+        self.refresh_tasks(
+            t.background.sample_complete,
+            t.background.groups.iter().any(|group| group.populated),
+            now_ms,
+            || dedup::scan_tasks(Path::new("/proc"), dedup::ScanLimits::default()),
+        );
         let mut observation = dedup::Observation {
             ksm: t.ksm.clone(),
             tasks: self.tasks.clone(),
@@ -449,6 +481,119 @@ mod tests {
                 }],
                 ..dedup::TaskScan::default()
             },
+        }
+    }
+
+    #[test]
+    fn complete_empty_background_skips_process_scans_and_stays_fresh() {
+        let mut state = State::new(2000);
+        for now in [0, 2000, 12_000, 30_000] {
+            state.refresh_tasks(true, false, now, || {
+                panic!("empty aggregates require no process scan")
+            });
+            assert!(state.tasks.complete);
+            assert!(state.tasks.tasks.is_empty());
+            assert_eq!(state.tasks.processes_examined, 0);
+            assert_eq!(state.tasks.marked_processes, 0);
+            assert!(!state.tasks.truncated);
+            assert!(state.tasks.errors.is_empty());
+            assert_eq!(state.sampled_ms, Some(now));
+        }
+    }
+
+    #[test]
+    fn populated_background_invalidates_empty_observation_immediately() {
+        let mut state = State::new(2000);
+        state.refresh_tasks(true, false, 0, || panic!("unexpected scan"));
+        state.refresh_tasks(true, true, 2000, || complete_observation(0).tasks);
+        assert_eq!(state.tasks.tasks.len(), 1);
+        assert_eq!(state.sampled_ms, Some(2000));
+
+        state.refresh_tasks(true, true, 4000, || {
+            panic!("populated aggregates retain the ordinary scan interval")
+        });
+        assert_eq!(state.sampled_ms, Some(2000));
+        state.refresh_tasks(true, true, 12_000, || {
+            let mut tasks = complete_observation(0).tasks;
+            tasks.tasks[0].pid = 124;
+            tasks
+        });
+        assert_eq!(state.tasks.tasks[0].pid, 124);
+        assert_eq!(state.sampled_ms, Some(12_000));
+    }
+
+    #[test]
+    fn incomplete_background_inventory_uses_actual_process_scan_coverage() {
+        for previously_empty in [false, true] {
+            for any_populated in [false, true] {
+                let mut state = State::new(2000);
+                if previously_empty {
+                    state.refresh_tasks(true, false, 0, || panic!("unexpected scan"));
+                }
+                state.refresh_tasks(false, any_populated, 2000, || dedup::TaskScan {
+                    processes_examined: 7,
+                    errors: vec!["process membership unavailable".into()],
+                    ..dedup::TaskScan::default()
+                });
+                assert!(!state.tasks.complete);
+                assert_eq!(state.tasks.processes_examined, 7);
+                assert_eq!(state.tasks.errors, ["process membership unavailable"]);
+                assert_eq!(state.sampled_ms, Some(2000));
+            }
+        }
+    }
+
+    #[test]
+    fn empty_background_retires_cached_tasks_before_the_scan_interval() {
+        let mut state = State::new(2000);
+        state.refresh_tasks(true, true, 0, || complete_observation(1).tasks);
+        assert_eq!(state.tasks.tasks.len(), 1);
+        state.refresh_tasks(true, false, 2000, || {
+            panic!("an empty aggregate retires tasks without a scan")
+        });
+        assert!(state.tasks.complete);
+        assert!(state.tasks.tasks.is_empty());
+        assert_eq!(state.sampled_ms, Some(2000));
+    }
+
+    #[test]
+    fn empty_background_still_requests_only_an_owned_ksm_pause() {
+        for owned_run in [false, true] {
+            let mut state = State::new(2000);
+            state.refresh_tasks(true, true, 0, || complete_observation(1).tasks);
+            state.refresh_tasks(true, false, 2000, || panic!("unexpected scan"));
+            let observation = dedup::Observation {
+                ksm: snapshot(1),
+                tasks: state.tasks.clone(),
+                task_age_ms: state.sampled_ms.map(|time| 2000 - time),
+            };
+            let plan = state.governor.plan(
+                2000,
+                true,
+                &observation,
+                healthy(),
+                if owned_run {
+                    owned(1)
+                } else {
+                    dedup::Ownership::default()
+                },
+            );
+            if owned_run {
+                assert_eq!(plan.state, dedup::State::Scanning);
+                assert_eq!(plan.target_state, dedup::State::Idle);
+                assert_eq!(plan.reason, "no_registered_tasks");
+                assert_eq!(
+                    plan.writes,
+                    [dedup::Write {
+                        knob: dedup::Knob::Run,
+                        expected: 1,
+                        value: 0,
+                    }]
+                );
+            } else {
+                assert_eq!(plan.state, dedup::State::ExternallyManaged);
+                assert!(plan.writes.is_empty());
+            }
         }
     }
 

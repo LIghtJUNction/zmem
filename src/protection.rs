@@ -23,6 +23,10 @@ pub enum Role {
 }
 
 impl Role {
+    pub(crate) const fn uses_swap_demand(self) -> bool {
+        matches!(self, Self::Input | Self::Terminal | Self::Remote)
+    }
+
     const fn cap_bytes(self) -> u64 {
         match self {
             Self::Session => 3 * GIB / 2,
@@ -39,8 +43,8 @@ pub struct Scope {
     pub path: PathBuf,
     pub role: Role,
     pub current_bytes: u64,
-    /// Swapped bytes help retain input-method demand after its pages are evicted.
-    /// Other roles use only their resident usage when requesting protection.
+    /// Swapped bytes retain demand for input, terminal and remote control
+    /// scopes after eviction. Sessions and ordinary apps use resident usage.
     pub swap_bytes: u64,
 }
 
@@ -121,7 +125,7 @@ pub fn plan_protection(
     let mut unique: BTreeMap<PathBuf, Candidate> = BTreeMap::new();
     for scope in scopes {
         let domain = classify(cgroup_root, &root_parts, scope)?;
-        let working_set = if scope.role == Role::Input {
+        let working_set = if scope.role.uses_swap_demand() {
             scope.current_bytes.saturating_add(scope.swap_bytes)
         } else {
             scope.current_bytes
@@ -483,17 +487,63 @@ mod tests {
             assert_eq!(p.leaves[0].requested_bytes, expected);
             assert_eq!(p.leaves[0].limit_bytes, expected);
         }
-        for role in [
-            Role::Session,
-            Role::Terminal,
-            Role::Remote,
-            Role::Interactive,
-        ] {
+        for role in [Role::Session, Role::Interactive] {
             let mut ordinary = user(1000, "app", "app.scope", role, 16 * MIB);
             ordinary.swap_bytes = GIB;
             let p = plan(&[ordinary]);
             assert_eq!(p.leaves[0].requested_bytes, 16 * MIB);
             assert_eq!(p.leaves[0].limit_bytes, 16 * MIB);
+        }
+    }
+
+    #[test]
+    fn protection_plan_retains_evicted_control_scopes_with_existing_role_caps() {
+        for role in [Role::Terminal, Role::Remote] {
+            for (current, swapped) in [(24 * MIB, 138 * MIB), (0, 96 * MIB), (PAGE, u64::MAX)] {
+                let category = "app";
+                let mut scope = user(1000, category, "control.scope", role, current);
+                scope.swap_bytes = swapped;
+                let p = plan(&[scope]);
+                let expected = current.saturating_add(swapped).min(role.cap_bytes());
+                assert_eq!(p.leaves[0].current_bytes, current);
+                assert_eq!(p.leaves[0].requested_bytes, expected);
+                assert_eq!(p.leaves[0].limit_bytes, expected);
+                assert!(p.allocated_bytes <= p.budget_bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn swapped_control_scopes_share_existing_budget_and_preserve_input_priority() {
+        let mut scopes = vec![user(1000, "app", "input.scope", Role::Input, 0)];
+        scopes[0].swap_bytes = 512 * MIB;
+        let mut session = user(1000, "session", "wm.scope", Role::Session, 2 * GIB);
+        session.swap_bytes = 2 * GIB;
+        scopes.push(session);
+        for index in 0..32 {
+            let mut scope = user(
+                1000,
+                "app",
+                &format!("terminal-{index}.scope"),
+                Role::Terminal,
+                0,
+            );
+            scope.swap_bytes = GIB;
+            scopes.push(scope);
+        }
+        let p = plan(&scopes);
+        assert_eq!(low(&p, &scopes[0].path), 256 * MIB);
+        assert!(p.allocated_bytes <= 2 * GIB);
+        let terminals: u64 = p
+            .leaves
+            .iter()
+            .filter(|leaf| leaf.role == Role::Terminal)
+            .map(|leaf| leaf.limit_bytes)
+            .sum();
+        assert_eq!(terminals, 256 * MIB);
+        for leaf in &p.leaves {
+            assert!(leaf.limit_bytes <= leaf.requested_bytes);
+            assert_eq!(leaf.limit_bytes % PAGE, 0);
         }
     }
 
