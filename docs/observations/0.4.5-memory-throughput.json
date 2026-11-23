@@ -1,0 +1,200 @@
+{
+  "schema": "zmem.acceptance.memory-throughput.v1",
+  "date": "2026-11-23",
+  "timezone": "Asia/Taipei",
+  "comparison": "Natural workload observations with changing work and cache state; not a controlled throughput or keystroke-latency benchmark.",
+  "before": {
+    "version": "0.4.4",
+    "requested_duration_s": 40,
+    "observed_duration_s": 40.104716593,
+    "sample_count": 21,
+    "mem_available_bytes": {
+      "count": 21,
+      "max": 2501165056,
+      "min": 2395385856,
+      "p50": 2451972096,
+      "p95": 2490490880,
+      "p99": 2499030220.8
+    },
+    "window_metrics": {
+      "paging.direct_scan": {
+        "count": 20,
+        "max": 42284712.26418545,
+        "min": 0,
+        "p50": 3384546.4160150876,
+        "p95": 42276493.812250584,
+        "p99": 42283068.57379848,
+        "time_weighted_mean": 12132330.951222034,
+        "total_delta": 485289984,
+        "unit": "bytes_per_second",
+        "valid_duration_s": 39.999731787
+      },
+      "paging.swap_in": {
+        "count": 20,
+        "max": 5048148.292283987,
+        "min": 40961.31864725055,
+        "p50": 435206.9357344904,
+        "p95": 4414019.991808158,
+        "p99": 4921322.63218882,
+        "time_weighted_mean": 1150062.1115402281,
+        "total_delta": 46002176,
+        "unit": "bytes_per_second",
+        "valid_duration_s": 39.999731787
+      },
+      "psi.io.full": {
+        "count": 20,
+        "max": 2.4965025964086993,
+        "min": 0.2772589256579643,
+        "p50": 0.8139105441325206,
+        "p95": 1.9441009548229242,
+        "p99": 2.3860222680915433,
+        "time_weighted_mean": 0.9532563918939159,
+        "total_delta": 381300,
+        "unit": "percent",
+        "valid_duration_s": 39.999731787
+      },
+      "psi.memory.full": {
+        "count": 20,
+        "max": 0.2731610096179122,
+        "min": 0.004800154528974674,
+        "p50": 0.050776341640790035,
+        "p95": 0.2473840906907877,
+        "p99": 0.2680056258324872,
+        "time_weighted_mean": 0.09480313568583579,
+        "total_delta": 37921,
+        "unit": "percent",
+        "valid_duration_s": 39.999731787
+      }
+    },
+    "input_query_ms": {
+      "count": 21,
+      "max": 8.705009,
+      "p50": 2.720532,
+      "p95": 4.133025,
+      "timeouts": 0
+    },
+    "compositor_query_ms": {
+      "count": 21,
+      "max": 182.844379,
+      "p50": 12.027769,
+      "p95": 98.24184,
+      "timeouts": 0
+    },
+    "daemon_diagnostic_occurrences": 0,
+    "observer_resources": {
+      "cpu_seconds": 0.07264200000000001,
+      "peak_rss_bytes": 43556864,
+      "probe_children_cpu_seconds": 0.156412
+    }
+  },
+  "after": {
+    "version": "0.4.5",
+    "requested_duration_s": 40,
+    "observed_duration_s": 40.058720107,
+    "sample_count": 21,
+    "mem_available_bytes": {
+      "count": 21,
+      "max": 2685341696,
+      "min": 2513879040,
+      "p50": 2628329472,
+      "p95": 2683817984,
+      "p99": 2685036953.6
+    },
+    "window_metrics": {
+      "paging.direct_scan": {
+        "count": 20,
+        "max": 53916578.92523251,
+        "min": 0,
+        "p50": 452689.1896075654,
+        "p95": 16676646.314310377,
+        "p99": 46468592.40304802,
+        "time_weighted_mean": 5156098.5079844985,
+        "total_delta": 206241792,
+        "unit": "bytes_per_second",
+        "valid_duration_s": 39.999583344
+      },
+      "paging.swap_in": {
+        "count": 20,
+        "max": 2736237.9174133805,
+        "min": 20480.337771970706,
+        "p50": 95221.7184294886,
+        "p95": 916975.4156827326,
+        "p99": 2372385.4170672484,
+        "time_weighted_mean": 292150.2431537928,
+        "total_delta": 11685888,
+        "unit": "bytes_per_second",
+        "valid_duration_s": 39.999583344
+      },
+      "psi.io.full": {
+        "count": 20,
+        "max": 1.0754829127274825,
+        "min": 0.2288822448162086,
+        "p50": 0.45272205304275587,
+        "p95": 0.8658615911761024,
+        "p99": 1.0335586484172061,
+        "time_weighted_mean": 0.5104603171588477,
+        "total_delta": 204182,
+        "unit": "percent",
+        "valid_duration_s": 39.999583344
+      },
+      "psi.memory.full": {
+        "count": 20,
+        "max": 0.20186514656938878,
+        "min": 0.0036000593739792253,
+        "p50": 0.024100206939626872,
+        "p95": 0.13521328352504183,
+        "p99": 0.1885347739605193,
+        "time_weighted_mean": 0.044802966685622184,
+        "total_delta": 17921,
+        "unit": "percent",
+        "valid_duration_s": 39.999583344
+      }
+    },
+    "input_query_ms": {
+      "count": 21,
+      "max": 5.609347,
+      "p50": 2.451876,
+      "p95": 2.851507,
+      "timeouts": 0
+    },
+    "compositor_query_ms": {
+      "count": 21,
+      "max": 56.311806,
+      "p50": 32.605733,
+      "p95": 54.575784,
+      "timeouts": 0
+    },
+    "daemon_diagnostic_occurrences": 0,
+    "observer_resources": {
+      "cpu_seconds": 0.07226400000000001,
+      "peak_rss_bytes": 43343872,
+      "probe_children_cpu_seconds": 0.154634
+    }
+  },
+  "build": {
+    "version": "zmem 0.4.5",
+    "binary_sha256": "76df9ad73e444464fd3559a3d44af7fae6f2aa595efbe926dc4bbc2e0cb8872f",
+    "binary_bytes": 1175584,
+    "source_sha256": "6a06d148eb2473e447696323fd3eb6281523f10a214be00f4cd5bb9d2766d95e",
+    "elapsed_s": 14.089416144008283,
+    "children_peak_rss_kib": 400328,
+    "managed_background_scope": true
+  },
+  "runtime": {
+    "version": "0.4.5",
+    "service_active": true,
+    "fresh_status": true,
+    "source": "daemon_cache",
+    "installed_matches": true,
+    "running_matches": true,
+    "config_preserved": true,
+    "active_swap_identity_preserved": true,
+    "active_swap_count": 17,
+    "service_memory_bytes": 901120,
+    "service_restarts": 0,
+    "protection_budget_bytes": 2059587584,
+    "protected_critical_scopes": 17,
+    "protection_complete": true,
+    "errors": []
+  }
+}

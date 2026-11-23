@@ -625,19 +625,35 @@ pub fn parse_meminfo(text: &str) -> Result<Snapshot> {
         ..Snapshot::default()
     })
 }
-fn psi(text: &str, kind: &str) -> (u16, u64) {
-    let line = text.lines().find(|l| l.starts_with(kind)).unwrap_or("");
-    let mut avg = 0;
-    let mut total = 0;
+fn psi(text: &str, kind: &str) -> Result<(u16, u64)> {
+    let mut rows = text
+        .lines()
+        .filter(|line| line.split_whitespace().next() == Some(kind.trim()));
+    let line = rows.next().ok_or("missing PSI row")?;
+    if rows.next().is_some() {
+        return Err("duplicate PSI row".into());
+    }
+    let mut avg = None;
+    let mut total = None;
     for word in line.split_whitespace() {
         if let Some(v) = word.strip_prefix("avg10=") {
-            avg = (v.parse::<f64>().unwrap_or(0.0) * 100.0).clamp(0.0, 10000.0) as u16;
+            let value = v.parse::<f64>()?;
+            if avg.is_some() || !value.is_finite() || !(0.0..=100.0).contains(&value) {
+                return Err("invalid or duplicate PSI average".into());
+            }
+            avg = Some((value * 100.0).round() as u16);
         }
         if let Some(v) = word.strip_prefix("total=") {
-            total = v.parse().unwrap_or(0);
+            if total.is_some() {
+                return Err("duplicate PSI total".into());
+            }
+            total = Some(v.parse()?);
         }
     }
-    (avg, total)
+    Ok((
+        avg.ok_or("missing PSI average")?,
+        total.ok_or("missing PSI total")?,
+    ))
 }
 fn vmstats(text: &str) -> (u64, u64) {
     let mut input = 0;
@@ -697,6 +713,24 @@ pub struct Applied {
     pub protection_errors: Vec<String>,
     pub protection_sampled_at: Option<u64>,
 }
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PressureAverages {
+    pub memory_some_bp: u16,
+    pub memory_full_bp: u16,
+    pub io_full_bp: u16,
+}
+
+impl PressureAverages {
+    fn conservative_sample(self, sample: Snapshot) -> Snapshot {
+        Snapshot {
+            memory_some_bp: sample.memory_some_bp.max(self.memory_some_bp),
+            memory_full_bp: sample.memory_full_bp.max(self.memory_full_bp),
+            io_full_bp: sample.io_full_bp.max(self.io_full_bp),
+            ..sample
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Telemetry {
     pub sample: Snapshot,
@@ -706,6 +740,7 @@ pub struct Telemetry {
     pub dedup: dedup_adapter::Report,
     pub sampled_at: u64,
     pub paging: Paging,
+    pub psi_avg10: Option<PressureAverages>,
     pub managed: Managed,
     pub background: background::Report,
     pub applied: Applied,
@@ -731,9 +766,9 @@ impl Sampler {
         let mut sample = parse_meminfo(&meminfo)?;
         let memory = read("/proc/pressure/memory")?;
         let io = read("/proc/pressure/io")?;
-        let (some, ts) = psi(&memory, "some ");
-        let (full, tf) = psi(&memory, "full ");
-        let (ioavg, ti) = psi(&io, "full ");
+        let (some, ts) = psi(&memory, "some ")?;
+        let (full, tf) = psi(&memory, "full ")?;
+        let (ioavg, ti) = psi(&io, "full ")?;
         let vmtext = read("/proc/vmstat")?;
         let (pin, pout) = vmstats(&vmtext);
         let vm = counters(&vmtext);
@@ -886,6 +921,11 @@ impl Sampler {
             dedup: dedup_adapter::Report::default(),
             sampled_at: now(),
             paging,
+            psi_avg10: Some(PressureAverages {
+                memory_some_bp: some,
+                memory_full_bp: full,
+                io_full_bp: ioavg,
+            }),
             managed,
             background,
             file_cache_bytes: meminfo_bytes(&meminfo, "Cached"),
@@ -1104,8 +1144,18 @@ pub fn telemetry_json(
         m.background_groups,m.populated_background_groups,m.background_tasks,m.background_memory_bytes,m.reclaim_candidates,m.reclaim_refault_skips,m.coverage_complete,device_details
     ));
     status.pop();
+    let psi_avg10 = t.psi_avg10.map_or_else(
+        || "null".to_owned(),
+        |p| {
+            format!(
+                "{{\"memory_some_bp\":{},\"memory_full_bp\":{},\"io_full_bp\":{}}}",
+                p.memory_some_bp, p.memory_full_bp, p.io_full_bp
+            )
+        },
+    );
     status.push_str(&format!(
-        ",\"background\":{},\"dedup\":{}}}",
+        ",\"psi_avg10\":{},\"background\":{},\"dedup\":{}}}",
+        psi_avg10,
         background::json(&t.background),
         dedup_adapter::report_json(&t.dedup)
     ));
@@ -2196,24 +2246,83 @@ fn capped_high(original: &str, requested: &str) -> Result<String> {
     }
     Ok(original.min(requested.parse::<u64>()?).to_string())
 }
+fn swap_zram_name(path: &str) -> Option<&str> {
+    path.strip_prefix("/dev/")
+        .filter(|name| name.starts_with("zram") && !name.contains('/'))
+}
+
+fn efficient_zram_room(total_bytes: u64, swaps: &[Swap], zram: &[Zram]) -> bool {
+    // Every active zram device consumes RAM, including full devices and those
+    // below the next allocation priority. A partial mm_stat inventory must not
+    // make their physical cost disappear from this decision.
+    let active_zram = swaps
+        .iter()
+        .filter(|swap| swap_zram_name(&swap.path).is_some())
+        .count();
+    if active_zram == 0 || active_zram != zram.len() {
+        return false;
+    }
+    let mut resident = 0u64;
+    for swap in swaps {
+        let Some(name) = swap_zram_name(&swap.path) else {
+            continue;
+        };
+        let mut matching = zram.iter().filter(|device| device.name == name);
+        let Some(device) = matching.next() else {
+            return false;
+        };
+        if matching.next().is_some()
+            || device.logical_size != swap.size
+            || device.logical_used != swap.used
+        {
+            return false;
+        }
+        resident = resident.saturating_add(device.resident);
+    }
+    if resident >= total_bytes / 2 {
+        return false;
+    }
+    // Linux fills the highest-priority available tier first and can distribute
+    // writes across equal-priority devices. Free compressed space in a lower
+    // tier therefore cannot justify treating an earlier disk tier as cheap.
+    let Some(priority) = swaps
+        .iter()
+        .filter(|swap| swap.used < swap.size)
+        .map(|swap| swap.priority)
+        .max()
+    else {
+        return false;
+    };
+    swaps
+        .iter()
+        .filter(|swap| swap.priority == priority && swap.used < swap.size)
+        .all(|swap| {
+            let Some(name) = swap_zram_name(&swap.path) else {
+                return false;
+            };
+            let Some(z) = zram.iter().find(|device| device.name == name) else {
+                return false;
+            };
+            // Logical capacity is not free RAM. Retain the measured savings,
+            // physical limit and logical-headroom checks for every device that
+            // may receive the next swap allocation.
+            z.logical_size > 0
+                && z.logical_size.saturating_sub(z.logical_used) > z.logical_size / 10
+                && (z.original == 0 || z.original >= z.resident.saturating_add(z.resident / 2))
+                && (z.memory_limit == 0 || z.resident < z.memory_limit.saturating_mul(9) / 10)
+        })
+}
+
+#[cfg(test)]
+#[path = "swappiness_device_tests.rs"]
+mod swappiness_device_tests;
+
 fn swappiness_preference(
     settings: &Settings,
     t: &Telemetry,
     d: &Decision,
 ) -> swappiness::Preference {
-    let resident: u64 = t
-        .zram
-        .iter()
-        .fold(0u64, |sum, z| sum.saturating_add(z.resident));
-    // Logical zram capacity is not free RAM. Require measured compression
-    // savings, bounded physical residency and usable logical headroom.
-    let zram_room = resident < t.sample.total_bytes / 2
-        && t.zram.iter().any(|z| {
-            z.logical_size > 0
-                && z.logical_size.saturating_sub(z.logical_used) > z.logical_size / 10
-                && (z.original == 0 || z.original >= z.resident.saturating_add(z.resident / 2))
-                && (z.memory_limit == 0 || z.resident < z.memory_limit.saturating_mul(9) / 10)
-        });
+    let zram_room = efficient_zram_room(t.sample.total_bytes, &t.swaps, &t.zram);
     swappiness::preference(swappiness::Input {
         rates_available: t.paging.rates_available,
         file_refault: t.paging.file_refault_bytes_per_sec,
@@ -3058,6 +3167,33 @@ fn worker_start(
         reclaim: reclaim.cloned(),
     })
 }
+fn swap_maintenance_mode(
+    settings: &Settings,
+    telemetry: &Telemetry,
+    decision: &Decision,
+) -> Option<swap_lifecycle::Mode> {
+    // A fresh maintenance worker sees avg10; the daemon also has a short
+    // measured interval. Require both to be quiet before spending a worker.
+    // The worker still samples again before touching an owned swap file.
+    let sample = telemetry.psi_avg10?.conservative_sample(telemetry.sample);
+    let reserve = settings.policy.effective_reserve_bytes(sample.total_bytes);
+    if decision.pressure == zmem::Pressure::Critical
+        || decision.io_congested
+        || swap_lifecycle::cleanup_defer_reason(sample, reserve, settings.policy.critical_full_bp)
+            .is_some()
+    {
+        return None;
+    }
+    if decision.shrink_allowed
+        && swap_lifecycle::defer_reason(sample, reserve, settings.policy.grow_free_bytes, 0)
+            .is_none()
+    {
+        Some(swap_lifecycle::Mode::Shrink)
+    } else {
+        Some(swap_lifecycle::Mode::Cleanup)
+    }
+}
+
 pub fn daemon(settings: Settings, config: PathBuf, observe: bool, once: bool) -> Result<()> {
     let _lock = if observe {
         None
@@ -3184,23 +3320,7 @@ pub fn daemon(settings: Settings, config: PathBuf, observe: bool, once: bool) ->
             t.managed.reclaim_candidates = selection.eligible;
             t.managed.reclaim_refault_skips = selection.refault_skips;
             if !observe && worker.is_none() {
-                let maintenance_mode = if d.shrink_allowed {
-                    Some(swap_lifecycle::Mode::Shrink)
-                } else if d.pressure != zmem::Pressure::Critical
-                    && !d.io_congested
-                    && swap_lifecycle::cleanup_defer_reason(
-                        t.sample,
-                        settings
-                            .policy
-                            .effective_reserve_bytes(t.sample.total_bytes),
-                        settings.policy.critical_full_bp,
-                    )
-                    .is_none()
-                {
-                    Some(swap_lifecycle::Mode::Cleanup)
-                } else {
-                    None
-                };
+                let maintenance_mode = swap_maintenance_mode(&settings, &t, &d);
                 let action = if d.grow_swap_bytes > 0 {
                     Some(("grow", vec![d.grow_swap_bytes.to_string()], None))
                 } else if let Some(target) = selection.first {
@@ -4962,8 +5082,88 @@ mod tests {
             psi(
                 "some avg10=12.34 avg60=0.00 total=9876\nfull avg10=2.00 total=456\n",
                 "some "
-            ),
+            )
+            .unwrap(),
             (1234, 9876)
+        );
+    }
+
+    #[test]
+    fn missing_or_invalid_pressure_does_not_look_idle() {
+        for text in [
+            "",
+            "some avg10=0.00 total=0",
+            "full total=0",
+            "full avg10=0.00",
+            "full avg10=NaN total=0",
+            "full avg10=inf total=0",
+            "full avg10=-1 total=0",
+            "full avg10=100.01 total=0",
+            "full avg10=0.00 total=oops",
+            "full avg10=0.00 avg10=0.01 total=0",
+            "full avg10=0.00 total=0 total=1",
+            "full avg10=0.00 total=0\nfull avg10=0.01 total=1",
+        ] {
+            assert!(psi(text, "full ").is_err(), "{text}");
+        }
+        assert_eq!(psi("full avg10=0.29 total=99", "full ").unwrap(), (29, 99));
+    }
+
+    #[test]
+    fn optional_maintenance_waits_for_both_pressure_windows() {
+        let settings = Settings::default();
+        let mut telemetry = Telemetry {
+            sample: Snapshot {
+                total_bytes: 16 * GIB,
+                available_bytes: 8 * GIB,
+                swap_total_bytes: 16 * GIB,
+                swap_free_bytes: 8 * GIB,
+                ..Snapshot::default()
+            },
+            psi_avg10: Some(PressureAverages::default()),
+            ..Telemetry::default()
+        };
+        let mut decision = Policy::new(settings.policy).observe(telemetry.sample, 0);
+        let mut schedule = swap_lifecycle::Schedule::default();
+        telemetry.psi_avg10.as_mut().unwrap().io_full_bp = 767;
+        assert_eq!(
+            schedule.next(swap_maintenance_mode(&settings, &telemetry, &decision), 0),
+            None
+        );
+        telemetry.psi_avg10.as_mut().unwrap().io_full_bp = 0;
+        telemetry.sample.io_full_bp = 101;
+        assert_eq!(
+            swap_maintenance_mode(&settings, &telemetry, &decision),
+            None
+        );
+        telemetry.sample.io_full_bp = 0;
+        assert_eq!(
+            schedule.next(swap_maintenance_mode(&settings, &telemetry, &decision), 1),
+            Some((swap_lifecycle::Mode::Cleanup, 0))
+        );
+        decision.shrink_allowed = true;
+        assert_eq!(
+            swap_maintenance_mode(&settings, &telemetry, &decision),
+            Some(swap_lifecycle::Mode::Shrink)
+        );
+        telemetry.psi_avg10 = Some(PressureAverages {
+            memory_some_bp: 201,
+            memory_full_bp: 101,
+            io_full_bp: 0,
+        });
+        assert_eq!(
+            swap_maintenance_mode(&settings, &telemetry, &decision),
+            Some(swap_lifecycle::Mode::Cleanup)
+        );
+        telemetry.psi_avg10.as_mut().unwrap().memory_full_bp = settings.policy.critical_full_bp;
+        assert_eq!(
+            swap_maintenance_mode(&settings, &telemetry, &decision),
+            None
+        );
+        telemetry.psi_avg10 = None;
+        assert_eq!(
+            swap_maintenance_mode(&settings, &telemetry, &decision),
+            None
         );
     }
     #[test]

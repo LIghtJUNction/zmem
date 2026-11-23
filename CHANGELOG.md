@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.5 — 2026-11-23
+
+- Preserve the original 30-second file-refault observation across repeated successful reclaim. Accumulated reuse now triggers the existing 60-second pause, including when a later worker finishes.
+- Require both the measured interval and PSI `avg10` to permit optional swap maintenance before starting a worker. Retain child-side revalidation and expose the average window as `psi_avg10`; reject malformed or missing PSI observations.
+- Base compressed-swap preference on the highest-priority writable swap tier. Require complete physical-memory observations for all active zram devices, and retain the existing compression, logical-headroom and resident-memory thresholds.
+
 ## 0.4.4 — 2026-11-23
 
 - Retain swapped demand for terminal and remote-control scopes within their existing role caps and shared protection budgets. Input methods retain priority; desktop sessions and ordinary applications continue to use resident demand.

@@ -122,7 +122,8 @@ pub struct Outcome {
     pub reclaimed_bytes: Option<u64>,
     /// Net cgroup usage reduction, measured independently of page reclaim.
     pub net_freed_bytes: u64,
-    /// Zero after progress; otherwise an absolute monotonic-seconds retry deadline.
+    /// Absolute monotonic-seconds retry deadline while attempts are deferred;
+    /// zero when no backoff is active.
     pub retry_after_secs: u64,
 }
 
@@ -259,6 +260,8 @@ impl Tracker {
     /// A successful reclaim is observed for 30 seconds. Refaults of at least
     /// 4 MiB and half its reclaimed pages pause further attempts for 60 seconds;
     /// without a reclaim counter, the request supplies the comparison amount.
+    /// Further successful requests keep an existing observation's baseline
+    /// and deadline until its window expires.
     /// This does not reserve an in-flight worker; the adapter serializes those.
     pub fn plan(
         &mut self,
@@ -353,10 +356,36 @@ impl Tracker {
                 now_secs >= request.observed_at_secs
                     && now_secs - request.observed_at_secs < REFAULT_WINDOW_SECS
             }) {
+                if let Some((entry, after)) = self
+                    .entries
+                    .iter_mut()
+                    .find(|entry| {
+                        entry.matches(request.before)
+                            && matches!(
+                                entry.feedback,
+                                Feedback::RefaultWatch { .. } | Feedback::RefaultBackoff
+                            )
+                    })
+                    .zip(comparable)
+                {
+                    // Requests may succeed more often than the observation
+                    // window ends. Keep its first baseline so slower refaults
+                    // cannot disappear behind repeated successful requests.
+                    entry.defer(after, request.page_size, now_secs);
+                    match entry.feedback {
+                        Feedback::RefaultWatch { .. } => return outcome,
+                        Feedback::RefaultBackoff => {
+                            outcome.retry_after_secs =
+                                entry.observed_at_secs.saturating_add(REFAULT_BACKOFF_SECS);
+                            return outcome;
+                        }
+                        _ => {}
+                    }
+                }
                 let reclaimed_pages = outcome
                     .reclaimed_pages
                     .unwrap_or(request.bytes / request.page_size);
-                self.record(Entry {
+                let mut entry = Entry {
                     dev: request.before.dev,
                     ino: request.before.ino,
                     observed_at_secs: request.observed_at_secs,
@@ -368,7 +397,15 @@ impl Tracker {
                             .max(MIN_REQUEST_BYTES.div_ceil(request.page_size)),
                         page_size: request.page_size,
                     },
-                });
+                };
+                if let Some(after) = comparable {
+                    if entry.defer(after, request.page_size, now_secs)
+                        == Some(SkipReason::RefaultBackoff)
+                    {
+                        outcome.retry_after_secs = now_secs.saturating_add(REFAULT_BACKOFF_SECS);
+                    }
+                }
+                self.record(entry);
             } else if let Some(entry) = self.entries.iter_mut().find(|e| e.matches(request.before))
             {
                 entry.feedback = Feedback::Empty;
@@ -684,6 +721,87 @@ mod tests {
             tracker.plan(after, 64 * MIB, 4096, 10),
             Err(SkipReason::RefaultBackoff)
         );
+    }
+
+    #[test]
+    fn repeated_success_keeps_the_original_refault_baseline() {
+        for page_size in [4096, 65536] {
+            for measured_reclaim in [true, false] {
+                let mut tracker = Tracker::new();
+                let before = Sample {
+                    pgsteal_proactive: measured_reclaim.then_some(100),
+                    ..refault_sample()
+                };
+                let request = tracker.plan(before, 64 * MIB, page_size, 0).unwrap();
+                let mut after = reclaimed(before, 64 * MIB, page_size);
+                tracker.finish(request, Some(after), 1);
+
+                after.current_bytes = before.current_bytes;
+                after.workingset_refault_file = Some(4096 + 16 * MIB / page_size);
+                let request = tracker.plan(after, 64 * MIB, page_size, 10).unwrap();
+                after = reclaimed(after, 64 * MIB, page_size);
+                assert!(
+                    tracker
+                        .finish(request, Some(after), 11)
+                        .progress
+                        .made_progress()
+                );
+
+                // Each ten-second interval refaults less than half of a
+                // request, but the first request's window reaches its limit.
+                after.workingset_refault_file = Some(4096 + 32 * MIB / page_size);
+                assert_eq!(
+                    tracker.plan(after, 64 * MIB, page_size, 20),
+                    Err(SkipReason::RefaultBackoff)
+                );
+                assert_eq!(
+                    tracker.plan(after, 64 * MIB, page_size, 79),
+                    Err(SkipReason::RefaultBackoff)
+                );
+                assert!(tracker.plan(after, 64 * MIB, page_size, 80).is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn later_worker_refaults_enter_backoff_when_it_finishes() {
+        let mut tracker = Tracker::new();
+        let before = refault_sample();
+        let request = tracker.plan(before, 64 * MIB, 4096, 0).unwrap();
+        let mut after = reclaimed(before, 64 * MIB, 4096);
+        tracker.finish(request, Some(after), 1);
+
+        after.current_bytes = before.current_bytes;
+        after.workingset_refault_file = Some(4096 + 16 * MIB / 4096);
+        let request = tracker.plan(after, 64 * MIB, 4096, 10).unwrap();
+        after = reclaimed(after, 64 * MIB, 4096);
+        after.workingset_refault_file = Some(4096 + 32 * MIB / 4096);
+        let outcome = tracker.finish(request, Some(after), 12);
+        assert_eq!(outcome.progress, Progress::Reclaimed);
+        assert_eq!(outcome.retry_after_secs, 72);
+        assert_eq!(
+            tracker.plan(after, 64 * MIB, 4096, 20),
+            Err(SkipReason::RefaultBackoff)
+        );
+        assert!(tracker.plan(after, 64 * MIB, 4096, 72).is_ok());
+    }
+
+    #[test]
+    fn repeated_success_does_not_extend_the_original_observation_deadline() {
+        let mut tracker = Tracker::new();
+        let before = refault_sample();
+        let request = tracker.plan(before, 64 * MIB, 4096, 0).unwrap();
+        let mut after = reclaimed(before, 64 * MIB, 4096);
+        tracker.finish(request, Some(after), 1);
+
+        after.current_bytes = before.current_bytes;
+        after.workingset_refault_file = Some(4096 + 8 * MIB / 4096);
+        let request = tracker.plan(after, 64 * MIB, 4096, 20).unwrap();
+        after = reclaimed(after, 64 * MIB, 4096);
+        tracker.finish(request, Some(after), 21);
+
+        after.workingset_refault_file = Some(4096 + 40 * MIB / 4096);
+        assert!(tracker.plan(after, 64 * MIB, 4096, 30).is_ok());
     }
 
     #[test]
