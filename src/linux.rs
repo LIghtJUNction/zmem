@@ -2072,11 +2072,6 @@ fn discover_protection_scopes(
         if visited > max_processes || start.elapsed() >= deadline || STOP.load(Ordering::Relaxed) {
             return Err("process discovery exceeded its limit or was interrupted".into());
         }
-        let comm = match protection_read(&entry.path().join("comm"), 128) {
-            Ok(text) => text,
-            Err(error) if process_disappeared(&error) => continue,
-            Err(error) => return Err(error.into()),
-        };
         let cgroup = match protection_read(&entry.path().join("cgroup"), 16 * 1024) {
             Ok(text) => text,
             Err(error) if process_disappeared(&error) => continue,
@@ -2084,6 +2079,11 @@ fn discover_protection_scopes(
         };
         let Some(path) = protection_process_path(cgroup_root, &cgroup)? else {
             continue;
+        };
+        let comm = match protection_read(&entry.path().join("comm"), 128) {
+            Ok(text) => text,
+            Err(error) if process_disappeared(&error) => continue,
+            Err(error) => return Err(error.into()),
         };
         let Some(role) = protection_role(&comm, &path) else {
             continue;
@@ -4705,6 +4705,10 @@ mod tests {
         let cgroup_root = fixture.0.join("cgroup");
         let process = proc_root.join("1");
         fs::create_dir_all(&process).unwrap();
+        let unrelated = proc_root.join("2");
+        fs::create_dir(&unrelated).unwrap();
+        fs::write(unrelated.join("cgroup"), "0::/system.slice/other.service\n").unwrap();
+        fs::write(unrelated.join("comm"), "x".repeat(129)).unwrap();
         fs::write(process.join("comm"), "kitty").unwrap();
         fs::write(
             process.join("cgroup"),
