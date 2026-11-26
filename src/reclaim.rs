@@ -42,12 +42,12 @@ impl Sample {
     /// Conservative clean-file budget, not a promise that these pages can be
     /// reclaimed. Dirty/writeback overlap may underestimate it intentionally.
     pub fn clean_file_budget(self) -> u64 {
-        self.inactive_file_bytes.min(
-            self.file_bytes
-                .saturating_sub(self.shmem_bytes)
-                .saturating_sub(self.dirty_bytes)
-                .saturating_sub(self.writeback_bytes),
-        )
+        // Dirty and writeback pages can all be on the inactive list even
+        // when the active file cache is entirely clean.
+        self.inactive_file_bytes
+            .min(self.file_bytes.saturating_sub(self.shmem_bytes))
+            .saturating_sub(self.dirty_bytes)
+            .saturating_sub(self.writeback_bytes)
     }
 }
 
@@ -514,6 +514,26 @@ mod tests {
         assert_eq!(
             tracker.plan(sample, 64 * MIB, 4096, 0),
             Err(SkipReason::NoCleanFileBudget)
+        );
+    }
+
+    #[test]
+    fn active_clean_cache_cannot_hide_dirty_inactive_pages() {
+        let mut tracker = Tracker::new();
+        let mut sample = usable();
+        sample.file_bytes = 256 * MIB;
+        sample.inactive_file_bytes = 32 * MIB;
+        sample.dirty_bytes = 16 * MIB;
+        sample.writeback_bytes = 16 * MIB;
+        assert_eq!(
+            tracker.plan(sample, 64 * MIB, 4096, 0),
+            Err(SkipReason::NoCleanFileBudget)
+        );
+
+        sample.writeback_bytes = 8 * MIB;
+        assert_eq!(
+            tracker.plan(sample, 64 * MIB, 4096, 0).unwrap().bytes,
+            8 * MIB
         );
     }
 

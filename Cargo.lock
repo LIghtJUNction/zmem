@@ -14,7 +14,7 @@ source = "git+https://github.com/LIghtJUNction/zhex.git#52515207f9d97a2580182169
 
 [[package]]
 name = "zmem-manager"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "zconv",
  "zhex",

@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.4.6 — 2026-11-26
+
+- Deduct dirty and writeback pages from the inactive file-page budget before proactive reclaim.
 
 - Route JSON string output through zconv while preserving lowercase `\u0008` and `\u000c` escapes, raw number text and report ordering. The optional dependency belongs to `std`; the policy core remains dependency-free with default features disabled.
 
